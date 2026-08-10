@@ -1,0 +1,6 @@
+node_modules/
+coverage/
+scratch/
+*.log
+.DS_Store
+vitest-report.json

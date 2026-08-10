@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+env:
+  # STRICT PIN (resolved at implementation time): the entire lease design is
+  # calibrated to observed bd >= 1.1.2 behavior (atomic --claim, per-key
+  # metadata merge, second-precision updated_at). A newer bd with changed
+  # lease-relevant behavior must fail loudly here, not drift silently —
+  # bump this pin deliberately, alongside a convention review.
+  BD_VERSION: "1.1.2"
+  # sha256 of beads_1.1.2_linux_amd64.tar.gz from the v1.1.2 release.
+  BD_SHA256: "a72d71ed374955dc9f83a0f90b54bd7b6a0016709dd1676ae2e368651ed401c2"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # The suite is serial (vitest --no-file-parallelism) and the cross-process
+    # suites use compressed 2 s TTLs — ~2 min expected, generous headroom here.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # test/helpers/worker-proc.ts spawns node directly on a .ts file,
+          # which needs native type stripping (unflagged from 22.18); the
+          # `22` alias currently resolves >= 22.18.
+          node-version: 22
+          cache: npm
+
+      - name: Install beads (bd)
+        # Install channel, in the spec's priority order:
+        #   1) official release binary from the beads GitHub releases
+        #      (preferred — exact version, used below; the tarball ships the
+        #      `bd` binary at its root)
+        #   2) fallback if the release asset ever disappears: homebrew-on-linux
+        #      (`brew install beads`) — switch channels explicitly and keep the
+        #      version assert; NEVER skip suites to get green.
+        run: |
+          curl -fsSL -o beads.tar.gz \
+            "https://github.com/gastownhall/beads/releases/download/v${BD_VERSION}/beads_${BD_VERSION}_linux_amd64.tar.gz"
+          echo "${BD_SHA256}  beads.tar.gz" | sha256sum --check
+          mkdir -p "${HOME}/.local/bin"
+          tar -xzf beads.tar.gz -C "${HOME}/.local/bin" bd
+          chmod +x "${HOME}/.local/bin/bd"
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
+      - name: Assert the bd pin took
+        # Match the version substring only — `bd version` appends an
+        # install-channel suffix (e.g. "bd version 1.1.2 (Homebrew)").
+        run: |
+          bd version
+          bd version | grep -F "${BD_VERSION}"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test (full suite, incl. cross-process race/fencing/reclaim)
+        run: npm test -- --reporter=default --reporter=json --outputFile=vitest-report.json

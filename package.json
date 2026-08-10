@@ -1,0 +1,76 @@
+{
+  "name": "pi-workgraph",
+  "version": "0.0.1",
+  "description": "Pi extension exposing the beads (bd) work graph as typed tools for coordinated agent workers",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gjtorikian/pi-workgraph.git"
+  },
+  "homepage": "https://github.com/gjtorikian/pi-workgraph#readme",
+  "bugs": {
+    "url": "https://github.com/gjtorikian/pi-workgraph/issues"
+  },
+  "engines": {
+    "node": ">= 22"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./protocol": "./src/protocol.ts",
+    "./adapters/in-session": "./src/adapters/in-session.ts",
+    "./adapters/pi-subagents": "./src/adapters/pi-subagents.ts"
+  },
+  "files": [
+    "src",
+    "!src/*.test.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "pi-package",
+    "beads",
+    "bd",
+    "workgraph",
+    "work-graph",
+    "lease",
+    "agent",
+    "agents"
+  ],
+  "scripts": {
+    "test": "vitest run --no-file-parallelism",
+    "test:context": "vitest run test/context.test.ts",
+    "test:dispatch": "vitest run test/dispatch.test.ts",
+    "test:race": "vitest run test/race.test.ts",
+    "test:protocol": "vitest run test/protocol.test.ts",
+    "test:coordinator": "vitest run test/coordinator.test.ts",
+    "test:fencing": "vitest run test/fencing.test.ts",
+    "test:reclaim": "vitest run test/reclaim.test.ts",
+    "test:invariants": "vitest run test/invariants.test.ts",
+    "test:judgment": "vitest run test/judgment.test.ts",
+    "test:recovery": "vitest run test/recovery.test.ts",
+    "test:adapter": "vitest run test/pi-subagents-adapter.test.ts",
+    "test:migration": "vitest run test/migration.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.84.1",
+    "@earendil-works/pi-coding-agent": "^0.84.1",
+    "@types/node": "^26.2.0",
+    "typebox": "^1.3.12",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}
