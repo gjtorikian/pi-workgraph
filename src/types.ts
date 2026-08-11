@@ -101,6 +101,8 @@ export const WORKGRAPH_ACTIVE_EXECUTION_ID_KEY = "workgraph_active_execution_id"
 export const WORKGRAPH_AUTHOR_PROVENANCE_KEY = "workgraph_author_provenance";
 export const WORKGRAPH_LAST_VERDICT_KEY = "workgraph_last_verdict";
 export const WORKGRAPH_FAILURE_FINGERPRINT_KEY = "workgraph_failure_fingerprint";
+export const WORKGRAPH_PLAN_SUMMARY_KEY = "workgraph_plan_summary";
+export const WORKGRAPH_PLANNER_PROVENANCE_KEY = "workgraph_planner_provenance";
 
 /**
  * The lifecycle phase union (README "Durable lifecycle metadata"). Beads'
@@ -110,6 +112,7 @@ export const WORKGRAPH_FAILURE_FINGERPRINT_KEY = "workgraph_failure_fingerprint"
 export type WorkgraphPhase =
   | "draft"
   | "ready"
+  | "planning"
   | "implementing"
   | "judging"
   | "revising"
@@ -186,6 +189,8 @@ export type LeaseEvent =
   | "review-rejected"
   /** Judgment (phase 3): a reviewer completion carried no parseable verdict. */
   | "verdict-invalid"
+  /** Planner tier: a planner completion carried no parseable plan. */
+  | "plan-invalid"
   /** Judgment (phase 3): blocking verdict → a revision run was requested. */
   | "revision-requested"
   /** Judgment (phase 3): escalated (fingerprint repeat, bounds, no reviewer). */
@@ -226,6 +231,42 @@ export const Verdict = Type.Object({
   summary: Type.Optional(Type.String()),
 });
 export type VerdictT = Static<typeof Verdict>;
+
+// ---------------------------------------------------------------------------
+// Plan shapes (planner role). Same TRANSPORT trick as the verdict: a planner
+// completion carries a `plan` field on the non-strict RunCompleted schema, and
+// `src/plan.ts` validates it before the plan is persisted or handed to the
+// implementer. Deliberately thin — the plan is EVIDENCE the implementer reads,
+// never something the core interprets. The core's only structural interest is
+// the acceptance criteria the planner refined, because the judgment gate
+// reviews against them.
+// ---------------------------------------------------------------------------
+
+export const PlanStep = Type.Object({
+  /** One bounded unit of implementation work, in order. */
+  description: Type.String(),
+  /** Files/symbols the step is expected to touch (advisory, never enforced). */
+  targets: Type.Optional(Type.Array(Type.String())),
+  /** Why this step exists — the rationale the implementer would otherwise
+   *  have to re-derive. */
+  rationale: Type.Optional(Type.String()),
+});
+export type PlanStepT = Static<typeof PlanStep>;
+
+export const Plan = Type.Object({
+  steps: Type.Array(PlanStep),
+  summary: Type.Optional(Type.String()),
+  /**
+   * Acceptance criteria the planner refined from the issue's. Recorded in the
+   * plan trail for the reviewer to read; the approved criteria on the issue
+   * are NOT overwritten (approval is a human gate — a planner that could
+   * rewrite its own bar would defeat the judgment gate).
+   */
+  acceptanceCriteria: Type.Optional(Type.String()),
+  /** Open questions the planner could not resolve; advisory only. */
+  risks: Type.Optional(Type.Array(Type.String())),
+});
+export type PlanT = Static<typeof Plan>;
 
 // ---------------------------------------------------------------------------
 // Tool parameter schemas (TypeBox). Pi validates tool-call arguments against

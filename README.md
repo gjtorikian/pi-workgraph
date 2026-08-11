@@ -45,10 +45,11 @@ sessions, harnesses, and machines. Everything else is delegated:
 - **Work authority** — this package plus bd: what the work is, who may
   touch it, and what state it is in. The core never executes model work
   itself.
-- **Execution** — adapters that answer discovery and run implementation,
-  review, revision, and verification requests. The in-session adapter (the
+- **Execution** — adapters that answer discovery and run planning,
+  implementation, review, revision, and verification requests. The
+  in-session adapter (the
   v0.1 "wake this agent" behavior as an explicit adapter) ships enabled;
-  the [pi-subagents bridge](#5-optional-executor-the-pi-subagents-bridge)
+  the [pi-subagents bridge](#6-optional-executor-the-pi-subagents-bridge)
   ships disabled.
 - **Communication** — observers of the audit trail and
   `workgraph:v1:activity` events, and remote transports via the
@@ -475,8 +476,8 @@ issue metadata:
 | Key | Meaning |
 |---|---|
 | `workgraph_lifecycle_version` | Lifecycle schema version, initially `1` |
-| `workgraph_phase` | `draft`, `ready`, `implementing`, `judging`, `revising`, `verifying`, `accepted`, or `escalated` |
-| `workgraph_workflow_run_id` | Stable ID covering implementation and all judgment/revision attempts for one claim |
+| `workgraph_phase` | `draft`, `ready`, `planning`, `implementing`, `judging`, `revising`, `verifying`, `accepted`, or `escalated` |
+| `workgraph_workflow_run_id` | Stable ID covering planning, implementation, and all judgment/revision attempts for one claim |
 | `workgraph_executor_id` | Selected executor adapter |
 | `workgraph_attempt` | Current implementation/revision attempt number |
 | `workgraph_risk_tier` | Policy input such as `low`, `medium`, or `high` |
@@ -484,11 +485,16 @@ issue metadata:
 | `workgraph_author_provenance` | Compact JSON describing effective harness, profile, provider, and model |
 | `workgraph_last_verdict` | Compact verdict summary and durable audit-event reference |
 | `workgraph_failure_fingerprint` | Hash used to detect a repeated failed attempt |
+| `workgraph_plan_summary` | Compact plan summary; the full plan lives in the `workgraph-plan` comment trail |
+| `workgraph_planner_provenance` | Compact JSON describing the planner's effective harness, provider, and model |
 
 ### 2. State transitions
 
 ```text
-draft --approve--> ready --claim--> implementing
+draft --approve--> ready --claim (planner offered)--> planning
+draft --approve--> ready --claim (no planner)--> implementing
+planning --plan accepted--> implementing
+planning --failed/invalid plan--> escalated
 implementing --implementation completed--> judging
 implementing --failed/blocked--> revising | escalated
 judging --hard-gate reject--> revising
@@ -558,7 +564,54 @@ and its migration effect. A legacy issue carrying a live v0.1 lease is
 respected and never claimed, under either setting. See
 [Migrating from v0.1](#migrating-from-v01).
 
-### 5. Optional executor: the pi-subagents bridge
+### 5. The planner tier
+
+An executor may offer the `planner` role. When one does, an approved issue
+is claimed into `planning` and a planning run is dispatched before any
+implementation; the accepted plan is then attached to the implementation
+run (and to every revision of it) as the optional `plan` field on
+`run:request`.
+
+**Planning is a tier, not a stage.** When no executor offers `planner`, the
+coordinator claims straight into `implementing` exactly as it did before the
+role existed — same phase, same request, same audit. The in-session
+compatibility executor offers only `implementer`, so this is the default.
+
+Four rules the code enforces, each with a reason:
+
+- **Never plan what cannot be built.** The tick only enters `planning` if
+  the same discovery round also produced an implementer. Otherwise a
+  planner-only offer set would plan, find nobody to implement, hand the
+  issue back, and re-plan forever.
+- **Failure escalates; it never degrades.** A planner that reports
+  `failure`/`blocked` or returns an unparseable plan escalates the issue to
+  `blocked` — it does *not* fall through to an unplanned implementation.
+  Silently implementing without the plan would look identical to success
+  while being the exact thing the operator wanted to prevent. Recover via
+  re-approve, as with any escalation.
+- **A plan is evidence, not authority.** The core never interprets steps or
+  enforces `targets`, and a planner's refined `acceptanceCriteria` is
+  recorded in the plan trail rather than overwriting the approved criteria
+  on the issue — a planner that could rewrite its own bar would defeat the
+  judgment gate.
+- **Legacy issues never plan.** Their only migration entry is
+  `implementing`, so compat-mode dispatch is unchanged.
+
+One workflow run spans the whole chain: planner, implementer, and every
+judgment sub-run share a lease, a `workgraph_workflow_run_id`, and a fencing
+triple. A crashed planner is not re-adopted on restart — there is no partial
+work to protect — it is abandoned, and the TTL sweep resets `planning` →
+`ready` for a clean re-plan.
+
+Model tiering (a heavier model plans, a capable one implements, a third
+reviews) is a property of the **executor adapter**, not of this package:
+the coordinator selects by role and validates reported provenance, and
+deliberately does no model routing (see `src/policy.ts`). An adapter that
+maps role → model gets tiering; the judgment gate's
+`requireAuthorIndependence` then enforces that the reviewer differs from the
+author on model and provider.
+
+### 6. Optional executor: the pi-subagents bridge
 
 > **Experimental and version-gated.** The bridge talks to
 > [pi-subagents](https://github.com/fitchmultz/pi-subagents) **by event

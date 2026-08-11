@@ -48,6 +48,9 @@ export interface RoleScript {
   /** Attached verbatim as the completion's extra `verdict` field (phase-3
    *  verdict transport: non-strict schemas tolerate it). */
   verdict?: unknown;
+  /** Attached verbatim as the completion's extra `plan` field (the planner
+   *  tier uses the same non-strict transport as the verdict). */
+  plan?: unknown;
   provenance?: RunCompletedT["provenance"];
   artifacts?: string[];
   rejectReason?: string;
@@ -72,6 +75,8 @@ export interface FakeExecutorOptions {
   roles?: ExecutorRoleT[];
   isolation?: IsolationLevelT;
   priority?: number;
+  /** Advertised `maxConcurrency` on the offer (omitted when undefined). */
+  maxConcurrency?: number;
   behavior?: FakeBehavior;
   outcome?: RunOutcomeT;
   rejectReason?: string;
@@ -102,6 +107,7 @@ export interface CompleteOverrides {
   leaseEpoch?: number;
   outcome?: RunOutcomeT;
   verdict?: unknown;
+  plan?: unknown;
   provenance?: RunCompletedT["provenance"];
   artifacts?: string[];
 }
@@ -160,6 +166,7 @@ export function installFakeExecutor(
     script: RoleScript = {},
   ): RunCompletedT {
     const verdict = overrides.verdict ?? script.verdict;
+    const plan = overrides.plan ?? script.plan;
     return {
       ...newEnvelope(),
       workflowRunId: request.workflowRunId,
@@ -173,8 +180,9 @@ export function installFakeExecutor(
         overrides.provenance ??
         script.provenance ??
         opts.provenance ?? { harness: "fake" },
-      // Extra v1-tolerated field — the phase-3 verdict transport.
+      // Extra v1-tolerated fields — the verdict and plan transports.
       ...(verdict !== undefined ? { verdict } : {}),
+      ...(plan !== undefined ? { plan } : {}),
     } as RunCompletedT;
   }
 
@@ -203,6 +211,9 @@ export function installFakeExecutor(
         supportsCancellation: opts.supportsCancellation ?? false,
         supportsReconciliation: opts.supportsReconciliation ?? false,
         ...(opts.priority !== undefined ? { priority: opts.priority } : {}),
+        ...(opts.maxConcurrency !== undefined
+          ? { maxConcurrency: opts.maxConcurrency }
+          : {}),
       };
       if (opts.offerDelayMs !== undefined) {
         setTimeout(() => events.emit(CH.offer, offer), opts.offerDelayMs);

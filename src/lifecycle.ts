@@ -42,6 +42,7 @@ export type { WorkgraphPhase } from "./types.ts";
 const PHASES: readonly WorkgraphPhase[] = [
   "draft",
   "ready",
+  "planning",
   "implementing",
   "judging",
   "revising",
@@ -58,7 +59,12 @@ const PHASES: readonly WorkgraphPhase[] = [
  */
 export const LEGAL: Record<WorkgraphPhase, readonly WorkgraphPhase[]> = {
   draft: ["ready"],
-  ready: ["implementing"],
+  // Both claim edges are legal by design: `planning` when some executor
+  // offered the planner role, `implementing` when none did. Planning is a
+  // TIER, not a mandatory stage — making it mandatory would strand every
+  // graph whose executors implement but do not plan.
+  ready: ["planning", "implementing"],
+  planning: ["implementing", "escalated"],
   implementing: ["judging", "revising", "escalated"],
   judging: ["revising", "verifying"],
   revising: ["revising", "judging"], // new execution accepted; implementation completed
@@ -77,18 +83,22 @@ const LEGACY_ENTRY: readonly WorkgraphPhase[] = ["ready", "implementing"];
 
 /** Phases with a live workflow attached (escalation is guarded to these). */
 const ACTIVE_PHASES: readonly WorkgraphPhase[] = [
+  "planning",
   "implementing",
   "judging",
   "revising",
   "verifying",
 ];
 
-/** Whether a phase has a live workflow attached (implementing/judging/
- *  revising/verifying) — the sweep's reclaim resets exactly these back to
- *  `ready` so a reclaimed issue is redispatchable (phase 4). */
+/** Whether a phase has a live workflow attached (planning/implementing/
+ *  judging/revising/verifying) — the sweep's reclaim resets exactly these
+ *  back to `ready` so a reclaimed issue is redispatchable (phase 4). A
+ *  planner run holds a lease like any other, so a crashed planner must
+ *  reclaim on the same path; leaving `planning` out would strand the issue
+ *  in a phase nothing sweeps. */
 export function isActivePhase(
   phase: WorkgraphPhase | undefined,
-): phase is "implementing" | "judging" | "revising" | "verifying" {
+): phase is "planning" | "implementing" | "judging" | "revising" | "verifying" {
   return phase !== undefined && ACTIVE_PHASES.includes(phase);
 }
 
