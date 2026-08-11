@@ -577,5 +577,9 @@ describe("subpath exports (packaging smoke)", () => {
 
     const piSubagents = await import("pi-workgraph/adapters/pi-subagents");
     expect(typeof piSubagents.registerPiSubagentsExecutor).toBe("function");
+
+    const tiered = await import("pi-workgraph/adapters/tiered");
+    expect(typeof tiered.registerTieredExecutor).toBe("function");
+    expect(tiered.TIERED_EXECUTOR_ID).toBe("tiered");
   }, 30_000);
 });

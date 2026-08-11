@@ -134,6 +134,7 @@ import type {
   VerdictT,
 } from "./types.ts";
 import {
+  Plan,
   Verdict,
   WORKGRAPH_ACTIVE_EXECUTION_ID_KEY,
   WORKGRAPH_ATTEMPT_KEY,
@@ -1980,6 +1981,10 @@ export function registerCoordinator(
       role,
       attempt: 1,
       workspace: { baseRevision: "", requiresIsolation: false },
+      // A planner owes a structured plan, so it is handed the shape — the
+      // same way the reviewer is handed `Verdict`. Without it an executor
+      // has to guess, and `parsePlan` escalates the guess.
+      ...(role === "planner" ? { outputSchema: Plan } : {}),
     };
 
     // Bounded accept window; the correlated subscription is registered

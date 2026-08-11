@@ -23,6 +23,28 @@ export interface SubagentsExecutorConfig {
   versionRange?: string;
 }
 
+/**
+ * The tiered executor: one model per role, each run a fresh `pi` process.
+ * Absent (the default) means the adapter is never registered — the same
+ * double gate the subagents bridge uses.
+ *
+ * `models` is the whole point: a role with NO entry is NOT OFFERED. That is
+ * the safety property. Offering a role with no mapping would spawn on the
+ * ambient default model and silently produce untiered work that still
+ * reports success — the operator asked for tiers precisely to prevent that.
+ */
+export interface TieredExecutorConfig {
+  enabled: boolean;
+  /** Role name → model id (e.g. `{"planner": "anthropic/claude-fable-5"}`). */
+  models: Record<string, string>;
+  /** Extra args appended to every spawned `pi` (advanced; default none). */
+  piArgs?: string[];
+  /** Per-run wall-clock cap before the child is killed (default 30 min). */
+  runTimeoutMs?: number;
+  /** Concurrent runs this executor advertises and enforces (default 2). */
+  maxConcurrency?: number;
+}
+
 export interface WorkgraphConfig {
   /** Lease time-to-live in milliseconds (default 5 min). */
   leaseTtlMs: number;
@@ -75,6 +97,12 @@ export interface WorkgraphConfig {
    * passes the version gate.
    */
   subagentsExecutor?: SubagentsExecutorConfig;
+  /**
+   * Opt-in: register the tiered executor (one model per role). Default
+   * UNDEFINED (disabled) — the adapter ships off, and even when enabled it
+   * offers only the roles that have a model mapped.
+   */
+  tieredExecutor?: TieredExecutorConfig;
 }
 
 export const DEFAULT_LEASE_TTL_MS = 300_000;
@@ -137,6 +165,11 @@ const FLAGS = [
     name: "workgraph-subagents-executor",
     description:
       'Opt-in: register the experimental pi-subagents bridge — "true" or a JSON object like {"enabled":true,"versionRange":"0.32"} (default disabled; env WORKGRAPH_SUBAGENTS_EXECUTOR)',
+  },
+  {
+    name: "workgraph-tiered-executor",
+    description:
+      'Opt-in: register the tiered executor, one model per role — a JSON object like {"enabled":true,"models":{"planner":"anthropic/claude-fable-5","implementer":"anthropic/claude-opus-5","reviewer":"<model>"}}. Only mapped roles are offered (default disabled; env WORKGRAPH_TIERED_EXECUTOR)',
   },
 ] as const;
 
@@ -227,6 +260,72 @@ function subagentsValue(
   }
 }
 
+/**
+ * Parse the tiered-executor block. Unlike the subagents block there is NO
+ * boolean shorthand: "enabled" without a `models` map would be a request to
+ * tier with no tiers, which is exactly the silent-untiered-work failure the
+ * adapter exists to prevent. A config that parses but maps no role resolves
+ * to undefined (disabled) with a named warning, never to a half-on adapter.
+ */
+function tieredValue(
+  pi: ExtensionAPI,
+  flag: string,
+  envVar: string,
+): TieredExecutorConfig | undefined {
+  const raw = stringValue(pi, flag, envVar);
+  if (raw === undefined) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    console.error(
+      `[pi-workgraph] ignoring unparseable ${flag}/${envVar} value (not JSON)`,
+    );
+    return undefined;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return undefined;
+  }
+  const record = parsed as Record<string, unknown>;
+  if (record.enabled !== true) return undefined;
+
+  const models: Record<string, string> = {};
+  const rawModels = record.models;
+  if (rawModels !== null && typeof rawModels === "object" && !Array.isArray(rawModels)) {
+    for (const [role, model] of Object.entries(rawModels as Record<string, unknown>)) {
+      if (typeof model === "string" && model !== "") models[role] = model;
+    }
+  }
+  if (Object.keys(models).length === 0) {
+    console.error(
+      `[pi-workgraph] ${flag}/${envVar} is enabled but maps no role to a model — ` +
+        `the tiered executor stays DISABLED. Map at least one role, e.g. ` +
+        `{"enabled":true,"models":{"implementer":"anthropic/claude-opus-5"}}.`,
+    );
+    return undefined;
+  }
+
+  const piArgs = Array.isArray(record.piArgs)
+    ? record.piArgs.filter((a): a is string => typeof a === "string")
+    : undefined;
+  const runTimeoutMs =
+    typeof record.runTimeoutMs === "number" && record.runTimeoutMs > 0
+      ? record.runTimeoutMs
+      : undefined;
+  const maxConcurrency =
+    typeof record.maxConcurrency === "number" && record.maxConcurrency > 0
+      ? record.maxConcurrency
+      : undefined;
+
+  return {
+    enabled: true,
+    models,
+    ...(piArgs && piArgs.length > 0 ? { piArgs } : {}),
+    ...(runTimeoutMs !== undefined ? { runTimeoutMs } : {}),
+    ...(maxConcurrency !== undefined ? { maxConcurrency } : {}),
+  };
+}
+
 function boolValue(
   pi: ExtensionAPI,
   flag: string,
@@ -307,6 +406,11 @@ export function resolveConfig(pi: ExtensionAPI): WorkgraphConfig {
       pi,
       "workgraph-subagents-executor",
       "WORKGRAPH_SUBAGENTS_EXECUTOR",
+    ),
+    tieredExecutor: tieredValue(
+      pi,
+      "workgraph-tiered-executor",
+      "WORKGRAPH_TIERED_EXECUTOR",
     ),
   };
 }

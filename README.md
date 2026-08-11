@@ -27,9 +27,10 @@ sessions, harnesses, and machines. Everything else is delegated:
 │ pi-workgraph + beads      │   discover / offer / request   │ executor adapters:        │
 │ issues & dependencies,    │ ◄───────────────────────────── │ · in-session (compat,     │
 │ atomic claims, expiring   │    accept / complete / status  │   default)                │
-│ leases + fencing, the     │                                │ · pi-subagents bridge     │
-│ approval → judgment       │                                │   (opt-in)                │
-│ lifecycle, audit trail    │                                │ · your adapter            │
+│ leases + fencing, the     │                                │ · tiered: one model per   │
+│ approval → judgment       │                                │   role (opt-in)           │
+│ lifecycle, audit trail    │                                │ · pi-subagents (opt-in)   │
+│                           │                                │ · your adapter            │
 └───────────┬───────────────┘                                └───────────────────────────┘
             │ post-commit activity events + audit comments
             ▼
@@ -49,7 +50,7 @@ sessions, harnesses, and machines. Everything else is delegated:
   implementation, review, revision, and verification requests. The
   in-session adapter (the
   v0.1 "wake this agent" behavior as an explicit adapter) ships enabled;
-  the [pi-subagents bridge](#6-optional-executor-the-pi-subagents-bridge)
+  the [pi-subagents bridge](#7-optional-executor-the-pi-subagents-bridge)
   ships disabled.
 - **Communication** — observers of the audit trail and
   `workgraph:v1:activity` events, and remote transports via the
@@ -155,10 +156,11 @@ import { CH, RunCompleted, parseMessage } from "pi-workgraph/protocol";
 and pulls in no session-bound module. It does import `@earendil-works/pi-ai`
 and `typebox` at runtime (both peer dependencies), so protocol-only
 consumers need those installed. The two adapters are also exported for
-custom wiring — `pi-workgraph/adapters/in-session` and
-`pi-workgraph/adapters/pi-subagents` (these ARE session-bound; they exist
-to be registered against a Pi session). This is a documented consumption
-pattern with an import smoke test, not a separately tested install mode.
+custom wiring — `pi-workgraph/adapters/in-session`,
+`pi-workgraph/adapters/tiered`, and `pi-workgraph/adapters/pi-subagents`
+(these ARE session-bound; they exist to be registered against a Pi
+session). This is a documented consumption pattern with an import smoke
+test, not a separately tested install mode.
 
 ## Migrating from v0.1
 
@@ -606,12 +608,64 @@ work to protect — it is abandoned, and the TTL sweep resets `planning` →
 Model tiering (a heavier model plans, a capable one implements, a third
 reviews) is a property of the **executor adapter**, not of this package:
 the coordinator selects by role and validates reported provenance, and
-deliberately does no model routing (see `src/policy.ts`). An adapter that
-maps role → model gets tiering; the judgment gate's
-`requireAuthorIndependence` then enforces that the reviewer differs from the
-author on model and provider.
+deliberately does no model routing (see `src/policy.ts`). The bundled
+[tiered executor](#6-optional-executor-the-tiered-executor) is that adapter.
 
-### 6. Optional executor: the pi-subagents bridge
+### 6. Optional executor: the tiered executor
+
+One model per role, each run a fresh `pi` process. This is the adapter the
+planner tier exists for. It ships **disabled**; enable it by mapping roles
+to models:
+
+```bash
+--workgraph-tiered-executor='{"enabled":true,"models":{
+  "planner":"anthropic/claude-fable-5",
+  "implementer":"anthropic/claude-opus-5",
+  "reviewer":"REPLACE_ME"
+}}'
+# or the WORKGRAPH_TIERED_EXECUTOR env var
+```
+
+`REPLACE_ME` is a placeholder, not a model — substitute a real id or drop
+the `reviewer` key entirely. An id that does not resolve fails at spawn
+time and is reported as a failed run, which the judgment gate then has to
+interpret; an absent key is handled cleanly (the role is simply not
+offered). `pi config models` lists what is available.
+
+The three tiers do not have to be three different models — but a reviewer
+sharing the implementer's model and provider fails the judgment gate's
+`requireAuthorIndependence` check on medium and high risk tiers, so the
+review is discarded and the issue escalates. That is the intended
+behavior; pick a distinct reviewer, or accept escalation.
+
+Each run is spawned as `pi --mode json -p --no-session --model <id>`, and
+the model the run **reports** using — never the one requested — becomes
+`provenance.model`. A provider-side substitution therefore surfaces as a
+failed independence check rather than as fake tiering.
+
+Three properties worth knowing:
+
+- **A role with no configured model is NOT offered.** Falling back to the
+  ambient default would produce untiered work that still reports success —
+  indistinguishable from the tiering you asked for. Map `reviewer` and the
+  judgment gate gets an independent reviewer; leave it unmapped and the
+  coordinator looks elsewhere.
+- **Isolation is `none`, honestly.** Runs execute in the session's cwd; this
+  adapter creates no worktrees. Advertising `worktree` without making one
+  would be a lie the coordinator relies on when filtering offers. That is
+  also why `maxConcurrency` defaults to 2 — concurrent mutating runs share
+  one tree. Worktree isolation is a follow-up.
+- **Structured output rides the prompt.** pi's CLI exposes no output-schema
+  flag, so a request carrying `outputSchema` gets the schema inlined with an
+  instruction to end on bare JSON; the final message is parsed into `plan`
+  or `verdict`. Unparseable output is reported *without* the field, and the
+  core's existing invalid-payload path audits and escalates it — the adapter
+  never invents one.
+
+Options: `models` (required), `piArgs`, `runTimeoutMs` (default 30 min),
+`maxConcurrency` (default 2).
+
+### 7. Optional executor: the pi-subagents bridge
 
 > **Experimental and version-gated.** The bridge talks to
 > [pi-subagents](https://github.com/fitchmultz/pi-subagents) **by event

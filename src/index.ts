@@ -10,6 +10,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerInSessionExecutor } from "./adapters/in-session.ts";
 import { registerPiSubagentsExecutor } from "./adapters/pi-subagents.ts";
+import { registerTieredExecutor } from "./adapters/tiered.ts";
 import { bdBinaryAvailable, bindExec } from "./bd.ts";
 import { registerCompactionTakeover } from "./compaction.ts";
 import { registerConfigFlags, resolveConfig } from "./config.ts";
@@ -50,6 +51,19 @@ export default function piWorkgraph(pi: ExtensionAPI): void {
     if (resolveConfig(pi).subagentsExecutor?.enabled !== true) return;
     subagentsRegistered = true;
     registerPiSubagentsExecutor(pi, { getConfig: () => resolveConfig(pi) });
+  });
+
+  // The OPTIONAL tiered executor (one model per role) — double-gated the
+  // same way, and deferred to session_start for the same reason: the
+  // role→model map arrives by flag or env, neither readable at load. Also
+  // registered BEFORE the coordinator's handler so its subscriptions exist
+  // before the first discovery pass.
+  let tieredRegistered = false;
+  pi.on("session_start", () => {
+    if (tieredRegistered) return;
+    if (resolveConfig(pi).tieredExecutor?.enabled !== true) return;
+    tieredRegistered = true;
+    registerTieredExecutor(pi, { getConfig: () => resolveConfig(pi) });
   });
 
   // The coordinator resolves config lazily; the 5 s poll floor lives HERE
