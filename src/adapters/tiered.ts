@@ -47,9 +47,14 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
-import path from "node:path";
+import { homedir } from "node:os";
+import path, { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { TieredExecutorConfig, WorkgraphConfig } from "../config.ts";
+import type {
+  TieredExecutorConfig,
+  TieredRoleConfig,
+  WorkgraphConfig,
+} from "../config.ts";
 import {
   CH,
   Discover,
@@ -131,8 +136,48 @@ export interface TieredController {
 /** The roles actually offered: supported ∩ configured. */
 export function offeredRoles(config: TieredExecutorConfig): ExecutorRoleT[] {
   return TIERED_SUPPORTED_ROLES.filter((role) =>
-    Object.prototype.hasOwnProperty.call(config.models, role),
+    Object.prototype.hasOwnProperty.call(config.roles, role),
   );
+}
+
+/** Expand a leading `~` so config files can use home-relative paths. */
+export function expandHome(p: string): string {
+  if (p === "~") return homedir();
+  if (p.startsWith("~/")) return join(homedir(), p.slice(2));
+  return p;
+}
+
+/**
+ * Build the argv for one role's run. Per-role `piArgs` land AFTER the
+ * global ones, so a role can override a global choice; the prompt is always
+ * last.
+ *
+ * A configured-but-unreadable `appendSystemPrompt` THROWS rather than
+ * dropping the flag. A reviewer silently stripped of its ruleset still
+ * returns confident verdicts, and nothing downstream — not the fencing
+ * check, not the independence check, not the audit trail — could tell that
+ * the review recorded was not the review configured.
+ */
+export function buildRunArgs(
+  role: TieredRoleConfig,
+  config: TieredExecutorConfig,
+  prompt: string,
+): string[] {
+  const args = ["--mode", "json", "-p", "--no-session", "--model", role.model];
+  if (role.appendSystemPrompt !== undefined) {
+    const path = expandHome(role.appendSystemPrompt);
+    if (!existsSync(path)) {
+      throw new Error(`appendSystemPrompt file not readable: ${path}`);
+    }
+    args.push("--append-system-prompt", path);
+  }
+  if (role.tools && role.tools.length > 0) {
+    args.push("--tools", role.tools.join(","));
+  }
+  if (config.piArgs) args.push(...config.piArgs);
+  if (role.piArgs) args.push(...role.piArgs);
+  args.push(prompt);
+  return args;
 }
 
 /**
@@ -235,7 +280,7 @@ export function registerTieredExecutor(
    *  declines to call this function when the block is absent. */
   function conf(): TieredExecutorConfig | undefined {
     const c = deps.getConfig().tieredExecutor;
-    return c?.enabled === true && Object.keys(c.models).length > 0 ? c : undefined;
+    return c?.enabled === true && Object.keys(c.roles).length > 0 ? c : undefined;
   }
 
   function reject(msg: RunRequestT, reason: string): void {
@@ -341,23 +386,29 @@ export function registerTieredExecutor(
       }
       if (msg.executorId !== TIERED_EXECUTOR_ID) return; // addressed elsewhere
 
-      const model = config.models[msg.role];
-      if (model === undefined) {
+      const role = config.roles[msg.role];
+      if (role === undefined) {
         // Not offered, so this should be unreachable — but a request for an
         // unmapped role is rejected rather than run on the ambient default.
         reject(msg, `no model configured for role ${msg.role}`);
         return;
       }
+      const model = role.model;
       const cap = config.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY;
       if (runs.size >= cap) {
         reject(msg, "at-capacity");
         return;
       }
 
-      const argv = ["--mode", "json", "-p", "--no-session", "--model", model];
-      if (config.piArgs) argv.push(...config.piArgs);
-      argv.push(buildTieredPrompt(msg));
-      const invocation = piInvocation(argv);
+      let invocation: { command: string; args: string[] };
+      try {
+        invocation = piInvocation(buildRunArgs(role, config, buildTieredPrompt(msg)));
+      } catch (e) {
+        // A missing ruleset file is a REJECTED run, not a degraded one —
+        // see buildRunArgs.
+        reject(msg, e instanceof Error ? e.message : String(e));
+        return;
+      }
 
       let child: ChildProcess;
       try {

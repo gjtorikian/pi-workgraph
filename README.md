@@ -155,7 +155,7 @@ import { CH, RunCompleted, parseMessage } from "pi-workgraph/protocol";
 `pi-workgraph/protocol` is session-free: importing it registers nothing
 and pulls in no session-bound module. It does import `@earendil-works/pi-ai`
 and `typebox` at runtime (both peer dependencies), so protocol-only
-consumers need those installed. The two adapters are also exported for
+consumers need those installed. The three adapters are also exported for
 custom wiring — `pi-workgraph/adapters/in-session`,
 `pi-workgraph/adapters/tiered`, and `pi-workgraph/adapters/pi-subagents`
 (these ARE session-bound; they exist to be registered against a Pi
@@ -617,14 +617,68 @@ One model per role, each run a fresh `pi` process. This is the adapter the
 planner tier exists for. It ships **disabled**; enable it by mapping roles
 to models:
 
-```bash
---workgraph-tiered-executor='{"enabled":true,"models":{
-  "planner":"anthropic/claude-fable-5",
-  "implementer":"anthropic/claude-opus-5",
-  "reviewer":"openai-codex/gpt-5.6-sol"
-}}'
-# or the WORKGRAPH_TIERED_EXECUTOR env var
+Configuration resolves **flag → env → standing file**:
+
+```jsonc
+// $PI_CODING_AGENT_DIR/configs/workgraph-tiered.json
+{
+  "enabled": true,
+  "models": {
+    "planner": "anthropic/claude-fable-5",
+    "implementer": "anthropic/claude-opus-5",
+    "reviewer": "openai-codex/gpt-5.6-sol"
+  }
+}
 ```
+
+The agent dir is global, so that one file governs **every project and every
+session** — no flag to remember at boot. `--workgraph-tiered-executor='{…}'`
+and `WORKGRAPH_TIERED_EXECUTOR` still win, which is what a sandbox or a
+one-off run needs in order to differ.
+
+An override **replaces** the standing config rather than merging into it: a
+deep merge would silently run a tier you did not name in the override you
+were looking at. A *broken* override does not fall back to the file either —
+running someone else's tiers because your JSON had a typo is worse than
+running none.
+
+#### Giving a role a character
+
+`models` is shorthand. The full form gives a role a ruleset and a tool set,
+which is how a tier becomes more than a model choice:
+
+```jsonc
+{
+  "enabled": true,
+  "models": { "planner": "anthropic/claude-fable-5" },
+  "roles": {
+    "implementer": { "model": "anthropic/claude-opus-5" },
+    "reviewer": {
+      "model": "openai-codex/gpt-5.6-sol",
+      "appendSystemPrompt": "~/rules/minimalism.md",
+      "tools": ["read", "grep", "find", "ls", "bash"]
+    }
+  }
+}
+```
+
+Both shapes may appear together; `roles` wins per role, so most tiers stay
+terse and only the one needing a ruleset expands.
+
+`appendSystemPrompt` is the **adversarial-review seam**. Any agent-agnostic
+ruleset works — [ponytail](https://ponytail.dev)'s `AGENTS.md`, for instance,
+pushes against over-engineering, so a reviewer carrying it argues with the
+implementer's instinct to over-build. A configured-but-missing file
+**rejects the run**: a reviewer silently stripped of its ruleset still
+returns confident verdicts, and nothing downstream could tell.
+
+> **Match findings to criteria.** The judgment gate blocks on findings whose
+> `severity` is `blocking`, and a ruleset-driven reviewer will happily raise
+> blocking findings about matters the acceptance criteria never mentioned —
+> the implementer cannot satisfy them, revisions burn `maxRevisions`, and the
+> issue escalates. Either instruct the reviewer to mark out-of-criteria
+> observations `advisory`, or run that work at the `low` risk tier, where the
+> gate is advisory and findings are recorded without blocking.
 
 Ids take the `provider/id` form pi's own `--model` flag accepts. `pi update
 --models` refreshes the catalogs they resolve against, and custom providers
@@ -666,8 +720,8 @@ Three properties worth knowing:
   core's existing invalid-payload path audits and escalates it — the adapter
   never invents one.
 
-Options: `models` (required), `piArgs`, `runTimeoutMs` (default 30 min),
-`maxConcurrency` (default 2).
+Options: `roles` and/or `models` (at least one role required), `piArgs`,
+`runTimeoutMs` (default 30 min), `maxConcurrency` (default 2).
 
 ### 7. Optional executor: the pi-subagents bridge
 

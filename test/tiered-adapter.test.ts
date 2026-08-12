@@ -11,6 +11,9 @@
  * Run via `npm run test:tiered`.
  */
 import { EventEmitter } from "node:events";
+import { rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   buildTieredPrompt,
@@ -48,10 +51,10 @@ const BASE_CONFIG: WorkgraphConfig = {
 
 const TIERS: TieredExecutorConfig = {
   enabled: true,
-  models: {
-    planner: "anthropic/claude-fable-5",
-    implementer: "anthropic/claude-opus-5",
-    reviewer: "some/reviewer-model",
+  roles: {
+    planner: { model: "anthropic/claude-fable-5" },
+    implementer: { model: "anthropic/claude-opus-5" },
+    reviewer: { model: "some/reviewer-model" },
   },
 };
 
@@ -166,7 +169,7 @@ describe("role→model mapping", () => {
     // look elsewhere rather than getting untiered work reported as success.
     expect(offeredRoles(TIERS)).not.toContain("revision");
     expect(
-      offeredRoles({ enabled: true, models: { implementer: "m" } }),
+      offeredRoles({ enabled: true, roles: { implementer: { model: "m" } } }),
     ).toEqual(["implementer"]);
   });
 
@@ -229,6 +232,73 @@ describe("role→model mapping", () => {
     expect(args.slice(-2)).toEqual(["--mode", "json"]);
     expect(command).toBe(process.execPath);
     expect(args).toHaveLength(3);
+  });
+
+  it("gives a role its ruleset and tool allowlist — the adversarial-review seam", () => {
+    const rules = join(tmpdir(), `pwg-rules-${process.pid}.md`);
+    writeFileSync(rules, "# be minimal\n");
+    try {
+      const h = makeHarness({
+        roles: {
+          implementer: { model: "anthropic/claude-opus-5" },
+          reviewer: {
+            model: "openai-codex/gpt-5.6-sol",
+            appendSystemPrompt: rules,
+            tools: ["read", "grep", "ls"],
+          },
+        },
+      });
+      active = h.controller;
+      request(h.mock, "reviewer");
+      const args = h.spawns[0]!.args;
+      expect(args[args.indexOf("--append-system-prompt") + 1]).toBe(rules);
+      expect(args[args.indexOf("--tools") + 1]).toBe("read,grep,ls");
+
+      // The implementer, configured without either, gets neither — roles
+      // differing is the whole point.
+      request(h.mock, "implementer");
+      expect(h.spawns[1]!.args).not.toContain("--append-system-prompt");
+      expect(h.spawns[1]!.args).not.toContain("--tools");
+    } finally {
+      rmSync(rules, { force: true });
+    }
+  });
+
+  it("REJECTS a run whose ruleset file is missing rather than running without it", () => {
+    const h = makeHarness({
+      roles: {
+        reviewer: {
+          model: "some/model",
+          appendSystemPrompt: "/nope/does-not-exist.md",
+        },
+      },
+    });
+    active = h.controller;
+    request(h.mock, "reviewer");
+
+    // Dropping the flag would yield a confident verdict from a reviewer
+    // silently stripped of its configured ruleset, and nothing downstream
+    // could tell.
+    expect(h.spawns).toHaveLength(0);
+    expect(h.rejections[0]?.reason).toMatch(/appendSystemPrompt file not readable/);
+  });
+
+  it("per-role piArgs land after the global ones, so a role can override", () => {
+    const h = makeHarness({
+      piArgs: ["--thinking", "medium"],
+      roles: {
+        planner: {
+          model: "anthropic/claude-fable-5",
+          piArgs: ["--thinking", "high"],
+        },
+      },
+    });
+    active = h.controller;
+    request(h.mock, "planner");
+    const args = h.spawns[0]!.args;
+    expect(args.indexOf("--thinking")).toBeLessThan(args.lastIndexOf("--thinking"));
+    expect(args[args.lastIndexOf("--thinking") + 1]).toBe("high");
+    expect(args[args.length - 1]).toContain("work-graph issue iss-1");
   });
 
   it("honours maxConcurrency, rejecting the run past the cap", () => {
@@ -498,8 +568,8 @@ describe("disabled by default", () => {
     expect(spawns).toHaveLength(0);
   });
 
-  it("an enabled block with no models offers nothing", () => {
-    const h = makeHarness({ models: {} });
+  it("an enabled block with no roles offers nothing", () => {
+    const h = makeHarness({ roles: {} });
     active = h.controller;
     discover(h.mock);
     expect(h.offers).toHaveLength(0);

@@ -58,6 +58,7 @@
     "test:judgment": "vitest run test/judgment.test.ts",
     "test:planner": "vitest run test/planner.test.ts",
     "test:tiered": "vitest run test/tiered-adapter.test.ts",
+    "test:tiered-config": "vitest run test/tiered-config.test.ts",
     "test:recovery": "vitest run test/recovery.test.ts",
     "test:adapter": "vitest run test/pi-subagents-adapter.test.ts",
     "test:migration": "vitest run test/migration.test.ts",
