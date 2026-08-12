@@ -93,6 +93,13 @@ import {
   transition,
   workflowRunIdOf,
 } from "./lifecycle.ts";
+import {
+  parsePlan,
+  PlanError,
+  planSummary,
+  recordPlan,
+  renderPlan,
+} from "./plan.ts";
 import { checkIndependence, resolvePolicy } from "./policy.ts";
 import {
   CH,
@@ -123,6 +130,7 @@ import type {
   IdentityProvider,
   Lease,
   LeaseActor,
+  PlanT,
   VerdictT,
 } from "./types.ts";
 import {
@@ -134,6 +142,8 @@ import {
   WORKGRAPH_FAILURE_FINGERPRINT_KEY,
   WORKGRAPH_LAST_VERDICT_KEY,
   WORKGRAPH_PHASE_KEY,
+  WORKGRAPH_PLAN_SUMMARY_KEY,
+  WORKGRAPH_PLANNER_PROVENANCE_KEY,
   WORKGRAPH_WORKFLOW_RUN_ID_KEY,
 } from "./types.ts";
 import {
@@ -189,6 +199,20 @@ export interface CoordinatorRun {
   executorId: string;
   executionId?: string;
   phase: "requested" | "accepted" | "judging" | "revising" | "verifying";
+  /**
+   * What the CURRENTLY in-flight primary run is for. `planner` and
+   * `implementer` are the only values a supervised run takes: reviewer and
+   * revision sub-runs are routed through the judgment inbox, not through
+   * `state.active`. This is what lets one `run:completed` handler tell a
+   * finished plan (→ dispatch the implementer) from a finished
+   * implementation (→ hand to the judgment gate); `phase` alone cannot,
+   * because both arrive as "requested"/"accepted".
+   */
+  role: "planner" | "implementer";
+  /** The accepted plan, rendered for prompts — set once a planner run
+   *  completes, then attached to the implementation run and to every
+   *  revision of it. Undefined whenever no planner ran. */
+  plan?: string;
   /** Current implementation/revision attempt (compaction folds it in). */
   attempt: number;
   /** The selected executor's advertised isolation — graceful shutdown
@@ -370,11 +394,17 @@ export function registerCoordinator(
     return state.active ? [...state.judged, state.active] : [...state.judged];
   }
 
-  /** Status-bar detail: the durable phase plus the selected executor. */
+  /** Status-bar detail: the durable phase plus the selected executor. The
+   *  handshake states (`requested`/`accepted`) carry no durable phase of
+   *  their own, so they render the phase their ROLE is running under —
+   *  otherwise a planning run would report "implementing" while the issue
+   *  sits in `planning`. */
   function statusDetail(run: CoordinatorRun): { phase: string; executorId: string } {
     const phase =
       run.phase === "requested" || run.phase === "accepted"
-        ? "implementing"
+        ? run.role === "planner"
+          ? "planning"
+          : "implementing"
         : run.phase;
     return { phase, executorId: run.executorId };
   }
@@ -620,6 +650,7 @@ export function registerCoordinator(
     if (state.completing) return;
     state.completing = true;
     let startJudgment = false;
+    let startImplementation = false;
     try {
       // Fencing triple, part 1: the payload must match the run we supervise.
       const payloadMatches =
@@ -681,6 +712,7 @@ export function registerCoordinator(
           workflowRunId: run.workflowRunId,
           executionId: msg.executionId,
           executorId: run.executorId,
+          role: run.role,
           outcome: msg.outcome,
           artifacts: msg.artifacts,
           evidence: msg.evidence,
@@ -688,51 +720,335 @@ export function registerCoordinator(
         },
         run.actor.bdActor,
       );
-      try {
-        await transition(run.cwd, run.lease.issueId, "implementing", "judging", {
-          fields: {
-            [WORKGRAPH_AUTHOR_PROVENANCE_KEY]: JSON.stringify(msg.provenance),
-          },
-          actor: run.actor.bdActor,
-        });
-      } catch (e) {
-        if (e instanceof LifecycleError) {
-          // A concurrent writer moved the phase under our lease (override,
-          // re-approve): this run no longer describes reality — drop it.
-          logSkipOnce(e.message);
-          untrackLease(run.cwd, run.lease.issueId);
-          state.active = null;
-          if (heldRuns().length === 0) stopHeartbeat();
-          return;
+
+      // A finished PLAN is not a finished implementation: it advances
+      // planning → implementing and is re-dispatched, never reaching the
+      // judgment gate. The durable part runs inside the `completing` latch
+      // (so a duplicate completion cannot double-transition); the DISPATCH
+      // deliberately does not — see the tail of this function.
+      if (run.role === "planner") {
+        startImplementation = await acceptPlan(run, msg);
+      } else {
+        try {
+          await transition(run.cwd, run.lease.issueId, "implementing", "judging", {
+            fields: {
+              [WORKGRAPH_AUTHOR_PROVENANCE_KEY]: JSON.stringify(msg.provenance),
+            },
+            actor: run.actor.bdActor,
+          });
+        } catch (e) {
+          if (e instanceof LifecycleError) {
+            // A concurrent writer moved the phase under our lease (override,
+            // re-approve): this run no longer describes reality — drop it.
+            logSkipOnce(e.message);
+            untrackLease(run.cwd, run.lease.issueId);
+            state.active = null;
+            if (heldRuns().length === 0) stopHeartbeat();
+            return;
+          }
+          throw e;
         }
-        throw e;
+        // POST-COMMIT: the judging transition just resolved.
+        emitActivity({
+          kind: "transition",
+          issueId: run.lease.issueId,
+          phase: "judging",
+          workflowRunId: run.workflowRunId,
+          actor: run.actor.bdActor,
+          summary: `implementation completed (${msg.outcome}) by ${run.executorId}`,
+        });
+        run.executionId = msg.executionId;
+        run.evidence = [...msg.evidence];
+        run.phase = "judging";
+        state.judged.push(run);
+        state.inboxes.set(run.workflowRunId, {
+          messages: [],
+          waiters: [],
+          closed: false,
+        });
+        state.active = null;
+        startJudgment = true;
       }
-      // POST-COMMIT: the judging transition just resolved.
-      emitActivity({
-        kind: "transition",
-        issueId: run.lease.issueId,
-        phase: "judging",
-        workflowRunId: run.workflowRunId,
-        actor: run.actor.bdActor,
-        summary: `implementation completed (${msg.outcome}) by ${run.executorId}`,
-      });
-      run.executionId = msg.executionId;
-      run.evidence = [...msg.evidence];
-      run.phase = "judging";
-      state.judged.push(run);
-      state.inboxes.set(run.workflowRunId, {
-        messages: [],
-        waiters: [],
-        closed: false,
-      });
-      state.active = null;
-      startJudgment = true;
     } finally {
       state.completing = false;
     }
-    // The judgment gate — awaited so the handler's promise spans the whole
-    // chain (test buses drain it; the real bus ignores the return value).
+    // BOTH continuations run OUTSIDE the `completing` latch, and for the same
+    // reason: each emits a request whose executor may answer synchronously on
+    // the process-local bus, so the resulting `run:completed` re-enters this
+    // handler DURING the call. Dispatching the implementation inside the
+    // latch would make that completion hit `if (state.completing) return` and
+    // be dropped — the run would then sit in `implementing` until its lease
+    // expired, with the plan already committed. Awaited so the handler's
+    // promise spans the whole chain (test buses drain it; the real bus
+    // ignores the return value).
+    if (startImplementation) await dispatchImplementation(run);
     if (startJudgment) await judge(run, msg);
+  }
+
+  /**
+   * A fenced planner completion: validate the reported plan, persist it, and
+   * advance planning → implementing. Returns whether the caller should go on
+   * to dispatch the implementation run — the dispatch itself must happen
+   * OUTSIDE the `completing` latch this runs under (see `onCompleted`'s
+   * tail), so every path here reports its decision rather than acting on it.
+   *
+   * FAILURE IS ESCALATION, NOT DEGRADATION. A planner that reports
+   * `failure`/`blocked`, or returns a payload that is not a valid plan, does
+   * NOT fall through to an unplanned implementation: the operator asked for
+   * a planning tier, and silently implementing without one would look
+   * identical to success while being exactly the thing they wanted to
+   * prevent. Escalation parks the issue as `blocked`, audited, and is
+   * recoverable via re-approve — the same contract the judgment gate uses
+   * when it cannot obtain independent review.
+   *
+   * No retry loop here, deliberately: the reviewer's bounded retry exists
+   * because a verdict is a JUDGMENT the gate cannot proceed without, while a
+   * failed plan has a cheap human recovery (re-approve, having fixed the
+   * planner). One knob with one exercised value is a constant.
+   */
+  async function acceptPlan(
+    run: CoordinatorRun,
+    msg: RunCompletedT,
+  ): Promise<boolean> {
+    if (msg.outcome !== "success") {
+      await escalateRun(
+        run,
+        "planning",
+        `planning run reported ${msg.outcome}`,
+      );
+      return false;
+    }
+
+    let plan: PlanT;
+    try {
+      plan = parsePlan((msg as RunCompletedT & { plan?: unknown }).plan);
+    } catch (e) {
+      const detail = e instanceof PlanError ? e.detail : String(e);
+      await recordLeaseEvent(
+        run.cwd,
+        "plan-invalid",
+        run.lease.issueId,
+        {
+          workflowRunId: run.workflowRunId,
+          executionId: msg.executionId,
+          executorId: run.executorId,
+          detail,
+        },
+        run.actor.bdActor,
+      );
+      await escalateRun(run, "planning", `planner returned an invalid plan: ${detail}`);
+      return false;
+    }
+
+    // Persist the plan trail BEFORE the transition: a crash between the two
+    // leaves a recorded plan on an issue still in `planning`, which the
+    // sweep reclaims to `ready` — recoverable. The reverse order would
+    // advance the phase with no trail behind it.
+    await recordPlan(
+      run.cwd,
+      run.lease.issueId,
+      plan,
+      {
+        workflowRunId: run.workflowRunId,
+        executionId: msg.executionId,
+        executorId: run.executorId,
+        provenance: msg.provenance,
+      },
+      run.actor.bdActor,
+    );
+
+    try {
+      await transition(run.cwd, run.lease.issueId, "planning", "implementing", {
+        fields: {
+          [WORKGRAPH_PLAN_SUMMARY_KEY]: planSummary(plan),
+          [WORKGRAPH_PLANNER_PROVENANCE_KEY]: JSON.stringify(msg.provenance),
+        },
+        actor: run.actor.bdActor,
+      });
+    } catch (e) {
+      if (e instanceof LifecycleError) {
+        // A concurrent writer moved the phase under our lease (override,
+        // re-approve): this run no longer describes reality — drop it.
+        logSkipOnce(e.message);
+        untrackLease(run.cwd, run.lease.issueId);
+        state.active = null;
+        if (heldRuns().length === 0) stopHeartbeat();
+        return false;
+      }
+      throw e;
+    }
+    emitActivity({
+      kind: "transition",
+      issueId: run.lease.issueId,
+      phase: "implementing",
+      workflowRunId: run.workflowRunId,
+      actor: run.actor.bdActor,
+      summary: `plan accepted (${plan.steps.length} steps) from ${run.executorId}`,
+    });
+
+    // The SAME run continues: same lease, same workflow-run id, same
+    // fencing triple. Only the role and the executor rebind — which is what
+    // keeps the whole planner → implementer → judgment chain one supervised
+    // run, exactly as judgment sub-runs stay inside the run that authored
+    // the work.
+    run.role = "implementer";
+    run.plan = renderPlan(plan);
+    run.phase = "requested";
+    delete run.executionId;
+    return true;
+  }
+
+  /**
+   * Dispatch the implementation run for a run already transitioned into
+   * `implementing`. Split out of the claim path because the planner tier
+   * reaches this point from a completion handler rather than a tick, with a
+   * lease it already holds.
+   */
+  async function dispatchImplementation(run: CoordinatorRun): Promise<void> {
+    const config = deps.getConfig();
+    const offers = await discoverExecutors(pi.events, {
+      timeoutMs: config.discoveryTimeoutMs,
+      now: nowFn,
+      onInvalid,
+    });
+    // The planner's execution has TERMINATED — this runs on its completion —
+    // but `state.active` still carries its executorId, so the generic
+    // in-flight count would charge it a slot it no longer occupies. Release
+    // that slot before selecting: otherwise ONE executor offering both roles
+    // at `maxConcurrency: 1` is judged at capacity for the very
+    // implementation it just planned, and the issue is handed back on every
+    // attempt — a permanent stall for the most natural single-adapter setup.
+    const counts = new Map(inFlightCounts());
+    const held = counts.get(run.executorId);
+    if (held !== undefined) {
+      if (held <= 1) counts.delete(run.executorId);
+      else counts.set(run.executorId, held - 1);
+    }
+
+    let implementer;
+    try {
+      implementer = selectExecutor(
+        offers,
+        { role: "implementer", requiresIsolation: false },
+        { executorId: config.executorId },
+        counts,
+      );
+    } catch (e) {
+      if (!(e instanceof ExecutorSelectionError)) throw e;
+      implementer = undefined;
+    }
+    if (!implementer) {
+      // The implementer that existed at claim time is gone (a genuine race,
+      // not a steady state — the tick refuses to plan without one). Hand the
+      // issue back rather than parking: the plan is durable in the comment
+      // trail, so nothing is lost but the redundant re-plan.
+      await handBackAfterPlanning(
+        run,
+        "no implementer-capable executor remained after planning",
+      );
+      return;
+    }
+
+    run.executorId = implementer.executorId;
+    run.isolation = implementer.isolation;
+    run.supportsCancellation = implementer.supportsCancellation;
+    await setMetadata(
+      run.cwd,
+      run.lease.issueId,
+      { [WORKGRAPH_EXECUTOR_ID_KEY]: implementer.executorId },
+      run.actor.bdActor,
+    );
+
+    const request: RunRequestT = {
+      ...newEnvelope(nowFn),
+      executorId: implementer.executorId,
+      issue: {
+        id: run.issue.id,
+        title: run.issue.title,
+        ...(run.issue.description !== undefined
+          ? { description: run.issue.description }
+          : {}),
+        ...(run.issue.acceptance_criteria !== undefined
+          ? { acceptanceCriteria: run.issue.acceptance_criteria }
+          : {}),
+      },
+      workflowRunId: run.workflowRunId,
+      leaseEpoch: run.lease.epoch,
+      role: "implementer",
+      attempt: run.attempt,
+      workspace: { baseRevision: "", requiresIsolation: false },
+      ...(run.plan !== undefined ? { plan: run.plan } : {}),
+    };
+    const result = await requestRun(pi.events, request, {
+      timeoutMs: config.acceptTimeoutMs,
+      onInvalid,
+    });
+    if (result.kind === "accepted") {
+      if (state.active === run && run.phase === "requested") {
+        run.phase = "accepted";
+        run.executionId = result.message.executionId;
+        await setMetadata(
+          run.cwd,
+          run.lease.issueId,
+          { [WORKGRAPH_ACTIVE_EXECUTION_ID_KEY]: result.message.executionId },
+          run.actor.bdActor,
+        );
+      }
+      clearSkipLog();
+      return;
+    }
+    if (state.active !== run || run.phase !== "requested") return;
+    await recordLeaseEvent(
+      run.cwd,
+      result.kind === "rejected" ? "executor-rejected" : "accept-timeout",
+      run.lease.issueId,
+      {
+        workflowRunId: run.workflowRunId,
+        executorId: implementer.executorId,
+        role: "implementer",
+        via: "post-planning",
+        ...(result.kind === "rejected"
+          ? { reason: result.message.reason }
+          : { timeoutMs: config.acceptTimeoutMs }),
+      },
+      run.actor.bdActor,
+    );
+    await handBackAfterPlanning(
+      run,
+      result.kind === "rejected"
+        ? "implementer rejected the post-planning run"
+        : "implementer did not accept the post-planning run",
+    );
+  }
+
+  /**
+   * Hand a planned-but-undispatched issue back to the ready pool: phase
+   * reset and lease released. Like the claim path's reject/timeout release,
+   * the `implementing` → `ready` write is a deliberate RAW write rather than
+   * a LEGAL edge — the never-started recovery path, coordinator-owned and
+   * audited.
+   */
+  async function handBackAfterPlanning(
+    run: CoordinatorRun,
+    reason: string,
+  ): Promise<void> {
+    logSkipOnce(`${run.lease.issueId}: ${reason} — returned to the ready pool`);
+    state.active = null;
+    if (heldRuns().length === 0) stopHeartbeat();
+    await setMetadata(
+      run.cwd,
+      run.lease.issueId,
+      { [WORKGRAPH_PHASE_KEY]: "ready" },
+      run.actor.bdActor,
+    );
+    try {
+      await releaseLease(run.cwd, run.lease, run.actor);
+    } catch (e) {
+      if (!(e instanceof FencingError)) {
+        const detail = e instanceof Error ? e.message : String(e);
+        logSkipOnce(`could not release ${run.lease.issueId}: ${detail}`);
+      }
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -792,7 +1108,7 @@ export function registerCoordinator(
    */
   async function escalateRun(
     run: CoordinatorRun,
-    expect: "implementing" | "judging" | "revising" | "verifying",
+    expect: "planning" | "implementing" | "judging" | "revising" | "verifying",
     reason: string,
     fields: Record<string, string> = {},
   ): Promise<void> {
@@ -903,6 +1219,9 @@ export function registerCoordinator(
       priorFindings: canonicalFindings(verdict.findings).map((f) =>
         JSON.stringify(f),
       ),
+      // A revision is still work against the plan: the revisor gets it for
+      // the same reason the implementer did. Absent when no planner ran.
+      ...(run.plan !== undefined ? { plan: run.plan } : {}),
     };
     await recordLeaseEvent(
       run.cwd,
@@ -1471,17 +1790,63 @@ export function registerCoordinator(
       return;
     }
 
+    // ROLE SELECTION. Planning is a tier, not a mandatory stage: prefer a
+    // planner when one is offered, and fall back to dispatching the
+    // implementer directly when none is — a graph whose executors implement
+    // but do not plan behaves exactly as it did before the role existed.
+    //
+    // Both selections run against the SAME discovery round: re-discovering
+    // per role would let the offer set change between the two calls and
+    // could claim into `planning` on the strength of a planner that is gone
+    // by the time we dispatch.
+    //
+    // LEGACY issues never plan: their only migration entry is
+    // `implementing` (lifecycle.ts LEGACY_ENTRY), so offering them the
+    // planner tier would claim a lease and then throw on the transition.
+    // Compat mode stays byte-for-byte what it was.
+    const candidate = eligible[0]!;
+    let role: "planner" | "implementer" = isLifecycleV1(candidate)
+      ? "planner"
+      : "implementer";
     let selected;
     try {
-      selected = selectExecutor(
-        offers,
-        // No isolation policy exists yet (phase 5+): implementation runs do
-        // not require isolation, which is what lets the in-session compat
-        // adapter (isolation "none") remain eligible.
-        { role: "implementer", requiresIsolation: false },
-        { executorId: config.executorId },
-        inFlightCounts(),
-      );
+      if (role === "planner") {
+        // NEVER PLAN WHAT CANNOT BE BUILT. Planning is only worth a lease if
+        // an implementer exists to consume the plan: without this check a
+        // planner-only offer set would plan, find nobody to implement, hand
+        // the issue back to the pool, and re-plan on the next tick — a
+        // token-burning loop with no forward progress.
+        const canImplement =
+          offers.some((o) => o.roles.includes("implementer")) ||
+          config.executorId !== undefined;
+        selected = canImplement
+          ? selectExecutor(
+              offers,
+              // No isolation policy exists yet (phase 5+): neither planning
+              // nor implementation runs require isolation, which is what
+              // lets the in-session compat adapter (isolation "none") stay
+              // eligible.
+              { role: "planner", requiresIsolation: false },
+              { executorId: config.executorId },
+              inFlightCounts(),
+            )
+          : undefined;
+        // A pinned executor that does not offer the planner role is not an
+        // error — it means this deployment has no planner tier. Fall through
+        // rather than refusing to dispatch: the pin's guarantee is "never
+        // silently select someone else", and dropping to the implementer
+        // role on the SAME pinned executor keeps that promise.
+        if (selected && !selected.roles.includes("planner")) selected = undefined;
+        if (!selected) role = "implementer";
+      }
+      if (role === "implementer") {
+        selected = selectExecutor(
+          offers,
+          { role: "implementer", requiresIsolation: false },
+          { executorId: config.executorId },
+          inFlightCounts(),
+        );
+      }
     } catch (e) {
       if (e instanceof ExecutorSelectionError) {
         // Configured-but-absent: error, NO CLAIM — never fall through.
@@ -1494,6 +1859,10 @@ export function registerCoordinator(
       logSkipOnce("no eligible executor for role implementer — no claim");
       return;
     }
+    // The phase the claim enters, and the phase every downstream write in
+    // this tick expects. Kept in one binding so the claim transition, the
+    // activity event, and the request role can never disagree.
+    const claimPhase = role === "planner" ? "planning" : "implementing";
 
     // A FRESH workflow-run holder per claim attempt: reusing one across
     // attempts would read as a same-holder renewal (no epoch bump) and
@@ -1503,8 +1872,9 @@ export function registerCoordinator(
 
     // Claim BY ID (bd's equally-atomic `update --claim`): `ready --claim`
     // is metadata-blind and cannot honor the approved-only filter. A
-    // conflicting claim exits 1 — a lost race, not an error.
-    const candidate = eligible[0]!;
+    // conflicting claim exits 1 — a lost race, not an error. (`candidate`
+    // was bound above — role selection needs it to keep legacy issues out
+    // of the planner tier.)
     let outcome: AcquireOutcome;
     try {
       outcome = await acquireLease(ctx.cwd, {
@@ -1536,6 +1906,7 @@ export function registerCoordinator(
       workflowRunId,
       executorId: selected.executorId,
       phase: "requested",
+      role,
       attempt: 1,
       isolation: selected.isolation,
       supportsCancellation: selected.supportsCancellation,
@@ -1547,15 +1918,16 @@ export function registerCoordinator(
     // Persist intent BEFORE the request is emitted: a crash in the window
     // between claim and accept is reconcilable from metadata (phase 4) and
     // never orphans silently. The write goes through the guarded lifecycle
-    // transition (ready → implementing; a compat claim of a legacy issue is
-    // the migration entry and stamps lifecycle v1) — phase, run id,
+    // transition (ready → planning when a planner was selected, else ready →
+    // implementing; a compat claim of a legacy issue is the migration entry,
+    // always → implementing, and stamps lifecycle v1) — phase, run id,
     // executor id, and attempt land in ONE setMetadata call.
     try {
       await transition(
         ctx.cwd,
         run.issue.id,
         isLifecycleV1(outcome.issue) ? "ready" : undefined,
-        "implementing",
+        claimPhase,
         {
           fields: {
             [WORKGRAPH_WORKFLOW_RUN_ID_KEY]: workflowRunId,
@@ -1580,14 +1952,14 @@ export function registerCoordinator(
       }
       return;
     }
-    // POST-COMMIT: the ready→implementing claim transition resolved.
+    // POST-COMMIT: the ready→planning/implementing claim transition resolved.
     emitActivity({
       kind: "claim",
       issueId: run.issue.id,
-      phase: "implementing",
+      phase: claimPhase,
       workflowRunId,
       actor: actor.bdActor,
-      summary: `claimed for ${selected.executorId}`,
+      summary: `claimed for ${selected.executorId} (${role})`,
     });
 
     const request: RunRequestT = {
@@ -1605,7 +1977,7 @@ export function registerCoordinator(
       },
       workflowRunId,
       leaseEpoch: run.lease.epoch,
-      role: "implementer",
+      role,
       attempt: 1,
       workspace: { baseRevision: "", requiresIsolation: false },
     };
@@ -1947,6 +2319,7 @@ export function registerCoordinator(
         const offer = executorId !== undefined ? offersById.get(executorId) : undefined;
         const makeRun = (
           runPhase: CoordinatorRun["phase"],
+          runRole: CoordinatorRun["role"] = "implementer",
         ): CoordinatorRun => ({
           cwd: ctx.cwd,
           issue: cur,
@@ -1956,10 +2329,37 @@ export function registerCoordinator(
           executorId: executorId ?? "unknown",
           ...(executionId !== undefined ? { executionId } : {}),
           phase: runPhase,
+          role: runRole,
           attempt: attemptOf(cur) ?? 1,
           isolation: offer?.isolation ?? "worktree",
           supportsCancellation: offer?.supportsCancellation ?? false,
         });
+
+        if (phase === "planning") {
+          // A planner run interrupted by downtime. Unlike `implementing`
+          // there is no partial work to protect — nothing has been written
+          // to the tree — so recovery does NOT try to re-adopt a live
+          // planner or reconstruct its completion: it abandons, and the TTL
+          // sweep resets `planning` → `ready` (isActivePhase) for a clean
+          // re-plan. Re-planning is cheap and idempotent; re-adopting would
+          // add a status/reconstruct path whose only saving is one planner
+          // run.
+          report.abandoned.push(issue.id);
+          await recordLeaseEvent(
+            ctx.cwd,
+            "recovery-abandoned",
+            issue.id,
+            {
+              workflowRunId,
+              ...(executorId !== undefined ? { executorId } : {}),
+              ...(executionId !== undefined ? { executionId } : {}),
+              phase: "planning",
+              reason: "planning run interrupted; re-plans after the sweep",
+            },
+            actor.bdActor,
+          );
+          continue;
+        }
 
         if (phase === "implementing") {
           if (executorId === undefined || executionId === undefined) {

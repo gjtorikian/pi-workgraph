@@ -117,15 +117,24 @@ async function auditCount(dir: string, id: string, kind: string): Promise<number
  * await that chain's promise and deadlock. Keep the condition CHEAP and
  * in-memory — a blocking bd read per poll starves the event loop the
  * chain's own bd calls resolve on.
+ *
+ * `intervalMs` exists for the rare poll that MUST read durable state: a bd
+ * read is synchronous and slow, so those callers back the interval off far
+ * enough that the chain's own async bd calls still get the loop between
+ * checks. Do not lower it for a durable condition.
  */
-async function until(cond: () => boolean, timeoutMs = 10_000): Promise<void> {
+async function until(
+  cond: () => boolean,
+  timeoutMs = 10_000,
+  intervalMs = 15,
+): Promise<void> {
   const start = Date.now();
   for (;;) {
     if (cond()) return;
     if (Date.now() - start > timeoutMs) {
       throw new Error("until: condition not met in time");
     }
-    await new Promise((resolve) => setTimeout(resolve, 15));
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
 }
 
@@ -1068,6 +1077,19 @@ describe("graceful shutdown", () => {
       const implementationExec = fake.completions[0]!.executionId;
       expect(revisionExec).not.toBe(implementationExec);
       const runId = supervised.workflowRunId;
+
+      // `revisionInFlight` is set BEFORE the revising→revising self edge
+      // that binds the execution id DURABLY — deliberately, so a teardown
+      // racing that write still cancels the live execution. The assertions
+      // below read that metadata, so gating only on the in-memory flag
+      // races the write and intermittently observes the previous
+      // (implementation) execution id. Wait for the durable binding, at a
+      // relaxed interval because each poll is a blocking bd read.
+      await until(
+        () => activeExecutionIdOf(graph.showIssue(id)) === revisionExec,
+        10_000,
+        250,
+      );
 
       await coordinator.teardown(ectx.ctx); // waits out the 150 ms ack window
       // The cancel targeted the REVISION execution (never the completed

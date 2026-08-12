@@ -73,7 +73,15 @@ export function newEnvelope(now: () => number = Date.now): EnvelopeT {
 // Shared enums
 // ---------------------------------------------------------------------------
 
+/**
+ * `planner` is a v1-safe ADDITION to the role enum, not a redefinition: an
+ * adapter that never offers it is unaffected, and the coordinator only enters
+ * the planning phase when some offer advertises the role (README "The planner
+ * tier"). Order is narrative — the lifecycle runs planner → implementer →
+ * reviewer, with `revision`/`verifier` as the gate's own sub-roles.
+ */
 export const ExecutorRole = StringEnum([
+  "planner",
   "implementer",
   "reviewer",
   "revision",
@@ -154,6 +162,15 @@ export const RunRequest = Type.Object({
   outputSchema: Type.Optional(Type.Unknown()),
   /** Prior judgment findings — used from phase 3. */
   priorFindings: Type.Optional(Type.Array(Type.String())),
+  /**
+   * The accepted plan, attached to the runs DOWNSTREAM of a planner run
+   * (implementer, and revisions of that implementation). Optional and
+   * v1-safe: absent whenever no planner ran, and an adapter that ignores it
+   * behaves exactly as it did before the role existed. Carried as text — the
+   * structured {@link PlanT} lives in the plan comment trail; what the
+   * executor needs is the prompt-ready rendering.
+   */
+  plan: Type.Optional(Type.String()),
 });
 export type RunRequestT = Static<typeof RunRequest>;
 
