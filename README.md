@@ -630,7 +630,12 @@ to models:
 the `reviewer` key entirely. An id that does not resolve fails at spawn
 time and is reported as a failed run, which the judgment gate then has to
 interpret; an absent key is handled cleanly (the role is simply not
-offered). `pi config models` lists what is available.
+offered).
+
+Ids take the `provider/id` form pi's own `--model` flag accepts (e.g.
+`anthropic/claude-opus-5`). `pi update --models` refreshes the catalogs
+they resolve against, and custom providers live in
+`$PI_CODING_AGENT_DIR/models.json`.
 
 The three tiers do not have to be three different models — but a reviewer
 sharing the implementer's model and provider fails the judgment gate's
