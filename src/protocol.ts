@@ -92,6 +92,26 @@ export type ExecutorRoleT = Static<typeof ExecutorRole>;
 export const IsolationLevel = StringEnum(["none", "worktree", "sandbox"]);
 export type IsolationLevelT = Static<typeof IsolationLevel>;
 
+/**
+ * Split a provider off a reported model string ONLY when the format is
+ * unambiguous — the "provider/id" shape with exactly one slash. The model
+ * itself is always reported VERBATIM (what the executor REPORTED, never
+ * what was requested); anything else leaves `provider` unset (both fields
+ * are optional in `RunCompleted.provenance`).
+ *
+ * Lives here rather than in an adapter because EVERY adapter's provenance
+ * feeds one judgment-gate independence check: two adapters splitting by
+ * different rules would make "same provider" mean different things
+ * depending on who ran the work.
+ */
+export function splitProvider(model: string): string | undefined {
+  const idx = model.indexOf("/");
+  if (idx <= 0) return undefined;
+  if (model.indexOf("/", idx + 1) !== -1) return undefined;
+  const provider = model.slice(0, idx);
+  return /\s/.test(provider) ? undefined : provider;
+}
+
 export const RunOutcome = StringEnum(["success", "failure", "blocked"]);
 export type RunOutcomeT = Static<typeof RunOutcome>;
 

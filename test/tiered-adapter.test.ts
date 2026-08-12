@@ -265,6 +265,34 @@ describe("provenance", () => {
     );
   });
 
+  it("populates the provider axis, so independence is not silently model-only", () => {
+    const h = makeHarness();
+    active = h.controller;
+    request(h.mock, "reviewer");
+    h.children[0]!.say("{}", "openai-codex/gpt-5.6-sol");
+    h.children[0]!.finish(0);
+
+    // `checkIndependence` FAILS CLOSED: an undefined axis counts as a
+    // match, so leaving provider unset would quietly reduce the check to
+    // the model axis alone.
+    expect(h.completions[0]!.provenance.provider).toBe("openai-codex");
+    expect(h.completions[0]!.provenance.model).toBe("openai-codex/gpt-5.6-sol");
+  });
+
+  it("leaves provider unset when the model id is not an unambiguous provider/id", () => {
+    const h = makeHarness();
+    active = h.controller;
+    request(h.mock, "implementer");
+    // Fireworks-style ids carry several slashes — splitting them would
+    // invent a provider that does not mean what the axis means.
+    h.children[0]!.say("done", "accounts/fireworks/models/kimi-k3");
+    h.children[0]!.finish(0);
+    expect(h.completions[0]!.provenance.provider).toBeUndefined();
+    expect(h.completions[0]!.provenance.model).toBe(
+      "accounts/fireworks/models/kimi-k3",
+    );
+  });
+
   it("falls back to the requested model only when the run reported none", () => {
     const h = makeHarness();
     active = h.controller;

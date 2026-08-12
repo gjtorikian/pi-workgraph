@@ -58,6 +58,7 @@ import {
   RunCancel,
   RunRequest,
   RunStatusRequest,
+  splitProvider,
   type ExecutorOfferT,
   type ExecutorRoleT,
   type RunCompletedT,
@@ -262,6 +263,8 @@ export function registerTieredExecutor(
 
     const field = STRUCTURED_FIELD[run.role];
     const structured = field ? extractStructured(finalText) : undefined;
+    const effectiveModel = reportedModel ?? run.requestedModel;
+    const provider = splitProvider(effectiveModel);
     const completion: RunCompletedT = {
       ...newEnvelope(nowFn),
       workflowRunId: run.workflowRunId,
@@ -277,7 +280,14 @@ export function registerTieredExecutor(
         // The model the run REPORTED using, never the one requested — a
         // provider-side substitution must surface, not be papered over.
         // Falls back to the requested id only when the child reported none.
-        model: reportedModel ?? run.requestedModel,
+        model: effectiveModel,
+        // The provider axis must be POPULATED to be worth anything:
+        // `checkIndependence` fails closed, so an undefined axis counts as
+        // a match and silently reduces the independence check to the model
+        // axis alone. Split with the same unambiguous-`provider/id` rule
+        // the subagents bridge uses, so the two adapters report provenance
+        // identically.
+        ...(provider !== undefined ? { provider } : {}),
       },
       ...(field && structured !== undefined ? { [field]: structured } : {}),
     } as RunCompletedT;

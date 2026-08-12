@@ -621,27 +621,26 @@ to models:
 --workgraph-tiered-executor='{"enabled":true,"models":{
   "planner":"anthropic/claude-fable-5",
   "implementer":"anthropic/claude-opus-5",
-  "reviewer":"REPLACE_ME"
+  "reviewer":"openai-codex/gpt-5.6-sol"
 }}'
 # or the WORKGRAPH_TIERED_EXECUTOR env var
 ```
 
-`REPLACE_ME` is a placeholder, not a model — substitute a real id or drop
-the `reviewer` key entirely. An id that does not resolve fails at spawn
-time and is reported as a failed run, which the judgment gate then has to
-interpret; an absent key is handled cleanly (the role is simply not
-offered).
+Ids take the `provider/id` form pi's own `--model` flag accepts. `pi update
+--models` refreshes the catalogs they resolve against, and custom providers
+live in `$PI_CODING_AGENT_DIR/models-store.json`. An id that does not
+resolve fails at spawn and is reported as a failed run the judgment gate
+then has to interpret — whereas omitting a role's key is handled cleanly
+(the role is simply not offered), so a wrong id is worse than no id.
 
-Ids take the `provider/id` form pi's own `--model` flag accepts (e.g.
-`anthropic/claude-opus-5`). `pi update --models` refreshes the catalogs
-they resolve against, and custom providers live in
-`$PI_CODING_AGENT_DIR/models.json`.
-
-The three tiers do not have to be three different models — but a reviewer
-sharing the implementer's model and provider fails the judgment gate's
-`requireAuthorIndependence` check on medium and high risk tiers, so the
-review is discarded and the issue escalates. That is the intended
-behavior; pick a distinct reviewer, or accept escalation.
+**On picking the reviewer.** `requireAuthorIndependence` passes when the
+reviewer differs from the author on *at least one* required axis, so
+`anthropic/claude-sonnet-5` reviewing `anthropic/claude-opus-5` is already
+independent — the models differ even though the provider does not. A
+cross-provider reviewer like the example above differs on both, which is
+strictly stronger and survives a provider-side model substitution that
+happens to land on the author's model. Point two roles at the *same* id and
+the review is discarded and the issue escalates; that is intended.
 
 Each run is spawned as `pi --mode json -p --no-session --model <id>`, and
 the model the run **reports** using — never the one requested — becomes
