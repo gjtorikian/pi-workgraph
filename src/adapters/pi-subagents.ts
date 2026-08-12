@@ -47,6 +47,7 @@ import {
   Discover,
   RunCancel,
   RunRequest,
+  splitProvider,
   SUBAGENTS_PACKAGE_NAME,
   SUBAGENTS_SUPPORTED_VERSION_RANGE,
   subagentsVersionInRange,
@@ -228,19 +229,13 @@ function firstResult(result: unknown): UpstreamSingleResult | undefined {
 }
 
 /**
- * Split a provider off a reported model string ONLY when the format is
- * unambiguous — the modelOverride "provider/id" shape with exactly one
- * slash. The model itself is always reported VERBATIM (what upstream
- * REPORTED, never what was requested); anything else leaves `provider`
- * unset (both fields are optional in `RunCompleted.provenance`).
+ * Moved to protocol.ts once a SECOND adapter (the tiered executor) needed
+ * it: both report provenance into the same independence check, so they must
+ * split providers by the same rule, and importing this whole module for one
+ * pure function was the wrong dependency direction. Re-exported here for
+ * existing importers.
  */
-export function splitProvider(model: string): string | undefined {
-  const idx = model.indexOf("/");
-  if (idx <= 0) return undefined;
-  if (model.indexOf("/", idx + 1) !== -1) return undefined;
-  const provider = model.slice(0, idx);
-  return /\s/.test(provider) ? undefined : provider;
-}
+export { splitProvider } from "../protocol.ts";
 
 /** The task prompt an upstream agent receives for a bridged run. */
 export function buildSubagentTask(

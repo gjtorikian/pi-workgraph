@@ -4,6 +4,8 @@
  * then default. The timers are consumed by the Phase 2 lease layer; only the
  * identity override is load-bearing in Phase 1.
  */
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { PolicyOverrides } from "./policy.ts";
 
@@ -21,6 +23,56 @@ export interface SubagentsExecutorConfig {
    * `SUBAGENTS_SUPPORTED_VERSION_RANGE` from protocol.ts.
    */
   versionRange?: string;
+}
+
+/**
+ * The tiered executor: one model per role, each run a fresh `pi` process.
+ * Absent (the default) means the adapter is never registered — the same
+ * double gate the subagents bridge uses.
+ *
+ * `models` is the whole point: a role with NO entry is NOT OFFERED. That is
+ * the safety property. Offering a role with no mapping would spawn on the
+ * ambient default model and silently produce untiered work that still
+ * reports success — the operator asked for tiers precisely to prevent that.
+ */
+/**
+ * What one role runs as. `model` is the only required field; everything
+ * else shapes the spawned process, which is how a role acquires a
+ * CHARACTER rather than just a model — a reviewer can be handed an
+ * adversarial ruleset and a read-only tool set while the implementer is
+ * not.
+ */
+export interface TieredRoleConfig {
+  /** Model id, `provider/id` form (e.g. `anthropic/claude-opus-5`). */
+  model: string;
+  /**
+   * Path to a file appended to this role's system prompt (pi's
+   * `--append-system-prompt`). The seam for agent-agnostic rulesets — e.g.
+   * pointing a reviewer at a minimalism ruleset makes it adversarial to the
+   * implementer's instinct to over-build.
+   *
+   * `~` is expanded. A path that cannot be read REJECTS the run rather than
+   * running without it: a reviewer that quietly lost its ruleset still
+   * returns confident verdicts, and nothing downstream could tell.
+   */
+  appendSystemPrompt?: string;
+  /** Tool allowlist for this role (pi's `--tools`). Omit for pi's default. */
+  tools?: string[];
+  /** Extra args for this role only, appended after the global `piArgs`. */
+  piArgs?: string[];
+}
+
+export interface TieredExecutorConfig {
+  enabled: boolean;
+  /** Role name → role config. Built from `roles` and/or the `models`
+   *  shorthand at parse time, so consumers read one shape. */
+  roles: Record<string, TieredRoleConfig>;
+  /** Extra args appended to EVERY spawned `pi` (advanced; default none). */
+  piArgs?: string[];
+  /** Per-run wall-clock cap before the child is killed (default 30 min). */
+  runTimeoutMs?: number;
+  /** Concurrent runs this executor advertises and enforces (default 2). */
+  maxConcurrency?: number;
 }
 
 export interface WorkgraphConfig {
@@ -75,6 +127,12 @@ export interface WorkgraphConfig {
    * passes the version gate.
    */
   subagentsExecutor?: SubagentsExecutorConfig;
+  /**
+   * Opt-in: register the tiered executor (one model per role). Default
+   * UNDEFINED (disabled) — the adapter ships off, and even when enabled it
+   * offers only the roles that have a model mapped.
+   */
+  tieredExecutor?: TieredExecutorConfig;
 }
 
 export const DEFAULT_LEASE_TTL_MS = 300_000;
@@ -137,6 +195,11 @@ const FLAGS = [
     name: "workgraph-subagents-executor",
     description:
       'Opt-in: register the experimental pi-subagents bridge — "true" or a JSON object like {"enabled":true,"versionRange":"0.32"} (default disabled; env WORKGRAPH_SUBAGENTS_EXECUTOR)',
+  },
+  {
+    name: "workgraph-tiered-executor",
+    description:
+      'Opt-in: register the tiered executor, one model per role — a JSON object like {"enabled":true,"models":{"planner":"anthropic/claude-fable-5","implementer":"anthropic/claude-opus-5","reviewer":"<model>"}}. Only mapped roles are offered (default disabled; env WORKGRAPH_TIERED_EXECUTOR)',
   },
 ] as const;
 
@@ -227,6 +290,203 @@ function subagentsValue(
   }
 }
 
+/** Where a standing tiered-executor config lives, relative to the agent dir. */
+export const TIERED_CONFIG_REL = "configs/workgraph-tiered.json";
+
+/**
+ * Cache TTL for the standing config file, mirroring `CONTEXT_CACHE_TTL_MS`.
+ *
+ * `resolveConfig` is called on EVERY event by `src/index.ts`'s live
+ * getters, so an uncached read means a `readFileSync` per event — and in
+ * the overwhelmingly common case (no file) an ENOENT throw per event, with
+ * stack capture, which is far more expensive than the read would have been.
+ * Ten seconds bounds staleness to about one tick while making the hot path
+ * a clock comparison.
+ */
+export const TIERED_CONFIG_CACHE_TTL_MS = 10_000;
+
+interface TieredFileCacheEntry {
+  fetchedAt: number;
+  value: TieredExecutorConfig | undefined;
+}
+
+const tieredFileCache = new Map<string, TieredFileCacheEntry>();
+
+/** Drop the standing-config cache (tests that write the file mid-run). */
+export function resetTieredConfigCacheForTest(): void {
+  tieredFileCache.clear();
+}
+
+/** String array or undefined, dropping non-strings rather than failing. */
+function stringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out = value.filter((v): v is string => typeof v === "string" && v !== "");
+  return out.length > 0 ? out : undefined;
+}
+
+/**
+ * Build the role map from either shape. `roles` (full per-role config) and
+ * `models` (role→id shorthand) may both appear; `roles` wins per role, so a
+ * config can name most tiers tersely and expand only the one that needs a
+ * ruleset. Entries missing a usable model are dropped — the not-offered
+ * safety property is enforced by absence, so a malformed entry must not
+ * become an offered role.
+ */
+function parseRoles(record: Record<string, unknown>): Record<string, TieredRoleConfig> {
+  const roles: Record<string, TieredRoleConfig> = {};
+
+  const rawModels = record.models;
+  if (rawModels && typeof rawModels === "object" && !Array.isArray(rawModels)) {
+    for (const [role, model] of Object.entries(rawModels as Record<string, unknown>)) {
+      if (typeof model === "string" && model !== "") roles[role] = { model };
+    }
+  }
+
+  const rawRoles = record.roles;
+  if (rawRoles && typeof rawRoles === "object" && !Array.isArray(rawRoles)) {
+    for (const [role, value] of Object.entries(rawRoles as Record<string, unknown>)) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      const entry = value as Record<string, unknown>;
+      const model = entry.model;
+      if (typeof model !== "string" || model === "") continue;
+      const tools = stringArray(entry.tools);
+      const piArgs = stringArray(entry.piArgs);
+      roles[role] = {
+        model,
+        ...(typeof entry.appendSystemPrompt === "string" &&
+        entry.appendSystemPrompt !== ""
+          ? { appendSystemPrompt: entry.appendSystemPrompt }
+          : {}),
+        ...(tools ? { tools } : {}),
+        ...(piArgs ? { piArgs } : {}),
+      };
+    }
+  }
+  return roles;
+}
+
+/** Shape a parsed JSON object into a config, or undefined if unusable. */
+function tieredFromRecord(
+  record: Record<string, unknown>,
+  source: string,
+): TieredExecutorConfig | undefined {
+  if (record.enabled !== true) return undefined;
+  const roles = parseRoles(record);
+  if (Object.keys(roles).length === 0) {
+    console.error(
+      `[pi-workgraph] ${source} is enabled but maps no role to a model — ` +
+        `the tiered executor stays DISABLED. Map at least one role, e.g. ` +
+        `{"enabled":true,"models":{"implementer":"anthropic/claude-opus-5"}}.`,
+    );
+    return undefined;
+  }
+  const piArgs = stringArray(record.piArgs);
+  const runTimeoutMs =
+    typeof record.runTimeoutMs === "number" && record.runTimeoutMs > 0
+      ? record.runTimeoutMs
+      : undefined;
+  const maxConcurrency =
+    typeof record.maxConcurrency === "number" && record.maxConcurrency > 0
+      ? record.maxConcurrency
+      : undefined;
+  return {
+    enabled: true,
+    roles,
+    ...(piArgs ? { piArgs } : {}),
+    ...(runTimeoutMs !== undefined ? { runTimeoutMs } : {}),
+    ...(maxConcurrency !== undefined ? { maxConcurrency } : {}),
+  };
+}
+
+/**
+ * Resolve the tiered-executor config: flag, then env, then the standing
+ * agent-dir file. There is deliberately NO boolean shorthand — "enabled"
+ * with no roles is a request to tier with no tiers, which is the
+ * silent-untiered-work failure the adapter exists to prevent, so it
+ * resolves to disabled with a named warning rather than a half-on adapter.
+ *
+ * The FILE is the answer to "every project should use the same tiers": the
+ * agent dir is global, so one file governs every project and every session.
+ * Flag and env still win, which is what a sandbox or a one-off run needs to
+ * differ without editing shared state. The file is not more or less
+ * reliable than the env var — it is the STANDING default, where the env var
+ * is a per-invocation override.
+ */
+function tieredValue(
+  pi: ExtensionAPI,
+  flag: string,
+  envVar: string,
+  agentDir: string | undefined,
+): TieredExecutorConfig | undefined {
+  const raw = stringValue(pi, flag, envVar);
+  if (raw !== undefined) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      // An explicitly-supplied but broken value does NOT fall through to
+      // the file: silently running someone else's tiers because your own
+      // JSON had a typo is worse than running none.
+      console.error(
+        `[pi-workgraph] ignoring unparseable ${flag}/${envVar} value (not JSON)`,
+      );
+      return undefined;
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return undefined;
+    }
+    return tieredFromRecord(parsed as Record<string, unknown>, `${flag}/${envVar}`);
+  }
+  return agentDir === undefined ? undefined : tieredFromFile(agentDir);
+}
+
+/**
+ * Read the standing config from `<agent-dir>/configs/workgraph-tiered.json`.
+ * A missing file is the normal case (the adapter ships disabled) and is
+ * silent; a file that EXISTS but cannot be parsed is loud, because the
+ * operator plainly meant to configure something.
+ *
+ * The agent dir is INJECTED rather than resolved here. Resolving it means
+ * calling pi's `getAgentDir()`, and importing that would add the first
+ * runtime (non-type) dependency on `@earendil-works/pi-coding-agent` to a
+ * module every other module imports — pulling the whole coding agent into
+ * every consumer and every test process. `src/index.ts` is the one place
+ * pi is already the host, so it supplies the value. Hardcoding
+ * `~/.pi/agent` instead was rejected: both the env var name and the config
+ * dir are REBRANDABLE (`${APP_NAME}_CODING_AGENT_DIR`,
+ * `pkg.piConfig.configDir`), so a hardcoded path silently reads the wrong
+ * directory under a rebranded host such as arc.
+ */
+function tieredFromFile(agentDir: string): TieredExecutorConfig | undefined {
+  const path = join(agentDir, TIERED_CONFIG_REL);
+  const now = Date.now();
+  const hit = tieredFileCache.get(path);
+  if (hit && now - hit.fetchedAt < TIERED_CONFIG_CACHE_TTL_MS) return hit.value;
+  const value = readTieredFile(path);
+  tieredFileCache.set(path, { fetchedAt: now, value });
+  return value;
+}
+
+function readTieredFile(path: string): TieredExecutorConfig | undefined {
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    return undefined; // absent — the default
+  }
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      console.error(`[pi-workgraph] ${path} is not a JSON object — ignoring`);
+      return undefined;
+    }
+    return tieredFromRecord(parsed as Record<string, unknown>, path);
+  } catch {
+    console.error(`[pi-workgraph] ${path} is not valid JSON — ignoring`);
+    return undefined;
+  }
+}
+
 function boolValue(
   pi: ExtensionAPI,
   flag: string,
@@ -246,8 +506,19 @@ function boolValue(
   return fallback;
 }
 
-/** Resolve the effective configuration (flag > env > default). */
-export function resolveConfig(pi: ExtensionAPI): WorkgraphConfig {
+/**
+ * Resolve the effective configuration (flag > env > default).
+ *
+ * `agentDir` is optional and only the tiered executor reads it, for its
+ * standing config file. Omitting it means no file is consulted — which is
+ * what every direct-import consumer (tests, protocol-only users) wants, and
+ * why this module still has ZERO runtime dependency on pi. `src/index.ts`
+ * passes it.
+ */
+export function resolveConfig(
+  pi: ExtensionAPI,
+  agentDir?: string,
+): WorkgraphConfig {
   const pollMs = timerValue(
     pi,
     "workgraph-poll-ms",
@@ -307,6 +578,12 @@ export function resolveConfig(pi: ExtensionAPI): WorkgraphConfig {
       pi,
       "workgraph-subagents-executor",
       "WORKGRAPH_SUBAGENTS_EXECUTOR",
+    ),
+    tieredExecutor: tieredValue(
+      pi,
+      "workgraph-tiered-executor",
+      "WORKGRAPH_TIERED_EXECUTOR",
+      agentDir,
     ),
   };
 }

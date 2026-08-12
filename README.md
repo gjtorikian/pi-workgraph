@@ -27,9 +27,10 @@ sessions, harnesses, and machines. Everything else is delegated:
 │ pi-workgraph + beads      │   discover / offer / request   │ executor adapters:        │
 │ issues & dependencies,    │ ◄───────────────────────────── │ · in-session (compat,     │
 │ atomic claims, expiring   │    accept / complete / status  │   default)                │
-│ leases + fencing, the     │                                │ · pi-subagents bridge     │
-│ approval → judgment       │                                │   (opt-in)                │
-│ lifecycle, audit trail    │                                │ · your adapter            │
+│ leases + fencing, the     │                                │ · tiered: one model per   │
+│ approval → judgment       │                                │   role (opt-in)           │
+│ lifecycle, audit trail    │                                │ · pi-subagents (opt-in)   │
+│                           │                                │ · your adapter            │
 └───────────┬───────────────┘                                └───────────────────────────┘
             │ post-commit activity events + audit comments
             ▼
@@ -49,7 +50,7 @@ sessions, harnesses, and machines. Everything else is delegated:
   implementation, review, revision, and verification requests. The
   in-session adapter (the
   v0.1 "wake this agent" behavior as an explicit adapter) ships enabled;
-  the [pi-subagents bridge](#6-optional-executor-the-pi-subagents-bridge)
+  the [pi-subagents bridge](#7-optional-executor-the-pi-subagents-bridge)
   ships disabled.
 - **Communication** — observers of the audit trail and
   `workgraph:v1:activity` events, and remote transports via the
@@ -154,11 +155,12 @@ import { CH, RunCompleted, parseMessage } from "pi-workgraph/protocol";
 `pi-workgraph/protocol` is session-free: importing it registers nothing
 and pulls in no session-bound module. It does import `@earendil-works/pi-ai`
 and `typebox` at runtime (both peer dependencies), so protocol-only
-consumers need those installed. The two adapters are also exported for
-custom wiring — `pi-workgraph/adapters/in-session` and
-`pi-workgraph/adapters/pi-subagents` (these ARE session-bound; they exist
-to be registered against a Pi session). This is a documented consumption
-pattern with an import smoke test, not a separately tested install mode.
+consumers need those installed. The three adapters are also exported for
+custom wiring — `pi-workgraph/adapters/in-session`,
+`pi-workgraph/adapters/tiered`, and `pi-workgraph/adapters/pi-subagents`
+(these ARE session-bound; they exist to be registered against a Pi
+session). This is a documented consumption pattern with an import smoke
+test, not a separately tested install mode.
 
 ## Migrating from v0.1
 
@@ -606,12 +608,122 @@ work to protect — it is abandoned, and the TTL sweep resets `planning` →
 Model tiering (a heavier model plans, a capable one implements, a third
 reviews) is a property of the **executor adapter**, not of this package:
 the coordinator selects by role and validates reported provenance, and
-deliberately does no model routing (see `src/policy.ts`). An adapter that
-maps role → model gets tiering; the judgment gate's
-`requireAuthorIndependence` then enforces that the reviewer differs from the
-author on model and provider.
+deliberately does no model routing (see `src/policy.ts`). The bundled
+[tiered executor](#6-optional-executor-the-tiered-executor) is that adapter.
 
-### 6. Optional executor: the pi-subagents bridge
+### 6. Optional executor: the tiered executor
+
+One model per role, each run a fresh `pi` process. This is the adapter the
+planner tier exists for. It ships **disabled**; enable it by mapping roles
+to models:
+
+Configuration resolves **flag → env → standing file**:
+
+```jsonc
+// $PI_CODING_AGENT_DIR/configs/workgraph-tiered.json
+{
+  "enabled": true,
+  "models": {
+    "planner": "anthropic/claude-fable-5",
+    "implementer": "anthropic/claude-opus-5",
+    "reviewer": "openai-codex/gpt-5.6-sol"
+  }
+}
+```
+
+The agent dir is global, so that one file governs **every project and every
+session** — no flag to remember at boot. `--workgraph-tiered-executor='{…}'`
+and `WORKGRAPH_TIERED_EXECUTOR` still win, which is what a sandbox or a
+one-off run needs in order to differ.
+
+An override **replaces** the standing config rather than merging into it: a
+deep merge would silently run a tier you did not name in the override you
+were looking at. A *broken* override does not fall back to the file either —
+running someone else's tiers because your JSON had a typo is worse than
+running none.
+
+#### Giving a role a character
+
+`models` is shorthand. The full form gives a role a ruleset and a tool set,
+which is how a tier becomes more than a model choice:
+
+```jsonc
+{
+  "enabled": true,
+  "models": { "planner": "anthropic/claude-fable-5" },
+  "roles": {
+    "implementer": { "model": "anthropic/claude-opus-5" },
+    "reviewer": {
+      "model": "openai-codex/gpt-5.6-sol",
+      "appendSystemPrompt": "~/rules/minimalism.md",
+      "tools": ["read", "grep", "find", "ls", "bash"]
+    }
+  }
+}
+```
+
+Both shapes may appear together; `roles` wins per role, so most tiers stay
+terse and only the one needing a ruleset expands.
+
+`appendSystemPrompt` is the **adversarial-review seam**. Any agent-agnostic
+ruleset works — [ponytail](https://ponytail.dev)'s `AGENTS.md`, for instance,
+pushes against over-engineering, so a reviewer carrying it argues with the
+implementer's instinct to over-build. A configured-but-missing file
+**rejects the run**: a reviewer silently stripped of its ruleset still
+returns confident verdicts, and nothing downstream could tell.
+
+> **Match findings to criteria.** The judgment gate blocks on findings whose
+> `severity` is `blocking`, and a ruleset-driven reviewer will happily raise
+> blocking findings about matters the acceptance criteria never mentioned —
+> the implementer cannot satisfy them, revisions burn `maxRevisions`, and the
+> issue escalates. Either instruct the reviewer to mark out-of-criteria
+> observations `advisory`, or run that work at the `low` risk tier, where the
+> gate is advisory and findings are recorded without blocking.
+
+Ids take the `provider/id` form pi's own `--model` flag accepts. `pi update
+--models` refreshes the catalogs they resolve against, and custom providers
+live in `$PI_CODING_AGENT_DIR/models-store.json`. An id that does not
+resolve fails at spawn and is reported as a failed run the judgment gate
+then has to interpret — whereas omitting a role's key is handled cleanly
+(the role is simply not offered), so a wrong id is worse than no id.
+
+**On picking the reviewer.** `requireAuthorIndependence` passes when the
+reviewer differs from the author on *at least one* required axis, so
+`anthropic/claude-sonnet-5` reviewing `anthropic/claude-opus-5` is already
+independent — the models differ even though the provider does not. A
+cross-provider reviewer like the example above differs on both, which is
+strictly stronger and survives a provider-side model substitution that
+happens to land on the author's model. Point two roles at the *same* id and
+the review is discarded and the issue escalates; that is intended.
+
+Each run is spawned as `pi --mode json -p --no-session --model <id>`, and
+the model the run **reports** using — never the one requested — becomes
+`provenance.model`. A provider-side substitution therefore surfaces as a
+failed independence check rather than as fake tiering.
+
+Three properties worth knowing:
+
+- **A role with no configured model is NOT offered.** Falling back to the
+  ambient default would produce untiered work that still reports success —
+  indistinguishable from the tiering you asked for. Map `reviewer` and the
+  judgment gate gets an independent reviewer; leave it unmapped and the
+  coordinator looks elsewhere.
+- **Isolation is `none`, honestly.** Runs execute in the session's cwd; this
+  adapter creates no worktrees. Advertising `worktree` without making one
+  would be a lie the coordinator relies on when filtering offers. That is
+  also why `maxConcurrency` defaults to 2 — concurrent mutating runs share
+  one tree. Worktree isolation is a follow-up.
+- **Structured output rides the prompt.** pi's CLI exposes no output-schema
+  flag, so a request carrying `outputSchema` gets the schema inlined with an
+  instruction to end on bare JSON; the final message is parsed into `plan`
+  or `verdict`. Unparseable output is reported *without* the field, and the
+  core's existing invalid-payload path audits and escalates it — the adapter
+  never invents one.
+
+Options: `roles` and/or `models` (at least one role required), `piArgs`,
+`runTimeoutMs` (default 30 min), `maxConcurrency` (default 2).
+
+### 7. Optional executor: the pi-subagents bridge
 
 > **Experimental and version-gated.** The bridge talks to
 > [pi-subagents](https://github.com/fitchmultz/pi-subagents) **by event

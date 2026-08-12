@@ -7,9 +7,10 @@
  * Loads with no build step: Pi's jiti loader consumes this TypeScript
  * directly via the `"pi": { "extensions": ["./src/index.ts"] }` manifest.
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerInSessionExecutor } from "./adapters/in-session.ts";
 import { registerPiSubagentsExecutor } from "./adapters/pi-subagents.ts";
+import { registerTieredExecutor } from "./adapters/tiered.ts";
 import { bdBinaryAvailable, bindExec } from "./bd.ts";
 import { registerCompactionTakeover } from "./compaction.ts";
 import { registerConfigFlags, resolveConfig } from "./config.ts";
@@ -35,7 +36,7 @@ export default function piWorkgraph(pi: ExtensionAPI): void {
   // next one, never instantly (see the adapter's header). It gates itself
   // on `compatInSessionExecutor` (default true) at every event, so a
   // disabled adapter never offers.
-  registerInSessionExecutor(pi, { getConfig: () => resolveConfig(pi) });
+  registerInSessionExecutor(pi, { getConfig: () => resolveConfig(pi, getAgentDir()) });
 
   // The OPTIONAL pi-subagents bridge (phase 5) — DOUBLE-gated: this outer
   // gate never calls the register function unless `subagentsExecutor` is
@@ -47,9 +48,22 @@ export default function piWorkgraph(pi: ExtensionAPI): void {
   let subagentsRegistered = false;
   pi.on("session_start", () => {
     if (subagentsRegistered) return;
-    if (resolveConfig(pi).subagentsExecutor?.enabled !== true) return;
+    if (resolveConfig(pi, getAgentDir()).subagentsExecutor?.enabled !== true) return;
     subagentsRegistered = true;
-    registerPiSubagentsExecutor(pi, { getConfig: () => resolveConfig(pi) });
+    registerPiSubagentsExecutor(pi, { getConfig: () => resolveConfig(pi, getAgentDir()) });
+  });
+
+  // The OPTIONAL tiered executor (one model per role) — double-gated the
+  // same way, and deferred to session_start for the same reason: the
+  // role→model map arrives by flag or env, neither readable at load. Also
+  // registered BEFORE the coordinator's handler so its subscriptions exist
+  // before the first discovery pass.
+  let tieredRegistered = false;
+  pi.on("session_start", () => {
+    if (tieredRegistered) return;
+    if (resolveConfig(pi, getAgentDir()).tieredExecutor?.enabled !== true) return;
+    tieredRegistered = true;
+    registerTieredExecutor(pi, { getConfig: () => resolveConfig(pi, getAgentDir()) });
   });
 
   // The coordinator resolves config lazily; the 5 s poll floor lives HERE
@@ -62,7 +76,7 @@ export default function piWorkgraph(pi: ExtensionAPI): void {
   // release immediately; isolated executions get cancel-first semantics).
   const coordinator = registerCoordinator(pi, {
     getConfig: () => {
-      const config = resolveConfig(pi);
+      const config = resolveConfig(pi, getAgentDir());
       return { ...config, pollMs: Math.max(config.pollMs, MIN_POLL_MS) };
     },
   });
@@ -75,7 +89,7 @@ export default function piWorkgraph(pi: ExtensionAPI): void {
   // tiny intervals.
   registerSweep(pi, {
     getConfig: () => {
-      const config = resolveConfig(pi);
+      const config = resolveConfig(pi, getAgentDir());
       return {
         ...config,
         sweepIntervalMs: Math.max(config.sweepIntervalMs, MIN_POLL_MS),
@@ -113,7 +127,7 @@ export default function piWorkgraph(pi: ExtensionAPI): void {
     // identity override, and resolve the session-id component of workerId()
     // now that a ctx exists.
     bdBinaryAvailable(true);
-    setWorkerIdOverride(resolveConfig(pi).workerIdOverride);
+    setWorkerIdOverride(resolveConfig(pi, getAgentDir()).workerIdOverride);
     noteSessionId(ctx.sessionManager.getSessionId());
   });
 }
