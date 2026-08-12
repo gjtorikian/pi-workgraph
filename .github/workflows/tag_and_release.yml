@@ -1,0 +1,26 @@
+name: Tag and Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request_target:
+    types:
+      - closed
+
+permissions:
+  pull-requests: write
+  contents: write
+  id-token: write
+  actions: write
+
+jobs:
+  node:
+    uses: gjtorikian/actions/.github/workflows/node_package_release.yml@main
+    secrets:
+      gh_token: ${{ secrets.GITHUB_TOKEN }}
+    with:
+      version_filepath: package.json
+      prepare: ${{ github.event_name == 'push' }}
+      release: ${{ github.event_name == 'workflow_dispatch' || ((github.event.pull_request.merged == true) && (contains(github.event.pull_request.labels.*.name, 'release'))) }}
