@@ -114,7 +114,7 @@ export function registerCompactionTakeover(
         event.preparation,
         model,
         auth.apiKey,
-        auth.headers,
+        sendableHeaders(auth.headers),
         instructions,
         event.signal,
         ctx.thinkingLevel,
@@ -126,4 +126,29 @@ export function registerCompactionTakeover(
       return undefined; // never block compaction
     }
   });
+}
+
+/**
+ * Drop null-valued headers before handing them to `compact()`.
+ *
+ * `getApiKeyAndHeaders` returns pi-ai's `ProviderHeaders`
+ * (`Record<string, string | null>`), where a null value means "do not send
+ * this header" — the provider layer's way of suppressing a default.
+ * `compact()` accepts `Record<string, string>`, so the two types disagree
+ * by exactly that suppression channel.
+ *
+ * Filtering, not casting: a cast would forward `null` as a header VALUE,
+ * which is the opposite of what null means here — the request would carry
+ * a header the provider layer explicitly suppressed. Dropping the entry is
+ * what the null was asking for.
+ */
+function sendableHeaders(
+  headers: Record<string, string | null> | undefined,
+): Record<string, string> | undefined {
+  if (!headers) return undefined;
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (typeof value === "string") out[key] = value;
+  }
+  return out;
 }
