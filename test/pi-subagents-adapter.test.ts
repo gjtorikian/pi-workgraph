@@ -67,7 +67,7 @@ interface BridgeHarness {
 
 function makeBridgeHarness(
   overrides: Partial<WorkgraphConfig> = {},
-  probe: () => string | undefined = () => "0.32.0",
+  probe: () => string | undefined = () => "0.34.8",
 ): BridgeHarness {
   const mock = makeMockPi();
   const warnings: string[] = [];
@@ -88,6 +88,8 @@ function makeRunRequest(overrides: Partial<RunRequestT> = {}): RunRequestT {
       id: "wg-7",
       title: "wire the flux capacitor",
       acceptanceCriteria: "the capacitor fluxes",
+      workflowClass: "reviewed",
+      riskTier: "medium",
     },
     workflowRunId: "workgraph-run/sub-run-1",
     leaseEpoch: 3,
@@ -117,7 +119,7 @@ describe("bridge registration gating", () => {
     expect(offers[0]).toMatchObject({
       inReplyTo: discover.messageId,
       executorId: PI_SUBAGENTS_EXECUTOR_ID,
-      roles: ["implementer", "reviewer", "revision"],
+      roles: ["planner", "implementer", "reviewer", "revision"],
       harness: "pi-subagents",
       isolation: "worktree",
       supportsCancellation: true,
@@ -135,7 +137,7 @@ describe("bridge registration gating", () => {
     delete (config as Partial<WorkgraphConfig>).subagentsExecutor;
     const bridge = registerPiSubagentsExecutor(asExtensionAPI(mock), {
       getConfig: () => config,
-      probeVersion: () => "0.32.0",
+      probeVersion: () => "0.34.8",
       warn: (message) => warnings.push(message),
     });
     expect(bridge.active()).toBe(false);
@@ -161,7 +163,7 @@ describe("bridge registration gating", () => {
     expect(mock.busHandlerCount()).toBe(0);
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toMatch(/0\.99\.0/);
-    expect(warnings[0]).toMatch(/0\.32\.x/);
+    expect(warnings[0]).toMatch(/0\.34\.x/);
     mock.events.emit(CH.discover, newEnvelope());
     expect(busOn(mock, CH.offer)).toHaveLength(0);
   });
@@ -183,9 +185,65 @@ describe("bridge registration gating", () => {
     expect(warnings).toHaveLength(0);
     bridge.teardown();
     // The range matcher is a strict major.minor prefix.
-    expect(subagentsVersionInRange("0.32.5")).toBe(true);
-    expect(subagentsVersionInRange("0.320.0")).toBe(false);
-    expect(subagentsVersionInRange("1.32.0")).toBe(false);
+    expect(subagentsVersionInRange("0.34.8")).toBe(true);
+    expect(subagentsVersionInRange("0.340.0")).toBe(false);
+    expect(subagentsVersionInRange("1.34.0")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// planner round-trip: named route + structured plan transport
+// ---------------------------------------------------------------------------
+
+describe("planner round-trip", () => {
+  it("uses the planned-work profile override and returns structured output as the plan", () => {
+    const { mock, bridge } = makeBridgeHarness({
+      subagentsExecutor: {
+        enabled: true,
+        routes: { planned: { planner: "architecture-planner" } },
+      },
+    });
+    const plan = {
+      summary: "wire it safely",
+      steps: [{ description: "inspect the flux circuit" }],
+    };
+    const fake = installFakeSubagents(mock.events, {
+      script: { model: "planner-model", structuredOutput: plan },
+    });
+    try {
+      const schema = { type: "object", properties: { steps: {} } };
+      const request = makeRunRequest({
+        role: "planner",
+        workflowRunId: "workgraph-run/sub-run-plan",
+        issue: {
+          id: "wg-7",
+          title: "wire the flux capacitor",
+          acceptanceCriteria: "the capacitor fluxes",
+          workflowClass: "planned",
+          riskTier: "high",
+        },
+        outputSchema: schema,
+      });
+      mock.events.emit(CH.runRequest, request);
+
+      expect(fake.requests).toHaveLength(1);
+      const params = fake.requests[0]!.params;
+      expect(params.agent).toBe("architecture-planner");
+      expect(params.worktree).toBe(false);
+      expect(params.context).toBe("fresh");
+      expect(params.outputSchema).toEqual(schema);
+      expect(String(params.task)).toContain("Do not modify product code");
+
+      const completions = busOn(mock, CH.runCompleted) as Array<
+        RunCompletedT & { plan?: unknown }
+      >;
+      expect(completions).toHaveLength(1);
+      expect(completions[0]!.plan).toEqual(plan);
+      expect(completions[0]!.provenance.model).toBe("planner-model");
+    } finally {
+      fake.uninstall();
+      bridge.teardown();
+    }
   });
 });
 
@@ -194,6 +252,34 @@ describe("bridge registration gating", () => {
 // ---------------------------------------------------------------------------
 
 describe("implementer round-trip", () => {
+  it("routes one-shot implementation to its configured economy profile", () => {
+    const { mock, bridge } = makeBridgeHarness({
+      subagentsExecutor: {
+        enabled: true,
+        routes: { oneshot: { implementer: "economy-worker" } },
+      },
+    });
+    const fake = installFakeSubagents(mock.events);
+    try {
+      mock.events.emit(
+        CH.runRequest,
+        makeRunRequest({
+          issue: {
+            id: "wg-7",
+            title: "rename a local helper",
+            workflowClass: "oneshot",
+            riskTier: "low",
+          },
+        }),
+      );
+      expect(fake.requests[0]!.params.agent).toBe("economy-worker");
+      expect(fake.requests[0]!.params.worktree).toBe(true);
+    } finally {
+      fake.uninstall();
+      bridge.teardown();
+    }
+  });
+
   it("request → upstream worker launch → accepted → completed with REPORTED provenance", () => {
     const { mock, bridge } = makeBridgeHarness();
     const fake = installFakeSubagents(mock.events, {
@@ -604,7 +690,7 @@ describe("two executors: selection determinism", () => {
     });
     const bridge = registerPiSubagentsExecutor(asExtensionAPI(mock), {
       getConfig: () => config,
-      probeVersion: () => "0.32.0",
+      probeVersion: () => "0.34.8",
       warn: () => {},
     });
     return {

@@ -6,6 +6,19 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { PolicyOverrides } from "./policy.ts";
+import type { WorkflowClassT } from "./types.ts";
+
+export type SubagentsRoleRoutes = Partial<
+  Record<
+    "planner" | "implementer" | "reviewer" | "revision" | "verifier",
+    string
+  >
+>;
+
+/** Named pi-subagents profiles selected by workflow class and protocol role. */
+export type SubagentsWorkflowRoutes = Partial<
+  Record<WorkflowClassT, SubagentsRoleRoutes>
+>;
 
 /**
  * Opt-in block for the pi-subagents bridge (phase 5). Absent (the default)
@@ -16,11 +29,13 @@ import type { PolicyOverrides } from "./policy.ts";
 export interface SubagentsExecutorConfig {
   enabled: boolean;
   /**
-   * Accepted upstream `major.minor` version prefix (e.g. "0.32" accepts
-   * every 0.32.x). Default: the harvest-verified
+   * Accepted upstream `major.minor` version prefix (e.g. "0.34" accepts
+   * every 0.34.x). Default: the contract-verified
    * `SUBAGENTS_SUPPORTED_VERSION_RANGE` from protocol.ts.
    */
   versionRange?: string;
+  /** Optional workflow-class + role overrides for named subagent profiles. */
+  routes?: SubagentsWorkflowRoutes;
 }
 
 export interface WorkgraphConfig {
@@ -135,7 +150,7 @@ const FLAGS = [
   {
     name: "workgraph-subagents-executor",
     description:
-      'Opt-in: register the experimental pi-subagents bridge — "true" or a JSON object like {"enabled":true,"versionRange":"0.32"} (default disabled; env WORKGRAPH_SUBAGENTS_EXECUTOR)',
+      'Opt-in: register the experimental pi-subagents bridge — "true" or JSON with versionRange/routes (default disabled; env WORKGRAPH_SUBAGENTS_EXECUTOR)',
   },
 ] as const;
 
@@ -212,11 +227,13 @@ function subagentsValue(
       return undefined;
     }
     const record = parsed as Record<string, unknown>;
+    const routes = parseSubagentsRoutes(record.routes);
     return {
       enabled: record.enabled === true,
       ...(typeof record.versionRange === "string" && record.versionRange
         ? { versionRange: record.versionRange }
         : {}),
+      ...(routes !== undefined ? { routes } : {}),
     };
   } catch {
     console.error(
@@ -224,6 +241,48 @@ function subagentsValue(
     );
     return undefined;
   }
+}
+
+function parseSubagentsRoutes(
+  raw: unknown,
+): SubagentsWorkflowRoutes | undefined {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return undefined;
+  }
+  const workflowClasses: WorkflowClassT[] = [
+    "oneshot",
+    "reviewed",
+    "planned",
+  ];
+  const roles: (keyof SubagentsRoleRoutes)[] = [
+    "planner",
+    "implementer",
+    "reviewer",
+    "revision",
+    "verifier",
+  ];
+  const input = raw as Record<string, unknown>;
+  const routes: SubagentsWorkflowRoutes = {};
+  for (const workflowClass of workflowClasses) {
+    const candidate = input[workflowClass];
+    if (
+      candidate === null ||
+      typeof candidate !== "object" ||
+      Array.isArray(candidate)
+    ) {
+      continue;
+    }
+    const record = candidate as Record<string, unknown>;
+    const roleRoutes: SubagentsRoleRoutes = {};
+    for (const role of roles) {
+      const agent = record[role];
+      if (typeof agent === "string" && agent.trim() !== "") {
+        roleRoutes[role] = agent.trim();
+      }
+    }
+    if (Object.keys(roleRoutes).length > 0) routes[workflowClass] = roleRoutes;
+  }
+  return Object.keys(routes).length > 0 ? routes : undefined;
 }
 
 function boolValue(

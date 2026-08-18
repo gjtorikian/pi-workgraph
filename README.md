@@ -561,12 +561,12 @@ The bridge ships **disabled**. Opt in explicitly:
 # flag (or env WORKGRAPH_SUBAGENTS_EXECUTOR)
 --workgraph-subagents-executor=true
 # or with an explicit accepted upstream major.minor range:
---workgraph-subagents-executor='{"enabled":true,"versionRange":"0.32"}'
+--workgraph-subagents-executor='{"enabled":true,"versionRange":"0.34"}'
 ```
 
 When configured and version-gated, it answers discovery as
-`executorId: "pi-subagents"` offering `implementer`, `reviewer`, and
-`revision` roles with `isolation: "worktree"` and a priority above the
+`executorId: "pi-subagents"` offering `planner`, `implementer`, `reviewer`,
+and `revision` roles with `isolation: "worktree"` and a priority above the
 in-session adapter — an operator who opted in prefers isolated background
 workers. Unconfigured, the bridge is **never registered**: an unconfigured
 extension answers discovery with no subagents offer and holds zero bus
@@ -580,9 +580,36 @@ Two semantics worth knowing:
   maps that to implementation-completion evidence at most; a reviewer
   verdict is emitted only from a **separately launched** reviewer run's
   structured output.
-- **Reported provenance.** Completions carry the model upstream *reported
-  using*, never the one requested; the provider is split off only when the
+- **Reported provenance.** Completions carry the model upstream _reported
+  using_, never the one requested; the provider is split off only when the
   `provider/id` format is unambiguous.
+
+The bridge uses named upstream profiles and can route them by workflow class
+and role without hard-coding model IDs into the control plane:
+
+```bash
+--workgraph-subagents-executor='{
+  "enabled": true,
+  "routes": {
+    "oneshot": { "implementer": "economy-worker" },
+    "reviewed": {
+      "implementer": "worker",
+      "reviewer": "reviewer",
+      "revision": "fixer"
+    },
+    "planned": {
+      "planner": "planner",
+      "implementer": "worker",
+      "reviewer": "reviewer",
+      "revision": "fixer"
+    }
+  }
+}'
+```
+
+Configure the named profiles' model, thinking level, and fallbacks in Pi or
+pi-subagents settings. The bridge was contract-tested against pi-subagents
+0.34.8; other major.minor lines remain fail-closed until re-verified.
 
 **Activity events**: the coordinator publishes `workgraph:v1:activity` on
 every canonical lifecycle change it commits (claim, phase transition,

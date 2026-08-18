@@ -343,15 +343,16 @@ export type ActivityT = Static<typeof Activity>;
  * anywhere in pi-subagents @ commit 3fc6b6b) — so the bridge probes the
  * INSTALLED package's package.json (a filesystem read, never an import) and
  * refuses to bridge unless the version falls inside this range. The range
- * is a `major.minor` prefix: `"0.32"` accepts every `0.32.x` patch and
+ * is a `major.minor` prefix: `"0.34"` accepts every `0.34.x` patch and
  * nothing else. `subagentsExecutor.versionRange` config overrides it.
  *
- * Harvest provenance: pi-subagents @ commit 3fc6b6b, package version 0.32.0.
+ * Re-verified against pi-subagents 0.34.8: event names, request parameters,
+ * response shape, structured output, progress, and cancellation are intact.
  */
 export const SUBAGENTS_PACKAGE_NAME = "pi-subagents";
-export const SUBAGENTS_SUPPORTED_VERSION_RANGE = "0.32";
+export const SUBAGENTS_SUPPORTED_VERSION_RANGE = "0.34";
 
-/** True when `version` (e.g. "0.32.1") falls inside a `major.minor` prefix range. */
+/** True when `version` (e.g. "0.34.8") falls inside a `major.minor` prefix range. */
 export function subagentsVersionInRange(
   version: string,
   range: string = SUBAGENTS_SUPPORTED_VERSION_RANGE,

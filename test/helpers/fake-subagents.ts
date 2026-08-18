@@ -1,8 +1,7 @@
 /**
  * A fake pi-subagents runtime for the bridge's contract tests: speaks the
- * HARVESTED upstream event names — pi-subagents @ commit 3fc6b6b (package
- * version 0.32.0), constants at src/shared/types.ts:1011-1015, semantics at
- * src/slash/slash-bridge.ts — so the workgraph side of the exchange
+ * upstream event names and payloads re-verified against pi-subagents 0.34.8
+ * — so the workgraph side of the exchange
  * (`src/adapters/pi-subagents.ts`) is the real adapter under test, exactly
  * as `test/helpers/fake-executor.ts` fakes the workgraph protocol side.
  *

@@ -39,7 +39,11 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
-import type { WorkgraphConfig } from "../config.ts";
+import type {
+  SubagentsExecutorConfig,
+  SubagentsRoleRoutes,
+  WorkgraphConfig,
+} from "../config.ts";
 import {
   CH,
   newEnvelope,
@@ -56,16 +60,15 @@ import {
   type RunOutcomeT,
   type RunRequestT,
 } from "../protocol.ts";
+import { DEFAULT_WORKFLOW_CLASS, type WorkflowClassT } from "../types.ts";
 
 export const PI_SUBAGENTS_EXECUTOR_ID = "pi-subagents";
 export const PI_SUBAGENTS_ADAPTER_VERSION = "0.1.0";
 
 /**
- * Harvested upstream event names — pi-subagents @ commit 3fc6b6b (package
- * version 0.32.0): constants at src/shared/types.ts:1011-1015, payload
- * shapes and semantics at src/slash/slash-bridge.ts. EVENT NAMES ONLY —
- * never import from the package; `test/helpers/fake-subagents.ts` fakes
- * this exact surface and cites the same commit.
+ * Upstream event names and shapes re-verified against pi-subagents 0.34.8.
+ * EVENT NAMES ONLY — never import from the package;
+ * `test/helpers/fake-subagents.ts` fakes this exact surface.
  */
 export const UPSTREAM_EVENTS = {
   /** `{requestId, params}` → runs `executor.execute` (slash-bridge.ts:74-158). */
@@ -89,22 +92,37 @@ export const UPSTREAM_EVENTS = {
  * agent profiles (`profileSemantics: "named"`); implementer/revision runs
  * request a worktree-isolated fresh worker; reviewer runs are SEPARATE
  * fresh launches carrying the structured-verdict output schema — never a
- * finalization pass on the implementer's own run. `verifier` is
+ * finalization pass on the implementer's own run. Planner runs use the
+ * upstream `planner` profile and structured output. `verifier` is
  * deliberately unmapped (and not offered).
  */
 export const ROLE_MAP: Partial<
   Record<ExecutorRoleT, { agent: string; worktree: boolean }>
 > = {
+  planner: { agent: "planner", worktree: false },
   implementer: { agent: "worker", worktree: true },
   revision: { agent: "worker", worktree: true },
   reviewer: { agent: "reviewer", worktree: false },
 };
 
 export const PI_SUBAGENTS_ROLES: ExecutorRoleT[] = [
+  "planner",
   "implementer",
   "reviewer",
   "revision",
 ];
+
+/** Resolve a named upstream profile without coupling the core to model IDs. */
+export function resolveSubagentAgent(
+  config: SubagentsExecutorConfig,
+  workflowClass: WorkflowClassT,
+  role: ExecutorRoleT,
+): string | undefined {
+  return (
+    config.routes?.[workflowClass]?.[role as keyof SubagentsRoleRoutes] ??
+    ROLE_MAP[role]?.agent
+  );
+}
 
 /** Advertised and enforced concurrent-run cap (a scheduling hint). */
 export const PI_SUBAGENTS_MAX_CONCURRENCY = 4;
@@ -262,6 +280,12 @@ export function buildSubagentTask(
       lines.push("Artifacts under review:", ...msg.artifacts.map((a) => `- ${a}`));
     }
   }
+  if (msg.role === "planner") {
+    lines.push(
+      "",
+      "Produce a concrete implementation plan as structured output matching the provided schema. Do not modify product code.",
+    );
+  }
   if (msg.priorFindings !== undefined && msg.priorFindings.length > 0) {
     lines.push(
       "",
@@ -386,7 +410,11 @@ export function registerPiSubagentsExecutor(
       run.role === "reviewer" && first?.structuredOutput !== undefined
         ? first.structuredOutput
         : undefined;
-    const completed: RunCompletedT & { verdict?: unknown } = {
+    const plan =
+      run.role === "planner" && first?.structuredOutput !== undefined
+        ? first.structuredOutput
+        : undefined;
+    const completed: RunCompletedT & { verdict?: unknown; plan?: unknown } = {
       ...newEnvelope(nowFn),
       workflowRunId: run.workflowRunId,
       executionId: run.executionId,
@@ -401,6 +429,7 @@ export function registerPiSubagentsExecutor(
         ...(provider !== undefined ? { provider } : {}),
       },
       ...(verdict !== undefined ? { verdict } : {}),
+      ...(plan !== undefined ? { plan } : {}),
     };
     pi.events.emit(CH.runCompleted, completed);
   }
@@ -457,7 +486,15 @@ export function registerPiSubagentsExecutor(
       };
 
       const mapping = ROLE_MAP[msg.role];
-      if (!mapping) {
+      const requestedWorkflowClass = msg.issue.workflowClass;
+      const workflowClass: WorkflowClassT =
+        requestedWorkflowClass === "oneshot" ||
+        requestedWorkflowClass === "reviewed" ||
+        requestedWorkflowClass === "planned"
+          ? requestedWorkflowClass
+          : DEFAULT_WORKFLOW_CLASS;
+      const agent = resolveSubagentAgent(configured, workflowClass, msg.role);
+      if (!mapping || !agent) {
         reject(`unsupported role: ${msg.role}`);
         return;
       }
@@ -485,7 +522,7 @@ export function registerPiSubagentsExecutor(
       pi.events.emit(UPSTREAM_EVENTS.request, {
         requestId: run.requestId,
         params: {
-          agent: mapping.agent,
+          agent,
           task: buildSubagentTask(msg as RunRequestT & { artifacts?: string[] }),
           worktree: mapping.worktree,
           context: "fresh",
