@@ -26,6 +26,7 @@ import {
   WORKGRAPH_LIFECYCLE_VERSION_KEY,
   WORKGRAPH_PHASE_KEY,
   WORKGRAPH_RISK_TIER_KEY,
+  WORKGRAPH_WORKFLOW_CLASS_KEY,
 } from "./types.ts";
 
 /** Signature of `pi.exec`, injected via {@link bindExec}. */
@@ -444,6 +445,8 @@ export interface CreateChildInput {
   acceptanceCriteria?: string;
   /** Judgment-gate risk tier, stored as `workgraph_risk_tier` metadata. */
   riskTier?: string;
+  /** Execution topology, stored as `workgraph_workflow_class` metadata. */
+  workflowClass?: "oneshot" | "reviewed" | "planned";
   /**
    * Create the issue already approved: stamps `workgraph_lifecycle_version: 1`
    * and `workgraph_phase: "ready"` at creation (one write — no draft window).
@@ -477,6 +480,17 @@ export async function createChild(
   if (input.acceptanceCriteria) args.push("--acceptance", input.acceptanceCriteria);
   const metadata: Record<string, unknown> = {};
   if (input.riskTier) metadata[WORKGRAPH_RISK_TIER_KEY] = input.riskTier;
+  if (input.workflowClass) {
+    // Approved children bypass workgraph_approve, so apply the same safety
+    // promotion here: only explicitly low-risk work may skip judgment.
+    const workflowClass =
+      input.approved &&
+      input.workflowClass === "oneshot" &&
+      input.riskTier !== "low"
+        ? "reviewed"
+        : input.workflowClass;
+    metadata[WORKGRAPH_WORKFLOW_CLASS_KEY] = workflowClass;
+  }
   if (input.approved) {
     metadata[WORKGRAPH_LIFECYCLE_VERSION_KEY] = 1;
     metadata[WORKGRAPH_PHASE_KEY] = "ready";

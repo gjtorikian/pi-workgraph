@@ -15,6 +15,7 @@ import {
 } from "./lease.ts";
 import { registerWorkgraphTools } from "./tools.ts";
 import {
+  ApproveParams,
   ReadyParams,
   SplitParams,
   type BeadsIssue,
@@ -109,6 +110,19 @@ describe("schema validation", () => {
     expect(
       Value.Check(SplitParams, { id: "x", children: [{ title: "a" }] }),
     ).toBe(true);
+  });
+
+  it("validates workflow classes on approval", () => {
+    expect(
+      Value.Check(ApproveParams, {
+        id: "x",
+        riskTier: "low",
+        workflowClass: "oneshot",
+      }),
+    ).toBe(true);
+    expect(
+      Value.Check(ApproveParams, { id: "x", workflowClass: "mystery" }),
+    ).toBe(false);
   });
 });
 
@@ -333,10 +347,39 @@ describe("workgraph_approve", () => {
       expect(metadata.workgraph_phase).toBe("ready");
       expect(Number(metadata.workgraph_lifecycle_version)).toBe(1);
       expect(metadata.workgraph_risk_tier).toBe("high");
+      expect(metadata.workgraph_workflow_class).toBe("reviewed");
       const comments = await listComments(local.dir, id);
       expect(
         comments.filter((c) => c.text.startsWith("workgraph-lease approve ")),
       ).toHaveLength(1);
+    } finally {
+      local.cleanup();
+    }
+  }, 30_000);
+
+  it("keeps low-risk one-shot approvals and promotes blocking-risk ones", async () => {
+    const local = makeScratchGraph({ prefix: "tapvcls" });
+    try {
+      const low = local.createIssue("mechanical rename");
+      await run(
+        "workgraph_approve",
+        { id: low, riskTier: "low", workflowClass: "oneshot" },
+        local.dir,
+      );
+      expect(local.showIssue(low).metadata?.workgraph_workflow_class).toBe(
+        "oneshot",
+      );
+
+      const high = local.createIssue("sensitive rename");
+      const result = await run(
+        "workgraph_approve",
+        { id: high, riskTier: "high", workflowClass: "oneshot" },
+        local.dir,
+      );
+      expect(resultText(result)).toContain("promoted");
+      expect(local.showIssue(high).metadata?.workgraph_workflow_class).toBe(
+        "reviewed",
+      );
     } finally {
       local.cleanup();
     }
@@ -390,6 +433,7 @@ describe("workgraph_approve", () => {
       const metadata = shown.metadata ?? {};
       expect(metadata.workgraph_phase).toBe("ready");
       expect(metadata.workgraph_risk_tier).toBe("low");
+      expect(metadata.workgraph_workflow_class).toBe("reviewed");
     } finally {
       local.cleanup();
     }
@@ -528,6 +572,7 @@ describe("workgraph_status", () => {
       expect(text).toContain("phase judging");
       expect(text).toContain("Acceptance: all tests green");
       expect(text).toContain("Risk tier: low");
+      expect(text).toContain("Workflow class: reviewed");
       expect(text).toContain("Run: workgraph-run/abc (attempt 2) via fake-executor");
       expect(text).toContain("Last verdict: reject blocking=1");
       expect(text).toContain("held by workgraph-run/abc (epoch 3");
@@ -583,7 +628,12 @@ describe("workgraph_split", () => {
         {
           id: parent,
           children: [
-            { title: "first half" },
+            {
+              title: "first half",
+              riskTier: "low",
+              workflowClass: "oneshot",
+              approved: true,
+            },
             { title: "second half", priority: 2 },
           ],
         },
@@ -594,6 +644,7 @@ describe("workgraph_split", () => {
       // Unset child priority inherits the parent's.
       expect(children[0]!.priority).toBe(1);
       expect(children[1]!.priority).toBe(2);
+      expect(children[0]!.metadata?.workgraph_workflow_class).toBe("oneshot");
       const shown = local.showIssue(parent);
       const depIds = shown.dependencies?.map((d) => d.id) ?? [];
       for (const child of children) expect(depIds).toContain(child.id);

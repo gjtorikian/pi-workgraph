@@ -60,12 +60,11 @@ export interface WorkgraphConfig {
    * skipped until approved via `workgraph_approve` (README "Legacy
    * compatibility": never an implicit default). When enabled, the
    * coordinator warns ONCE per session that legacy auto-dispatch is active
-   * and that each claim lazily migrates the issue (stamps lifecycle v1,
-   * enters phase "implementing"); a legacy issue carrying a live v0.1
-   * lease is respected and never claimed. Transitional — for v0.1 graphs
-   * mid-upgrade. (The phase-6 spec names this `compatLegacyDispatch`; it
-   * shipped in phase 3 under this name, kept to avoid breaking the
-   * flag/env strings.)
+   * and that each claim initializes lifecycle metadata and enters phase
+   * "implementing"; a legacy issue carrying a live lease is respected and
+   * never claimed. The phase-6 spec names this `compatLegacyDispatch`; it
+   * shipped under this name, which is retained to avoid breaking the
+   * flag/env strings.
    */
   compatLegacyIssues?: boolean;
   /**

@@ -11,7 +11,7 @@ bd gives agents a dependency-aware work graph with race-safe atomic claims,
 but a claim never expires: a session that crashes or gets SIGKILL'd mid-task
 leaves its issue assigned forever, invisible to every other worker.
 pi-workgraph adds a TTL + fencing lease layer on top of bd's primitives, a
-durable lifecycle (approve → implement → judge → accept) stored in
+durable, per-issue lifecycle (one-shot, reviewed, or planned) stored in
 namespaced issue metadata, a coordinator that discovers executors and
 supervises runs end to end, and per-turn context injection so the graph
 survives conversation compaction.
@@ -47,8 +47,8 @@ sessions, harnesses, and machines. Everything else is delegated:
   itself.
 - **Execution** — adapters that answer discovery and run planning,
   implementation, review, revision, and verification requests. The
-  in-session adapter (the
-  v0.1 "wake this agent" behavior as an explicit adapter) ships enabled;
+  in-session adapter (the local "wake this agent" behavior exposed through
+  the executor protocol) ships enabled;
   the [pi-subagents bridge](#6-optional-executor-the-pi-subagents-bridge)
   ships disabled.
 - **Communication** — observers of the audit trail and
@@ -91,13 +91,30 @@ Pi session):
 ```
 
 The agent calls `workgraph_approve`, which records the acceptance criteria,
-stamps a risk tier, and moves the issue to phase `ready`. On the next idle
-tick the coordinator discovers an executor (the in-session compatibility
-executor, unless you disabled it), claims the issue under a workflow-run
-lease, and delegates the run. When the implementation completes, the
-judgment gate takes over: an independent reviewer run checks the acceptance
+stamps an independent workflow class and risk tier, and moves the issue to
+phase `ready`. On the next idle tick the coordinator discovers an executor
+(the in-session compatibility executor, unless you disabled it), claims the
+issue under a workflow-run lease, and delegates the selected workflow.
+`reviewed` is the default: an independent reviewer checks the acceptance
 criteria, bounded revision rounds fix findings, and only policy-approved
 judgment closes the issue.
+
+Choose workflow depth at approval time:
+
+```text
+> approve bdx-001 as oneshot, risk low, with acceptance criteria "..."
+> approve bdx-002 as reviewed, risk medium, with acceptance criteria "..."
+> approve bdx-003 as planned, risk high, with acceptance criteria "..."
+```
+
+`workflowClass` and `riskTier` are separate axes. Workflow class selects
+the execution topology; risk controls judgment strictness. Because a
+one-shot skips independent judgment, a medium/high-risk one-shot request is
+promoted to `reviewed`. A failed/blocked low-risk one-shot is also promoted
+to `reviewed` and returned to the ready pool automatically. Reviewed work
+that exhausts its revision bound or repeats the same blocking verdict is
+promoted once to `planned`; failure to converge after planning escalates to
+blocked as before.
 
 Prefer tools without autonomy? Disable the coordinator and keep everything
 else:
@@ -106,139 +123,48 @@ else:
 pi --workgraph-dispatch=false
 ```
 
-## Usage modes
-
-### Fresh install
-
-The Quickstart above: `bd init`, create work, approve it, let the
-coordinator dispatch. New issues enter the lifecycle at approval time; you
-never think about migration.
-
-### Upgrading from v0.1
-
-Install 0.2.0 over an existing v0.1 workspace. Nothing is rewritten:
-issues created before the lifecycle shipped (no `workgraph_lifecycle_version`
-metadata) are **legacy issues** — still readable, listable
-(`workgraph_ready` with `legacy: true`), and closable by hand, but skipped
-by the coordinator until approved. The first `workgraph_approve` on a
-legacy issue migrates it — lazily, per issue, preserving every existing
-metadata key. Read [Migrating from v0.1](#migrating-from-v01) for the
-behavior changes.
-
-### Legacy compatibility mode
-
-Want v0.1-like behavior while you transition? Two opt-in settings:
-
-```bash
-pi --workgraph-compat-legacy-issues=true   # coordinator may dispatch legacy issues
-# --workgraph-compat-in-session-executor defaults to true already
-```
-
-With `workgraph-compat-legacy-issues` enabled, the coordinator
-auto-dispatches legacy issues; each claim lazily migrates the issue
-(stamps lifecycle v1, enters phase `implementing`). A warning is logged
-once per session naming the setting and this migration effect — the mode
-is transitional, not a place to live. A legacy issue still carrying a
-live v0.1 lease is respected and never claimed, under either setting.
-This mode is exercised by `test/migration.test.ts`.
-
-### Protocol-only usage
-
-External executor adapters and observers can depend on the protocol
-without loading the Pi extension:
-
-```ts
-import { CH, RunCompleted, parseMessage } from "pi-workgraph/protocol";
-```
-
-`pi-workgraph/protocol` is session-free: importing it registers nothing
-and pulls in no session-bound module. It does import `@earendil-works/pi-ai`
-and `typebox` at runtime (both peer dependencies), so protocol-only
-consumers need those installed. The two adapters are also exported for
-custom wiring — `pi-workgraph/adapters/in-session` and
-`pi-workgraph/adapters/pi-subagents` (these ARE session-bound; they exist
-to be registered against a Pi session). This is a documented consumption
-pattern with an import smoke test, not a separately tested install mode.
-
-## Migrating from v0.1
-
-Pre-1.0, behavior-changing release. What changed in 0.2.0:
-
-- **Close is gated.** Successful implementation never closes an issue
-  directly anymore: lifecycle-v1 work closes through the judgment gate
-  (independent review → bounded revisions → verification → accepted), or
-  through an explicit, audited `workgraph_override`. Legacy issues close
-  as before.
-- **Dispatch is now the coordinator + executor protocol.** The v0.1
-  in-session dispatch loop ("wake this agent with the issue") became an
-  explicit executor adapter. The coordinator discovers executors first —
-  no executor, no claim — then claims and delegates. The in-session
-  adapter is registered by default (`workgraph-compat-in-session-executor`,
-  default `true`); set it to `false` with no other executor for a
-  correctly idle coordinator.
-- **Approval is required for dispatch.** New and legacy issues are not
-  auto-dispatched until `workgraph_approve` moves them to `ready`.
-  v0.1-like auto-dispatch of legacy issues is the explicit
-  `workgraph-compat-legacy-issues` opt-in (see
-  [Legacy compatibility mode](#legacy-compatibility-mode)).
-- **Leases are now run-scoped.** Claims made by the coordinator hold their
-  lease under a generated `workgraph-run/<id>` identity whose lifetime is
-  the workflow run's, not the initiating session's. This is a
-  values-semantics note only — the three lease metadata keys are unchanged
-  and **Convention-Version stays 1**: a mid-graph downgrade to 0.1.x is
-  safe (the new `workgraph_*` keys are inert to 0.1.x).
-- **Migration is lazy and non-destructive.** There is no bulk migration
-  pass anywhere. An issue migrates when touched — approved or
-  compat-claimed — in one metadata write that preserves every pre-existing
-  key.
-
-> The phase-6 spec refers to the legacy-dispatch setting as
-> `compatLegacyDispatch`; it shipped (in 0.2.0-pre phases) as
-> `compatLegacyIssues` / `--workgraph-compat-legacy-issues`, and that
-> shipped name is the one that works.
-
 ## Tools
 
 Nine typed tools, all schema-validated and race-safe. Agents are instructed
 to use these instead of composing `bd` calls from bash — bare `--assignee`
 writes are how leases get corrupted.
 
-| Tool                  | What it does                                                                                       |
-| --------------------- | -------------------------------------------------------------------------------------------------- |
-| `workgraph_ready`     | List approved claimable issues (dependency-unblocked, unassigned); `legacy: true` lists unapproved |
-| `workgraph_claim`     | Atomically claim an issue by id, or the next ready one; stamps a lease                             |
-| `workgraph_release`   | Voluntarily hand a claimed issue back to the pool (fenced; clears assignee, reopens)               |
-| `workgraph_close`     | Close an issue (fenced; lifecycle-v1 work must be phase `accepted` — the judgment gate's output)   |
-| `workgraph_split`     | Split an issue into child issues; the parent is blocked until every child closes                   |
-| `workgraph_heartbeat` | Renew the leases this worker holds (verifies the fencing epoch, pushes `lease_expires_at` forward) |
-| `workgraph_approve`   | Approve a draft/legacy/escalated issue for dispatch: acceptance criteria, risk tier, phase `ready` |
-| `workgraph_override`  | Explicit human override: force-close or force-release, bypassing guards — always audited           |
-| `workgraph_status`    | One issue's full control-plane state: phase, lease, attempt, verdict, acceptance criteria          |
+| Tool                  | What it does                                                                                          |
+| --------------------- | ----------------------------------------------------------------------------------------------------- |
+| `workgraph_ready`     | List approved claimable issues (dependency-unblocked, unassigned); `legacy: true` lists unapproved    |
+| `workgraph_claim`     | Atomically claim an issue by id, or the next ready one; stamps a lease                                |
+| `workgraph_release`   | Voluntarily hand a claimed issue back to the pool (fenced; clears assignee, reopens)                  |
+| `workgraph_close`     | Close an issue (fenced; lifecycle-v1 work must be phase `accepted` — the judgment gate's output)      |
+| `workgraph_split`     | Split an issue into child issues; the parent is blocked until every child closes                      |
+| `workgraph_heartbeat` | Renew the leases this worker holds (verifies the fencing epoch, pushes `lease_expires_at` forward)    |
+| `workgraph_approve`   | Approve a draft/legacy/escalated issue: acceptance criteria, workflow class, risk tier, phase `ready` |
+| `workgraph_override`  | Explicit human override: force-close or force-release, bypassing guards — always audited              |
+| `workgraph_status`    | One issue's full control-plane state: phase, lease, attempt, verdict, acceptance criteria             |
 
 ## Configuration
 
 Resolution order per value: CLI flag > environment variable > default.
 
-| Flag                                     | Environment variable                   | Default                         | Purpose                                                              |
-| ---------------------------------------- | --------------------------------------- | ------------------------------- | -------------------------------------------------------------------- |
-| `--workgraph-lease-ttl-ms`               | `WORKGRAPH_LEASE_TTL_MS`               | `300000` (5 min)                | Lease time-to-live; expired leases are reclaimable                   |
-| `--workgraph-heartbeat-ms`               | `WORKGRAPH_HEARTBEAT_MS`               | `60000` (60 s)                  | How often held leases are renewed                                    |
-| `--workgraph-poll-ms`                    | `WORKGRAPH_POLL_MS`                    | `30000` (30 s)                  | Coordinator poll interval (floored at 5 s in production wiring)      |
-| `--workgraph-sweep-interval-ms`          | `WORKGRAPH_SWEEP_INTERVAL_MS`          | the poll interval               | Expiry-sweep cadence (reclaims expired leases back to ready)         |
-| `--workgraph-discovery-timeout-ms`       | `WORKGRAPH_DISCOVERY_TIMEOUT_MS`       | `2000` (2 s)                    | Executor-discovery collection window                                 |
-| `--workgraph-accept-timeout-ms`          | `WORKGRAPH_ACCEPT_TIMEOUT_MS`          | `10000` (10 s)                  | Run-request accept/reject deadline                                   |
-| `--workgraph-compat-in-session-executor` | `WORKGRAPH_COMPAT_IN_SESSION_EXECUTOR` | `true`                          | Register the in-session compatibility executor (the v0.1 wake path)  |
-| `--workgraph-executor-id`                | `WORKGRAPH_EXECUTOR_ID`                | —                               | Pin executor selection to one executorId (errors when it's absent)   |
-| `--workgraph-compat-legacy-issues`       | `WORKGRAPH_COMPAT_LEGACY_ISSUES`       | `false`                         | Opt-in: auto-dispatch legacy issues (lazy migration; warned once)    |
-| `--workgraph-policy`                     | `WORKGRAPH_POLICY`                     | low advisory, med/high blocking | Per-risk-tier judgment-gate policy overrides (JSON)                  |
-| `--workgraph-subagents-executor`         | `WORKGRAPH_SUBAGENTS_EXECUTOR`         | disabled                        | Opt-in: the experimental pi-subagents bridge                         |
-| `--workgraph-worker-id`                  | `WORKGRAPH_WORKER_ID`                  | `{user}@{host}/{short-session}` | Worker identity used for claims, audit records, and fencing checks   |
-| `--workgraph-dispatch`                   | —                                       | `true`                          | Kill switch: `false` keeps tools + context injection, no autonomy (the flag name predates the coordinator; it disables the coordinator) |
+| Flag                                     | Environment variable                   | Default                         | Purpose                                                                                                                                 |
+| ---------------------------------------- | -------------------------------------- | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `--workgraph-lease-ttl-ms`               | `WORKGRAPH_LEASE_TTL_MS`               | `300000` (5 min)                | Lease time-to-live; expired leases are reclaimable                                                                                      |
+| `--workgraph-heartbeat-ms`               | `WORKGRAPH_HEARTBEAT_MS`               | `60000` (60 s)                  | How often held leases are renewed                                                                                                       |
+| `--workgraph-poll-ms`                    | `WORKGRAPH_POLL_MS`                    | `30000` (30 s)                  | Coordinator poll interval (floored at 5 s in production wiring)                                                                         |
+| `--workgraph-sweep-interval-ms`          | `WORKGRAPH_SWEEP_INTERVAL_MS`          | the poll interval               | Expiry-sweep cadence (reclaims expired leases back to ready)                                                                            |
+| `--workgraph-discovery-timeout-ms`       | `WORKGRAPH_DISCOVERY_TIMEOUT_MS`       | `2000` (2 s)                    | Executor-discovery collection window                                                                                                    |
+| `--workgraph-accept-timeout-ms`          | `WORKGRAPH_ACCEPT_TIMEOUT_MS`          | `10000` (10 s)                  | Run-request accept/reject deadline                                                                                                      |
+| `--workgraph-compat-in-session-executor` | `WORKGRAPH_COMPAT_IN_SESSION_EXECUTOR` | `true`                          | Register the in-session compatibility executor                                                                                          |
+| `--workgraph-executor-id`                | `WORKGRAPH_EXECUTOR_ID`                | —                               | Pin executor selection to one executorId (errors when it's absent)                                                                      |
+| `--workgraph-compat-legacy-issues`       | `WORKGRAPH_COMPAT_LEGACY_ISSUES`       | `false`                         | Opt-in: auto-dispatch issues without lifecycle metadata (warned once)                                                                   |
+| `--workgraph-policy`                     | `WORKGRAPH_POLICY`                     | low advisory, med/high blocking | Per-risk-tier judgment-gate policy overrides (JSON)                                                                                     |
+| `--workgraph-subagents-executor`         | `WORKGRAPH_SUBAGENTS_EXECUTOR`         | disabled                        | Opt-in: the experimental pi-subagents bridge                                                                                            |
+| `--workgraph-worker-id`                  | `WORKGRAPH_WORKER_ID`                  | `{user}@{host}/{short-session}` | Worker identity used for claims, audit records, and fencing checks                                                                      |
+| `--workgraph-dispatch`                   | —                                      | `true`                          | Kill switch: `false` keeps tools + context injection, no autonomy (the flag name predates the coordinator; it disables the coordinator) |
 
 ## How it works
 
-- **Coordinator** — the successor to the v0.1 dispatch loop, on the same
-  scheduling shell (poll timer plus Pi's `agent_settled` idle edge, one
+- **Coordinator** — the protocol-based dispatch loop, using a scheduling
+  shell built from a poll timer plus Pi's `agent_settled` idle edge and one
   reentrancy-guarded tick). Each tick: fetch the ready pool (readiness is
   judged by array length, never exit codes), filter to approved lifecycle
   work, **discover executors first** (no executor → no claim), claim by id
@@ -298,7 +224,7 @@ never parse meaning out of them. Two shapes appear today: the initiating
 session's worker identity (`{user}@{host}/{short-session-id}`) for direct
 tool claims, and `workgraph-run/{id}` (a generated workflow-run identity
 whose lifetime is the run's, not the initiating session's) for coordinator
-claims. This is a semantics note about the *values*, not a key change —
+claims. This is a semantics note about the _values_, not a key change —
 the keys above stay frozen.
 
 A leased issue as returned by `bd show <id> --json` (real output, abridged;
@@ -473,28 +399,31 @@ Beads' native statuses stay simple (`open`, `in_progress`, `blocked`,
 `closed`); lifecycle phase is workgraph semantics, stored in namespaced
 issue metadata:
 
-| Key | Meaning |
-|---|---|
-| `workgraph_lifecycle_version` | Lifecycle schema version, initially `1` |
-| `workgraph_phase` | `draft`, `ready`, `planning`, `implementing`, `judging`, `revising`, `verifying`, `accepted`, or `escalated` |
-| `workgraph_workflow_run_id` | Stable ID covering planning, implementation, and all judgment/revision attempts for one claim |
-| `workgraph_executor_id` | Selected executor adapter |
-| `workgraph_attempt` | Current implementation/revision attempt number |
-| `workgraph_risk_tier` | Policy input such as `low`, `medium`, or `high` |
-| `workgraph_active_execution_id` | Executor-specific active run ID, when accepted |
-| `workgraph_author_provenance` | Compact JSON describing effective harness, profile, provider, and model |
-| `workgraph_last_verdict` | Compact verdict summary and durable audit-event reference |
-| `workgraph_failure_fingerprint` | Hash used to detect a repeated failed attempt |
-| `workgraph_plan_summary` | Compact plan summary; the full plan lives in the `workgraph-plan` comment trail |
-| `workgraph_planner_provenance` | Compact JSON describing the planner's effective harness, provider, and model |
+| Key                             | Meaning                                                                                                      |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `workgraph_lifecycle_version`   | Lifecycle schema version, initially `1`                                                                      |
+| `workgraph_phase`               | `draft`, `ready`, `planning`, `implementing`, `judging`, `revising`, `verifying`, `accepted`, or `escalated` |
+| `workgraph_workflow_run_id`     | Stable ID covering planning, implementation, and all judgment/revision attempts for one claim                |
+| `workgraph_executor_id`         | Selected executor adapter                                                                                    |
+| `workgraph_attempt`             | Current implementation/revision attempt number                                                               |
+| `workgraph_risk_tier`           | Policy input such as `low`, `medium`, or `high`                                                              |
+| `workgraph_workflow_class`      | Execution topology: `oneshot`, `reviewed` (default), or `planned`                                            |
+| `workgraph_active_execution_id` | Executor-specific active run ID, when accepted                                                               |
+| `workgraph_author_provenance`   | Compact JSON describing effective harness, profile, provider, and model                                      |
+| `workgraph_last_verdict`        | Compact verdict summary and durable audit-event reference                                                    |
+| `workgraph_failure_fingerprint` | Hash used to detect a repeated failed attempt                                                                |
+| `workgraph_plan_summary`        | Compact plan summary; the full plan lives in the `workgraph-plan` comment trail                              |
+| `workgraph_planner_provenance`  | Compact JSON describing the planner's effective harness, provider, and model                                 |
 
 ### 2. State transitions
 
 ```text
-draft --approve--> ready --claim (planner offered)--> planning
-draft --approve--> ready --claim (no planner)--> implementing
+draft --approve--> ready --claim (planned)--> planning
+draft --approve--> ready --claim (reviewed/oneshot)--> implementing
 planning --plan accepted--> implementing
 planning --failed/invalid plan--> escalated
+implementing --oneshot success--> verifying --> accepted --> closed
+implementing --oneshot failure/blocked--> ready (promoted to reviewed)
 implementing --implementation completed--> judging
 implementing --failed/blocked--> revising | escalated
 judging --hard-gate reject--> revising
@@ -510,16 +439,18 @@ any active phase --human override--> closed, with actor and reason audited
 
 <!-- Tested: test/invariants.test.ts — "successful implementation cannot close the issue directly" (pinned in phase 0, flipped in phase 3) -->
 
-Successful implementation transitions to judgment — it never closes the
-issue directly. Only policy-approved judgment, a final verifier, or an
-explicit audited human override may close.
+Successful reviewed/planned implementation transitions to judgment. A
+successful low-risk one-shot follows the explicit verification/acceptance
+tail and closes without independent review. Policy-approved judgment, that
+one-shot tail, a final verifier, or an explicit audited human override may
+close.
 
 <!-- Tested: test/invariants.test.ts — "release without a tracked lease is rejected, not silently performed" (pinned in phase 0, flipped in phase 1) -->
 
 Every state-changing result is fenced: a completion, verdict, cancellation,
 or promotion is ignored unless its issue ID, workflow run ID, and lease
-epoch still match Beads. The v0.1 unfenced fallback release (releasing an
-issue this process holds no tracked lease on) was removed in phase 1.
+epoch still match Beads. The coordinator never releases an issue unless
+this process holds its tracked lease.
 
 ### 3. Protocol channels
 
@@ -527,20 +458,20 @@ Versioned execution envelopes (`protocolVersion: 1`; every message includes
 `messageId`, `occurredAt`, and the relevant correlation identifiers) travel
 over these Pi event-bus channels in the first transport:
 
-| Channel | Direction | Purpose |
-|---|---|---|
-| `workgraph:v1:executor:discover` | core → adapters | Request capability offers |
-| `workgraph:v1:executor:offer` | adapter → core | Advertise identity, roles, isolation, capacity, and supported profile semantics |
-| `workgraph:v1:run:request` | core → adapter | Request an implementation, review, revision, or verification run |
-| `workgraph:v1:run:accepted` | adapter → core | Bind the workflow request to an executor run |
-| `workgraph:v1:run:rejected` | adapter → core | Reject before starting, with a stable reason code |
-| `workgraph:v1:run:progress` | adapter → core | Advisory progress; never a durable transition by itself |
-| `workgraph:v1:run:completed` | adapter → core | Return structured result, artifacts, evidence, and provenance |
-| `workgraph:v1:run:cancel` | core → adapter | Interrupt a run after release, fencing loss, shutdown, or policy decision |
-| `workgraph:v1:run:cancelled` | adapter → core | Acknowledge cancellation |
-| `workgraph:v1:run:status-request` | core → adapter | Reconcile a persisted active run after restart |
-| `workgraph:v1:run:status` | adapter → core | Report active, terminal, missing, or unreachable |
-| `workgraph:v1:activity` | core → observers | Publish canonical lifecycle changes for UI/presence adapters |
+| Channel                           | Direction        | Purpose                                                                         |
+| --------------------------------- | ---------------- | ------------------------------------------------------------------------------- |
+| `workgraph:v1:executor:discover`  | core → adapters  | Request capability offers                                                       |
+| `workgraph:v1:executor:offer`     | adapter → core   | Advertise identity, roles, isolation, capacity, and supported profile semantics |
+| `workgraph:v1:run:request`        | core → adapter   | Request an implementation, review, revision, or verification run                |
+| `workgraph:v1:run:accepted`       | adapter → core   | Bind the workflow request to an executor run                                    |
+| `workgraph:v1:run:rejected`       | adapter → core   | Reject before starting, with a stable reason code                               |
+| `workgraph:v1:run:progress`       | adapter → core   | Advisory progress; never a durable transition by itself                         |
+| `workgraph:v1:run:completed`      | adapter → core   | Return structured result, artifacts, evidence, and provenance                   |
+| `workgraph:v1:run:cancel`         | core → adapter   | Interrupt a run after release, fencing loss, shutdown, or policy decision       |
+| `workgraph:v1:run:cancelled`      | adapter → core   | Acknowledge cancellation                                                        |
+| `workgraph:v1:run:status-request` | core → adapter   | Reconcile a persisted active run after restart                                  |
+| `workgraph:v1:run:status`         | adapter → core   | Report active, terminal, missing, or unreachable                                |
+| `workgraph:v1:activity`           | core → observers | Publish canonical lifecycle changes for UI/presence adapters                    |
 
 <!-- Tested: test/invariants.test.ts — "with no executor available, a dispatch tick claims nothing" (pinned in phase 0, flipped in phase 2) -->
 
@@ -554,28 +485,27 @@ subpath export — see [Protocol-only usage](#protocol-only-usage).
 ### 4. Legacy compatibility
 
 Issues without `workgraph_lifecycle_version` are legacy issues. They remain
-readable, and migration is lazy and non-destructive: the first
-`workgraph_approve` (or compat-mode claim) initializes them as lifecycle
-version 1 in one metadata write that preserves every pre-existing key.
+readable. The first `workgraph_approve` (or compat-mode claim) initializes
+lifecycle metadata in one non-destructive write that preserves every
+pre-existing key.
 Automatic dispatch of legacy issues requires the **explicit opt-in
 compatibility setting** `workgraph-compat-legacy-issues` — it is never an
 implicit default — and logs a once-per-session warning naming the setting
-and its migration effect. A legacy issue carrying a live v0.1 lease is
-respected and never claimed, under either setting. See
-[Migrating from v0.1](#migrating-from-v01).
+and its effect. A legacy issue carrying a live lease is respected and never
+claimed, under either setting.
 
 ### 5. The planner tier
 
-An executor may offer the `planner` role. When one does, an approved issue
-is claimed into `planning` and a planning run is dispatched before any
-implementation; the accepted plan is then attached to the implementation
+An issue approved with workflow class `planned` is claimed into `planning`
+when eligible planner and implementer executors are both available. The
+accepted plan is then attached to the implementation
 run (and to every revision of it) as the optional `plan` field on
 `run:request`.
 
-**Planning is a tier, not a stage.** When no executor offers `planner`, the
-coordinator claims straight into `implementing` exactly as it did before the
-role existed — same phase, same request, same audit. The in-session
-compatibility executor offers only `implementer`, so this is the default.
+Planning is selected per issue, not globally from executor availability.
+`reviewed` and `oneshot` work go straight to implementation even when a
+planner is online. `planned` work never silently degrades: without both a
+planner and implementer it remains unclaimed in `ready`.
 
 Four rules the code enforces, each with a reason:
 
@@ -585,7 +515,7 @@ Four rules the code enforces, each with a reason:
   issue back, and re-plan forever.
 - **Failure escalates; it never degrades.** A planner that reports
   `failure`/`blocked` or returns an unparseable plan escalates the issue to
-  `blocked` — it does *not* fall through to an unplanned implementation.
+  `blocked` — it does _not_ fall through to an unplanned implementation.
   Silently implementing without the plan would look identical to success
   while being the exact thing the operator wanted to prevent. Recover via
   re-approve, as with any escalation.
@@ -594,8 +524,8 @@ Four rules the code enforces, each with a reason:
   recorded in the plan trail rather than overwriting the approved criteria
   on the issue — a planner that could rewrite its own bar would defeat the
   judgment gate.
-- **Legacy issues never plan.** Their only migration entry is
-  `implementing`, so compat-mode dispatch is unchanged.
+- **Legacy issues never plan.** Their compatibility entry is
+  `implementing`, so compat-mode dispatch stays predictable.
 
 One workflow run spans the whole chain: planner, implementer, and every
 judgment sub-run share a lease, a `workgraph_workflow_run_id`, and a fencing
@@ -603,13 +533,15 @@ triple. A crashed planner is not re-adopted on restart — there is no partial
 work to protect — it is abandoned, and the TTL sweep resets `planning` →
 `ready` for a clean re-plan.
 
-Model tiering (a heavier model plans, a capable one implements, a third
-reviews) is a property of the **executor adapter**, not of this package:
+Model tiering (an economy model one-shots, a judgment-heavy model plans, a
+capable one implements, and an independent model reviews) is a property of
+the **executor adapter**, not of this package:
 the coordinator selects by role and validates reported provenance, and
 deliberately does no model routing (see `src/policy.ts`). An adapter that
 maps role → model gets tiering; the judgment gate's
 `requireAuthorIndependence` then enforces that the reviewer differs from the
-author on model and provider.
+author on every required provenance axis (model and provider by default for
+medium/high risk).
 
 ### 6. Optional executor: the pi-subagents bridge
 
@@ -618,7 +550,7 @@ author on model and provider.
 > names only** — it imports zero pi-subagents code and this package
 > declares no pi-subagents dependency in any block (CI enforces it).
 > Because those event names are not a declared public API, the adapter
-> validates the *installed* upstream package version (a package.json read,
+> validates the _installed_ upstream package version (a package.json read,
 > never an import; upstream advertises no version on its bus) and registers
 > nothing on a mismatch. Expect breakage across upstream minor versions
 > until upstream adopts the generic protocol.

@@ -237,6 +237,7 @@ describe("wrappers", () => {
           title: "with criteria",
           acceptanceCriteria: "does the thing",
           riskTier: "high",
+          workflowClass: "planned",
           approved: true,
         },
         "worker-g",
@@ -246,9 +247,21 @@ describe("wrappers", () => {
       expect(shown.acceptance_criteria).toBe("does the thing");
       expect(shown.metadata).toMatchObject({
         workgraph_risk_tier: "high",
+        workgraph_workflow_class: "planned",
         workgraph_phase: "ready",
       });
       expect(Number(shown.metadata?.workgraph_lifecycle_version)).toBe(1);
+      const promoted = await createChild(
+        local.dir,
+        {
+          title: "high-risk requested one-shot",
+          riskTier: "high",
+          workflowClass: "oneshot",
+          approved: true,
+        },
+        "worker-g",
+      );
+      expect(promoted.metadata?.workgraph_workflow_class).toBe("reviewed");
       // update --acceptance replaces the criteria in place.
       await update(
         local.dir,

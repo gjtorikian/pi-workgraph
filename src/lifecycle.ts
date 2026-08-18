@@ -24,8 +24,9 @@
  * override tool bypasses phases entirely, always audited).
  */
 import { setMetadata, show } from "./bd.ts";
-import type { BeadsIssue, WorkgraphPhase } from "./types.ts";
+import type { BeadsIssue, WorkflowClassT, WorkgraphPhase } from "./types.ts";
 import {
+  DEFAULT_WORKFLOW_CLASS,
   WORKGRAPH_ACTIVE_EXECUTION_ID_KEY,
   WORKGRAPH_ATTEMPT_KEY,
   WORKGRAPH_EXECUTOR_ID_KEY,
@@ -34,6 +35,7 @@ import {
   WORKGRAPH_LIFECYCLE_VERSION_KEY,
   WORKGRAPH_PHASE_KEY,
   WORKGRAPH_RISK_TIER_KEY,
+  WORKGRAPH_WORKFLOW_CLASS_KEY,
   WORKGRAPH_WORKFLOW_RUN_ID_KEY,
 } from "./types.ts";
 
@@ -65,7 +67,9 @@ export const LEGAL: Record<WorkgraphPhase, readonly WorkgraphPhase[]> = {
   // graph whose executors implement but do not plan.
   ready: ["planning", "implementing"],
   planning: ["implementing", "escalated"],
-  implementing: ["judging", "revising", "escalated"],
+  // One-shot success skips judgment but still passes through the explicit
+  // verification/acceptance tail before close.
+  implementing: ["judging", "verifying", "revising", "escalated"],
   judging: ["revising", "verifying"],
   revising: ["revising", "judging"], // new execution accepted; implementation completed
   verifying: ["accepted", "revising", "escalated"],
@@ -74,10 +78,10 @@ export const LEGAL: Record<WorkgraphPhase, readonly WorkgraphPhase[]> = {
 };
 
 /**
- * Migration entry edges for LEGACY issues (no phase at all): approval
+ * Initialization edges for LEGACY issues (no phase at all): approval
  * (`workgraph_approve`) enters at `ready`; a compat-mode coordinator claim
- * enters at `implementing`. Both stamp `workgraph_lifecycle_version: 1` —
- * lazy, per-issue, never a bulk rewrite.
+ * enters at `implementing`. Both stamp `workgraph_lifecycle_version: 1`
+ * per issue, without a bulk rewrite.
  */
 const LEGACY_ENTRY: readonly WorkgraphPhase[] = ["ready", "implementing"];
 
@@ -169,6 +173,14 @@ export function riskTierOf(issue: BeadsIssue): string | undefined {
   return typeof raw === "string" && raw !== "" ? raw : undefined;
 }
 
+/** The issue's execution topology; old/unclassified work defaults to reviewed. */
+export function workflowClassOf(issue: BeadsIssue): WorkflowClassT {
+  const raw = issue.metadata?.[WORKGRAPH_WORKFLOW_CLASS_KEY];
+  return raw === "oneshot" || raw === "reviewed" || raw === "planned"
+    ? raw
+    : DEFAULT_WORKFLOW_CLASS;
+}
+
 /** The stored failure fingerprint from the last blocking verdict, if any. */
 export function failureFingerprintOf(issue: BeadsIssue): string | undefined {
   const raw = issue.metadata?.[WORKGRAPH_FAILURE_FINGERPRINT_KEY];
@@ -220,21 +232,20 @@ export interface TransitionOptions {
  * verifies the edge is legal, then writes phase + `fields` in one
  * `setMetadata` call.
  *
- * `expect: undefined` is the legacy/migration entry: only approval
+ * `expect: undefined` is the legacy initialization entry: only approval
  * (→ `ready`) and a compat claim (→ `implementing`) are legal from an
  * unphased issue. Transitions out of `draft`/`ready`/legacy stamp
- * `workgraph_lifecycle_version: 1` when it is absent (lazy migration).
+ * `workgraph_lifecycle_version: 1` when it is absent.
  *
- * The migration contract this stamping path carries (phase 6, pinned by
+ * The compatibility contract this stamping path carries (phase 6, pinned by
  * `test/migration.test.ts`):
  * - NON-DESTRUCTIVE — the single `setMetadata` call merges PER-KEY
- *   server-side, so every pre-existing metadata key (v0.1 lease keys,
- *   foreign tooling keys) survives byte-for-byte; only `workgraph_*` keys
- *   are added.
- * - PER-ISSUE AT TOUCH TIME — there is deliberately no bulk-migration
- *   path anywhere; an interrupted process leaves no half-migrated graph.
+ *   server-side, so every pre-existing metadata key (lease keys and foreign
+ *   tooling keys) survives byte-for-byte; only `workgraph_*` keys are added.
+ * - PER-ISSUE AT TOUCH TIME — there is deliberately no bulk rewrite; an
+ *   interrupted process leaves untouched issues unchanged.
  * - IDEMPOTENT AS CAS-SAFE, not silently repeatable — re-running the
- *   migration entry on an already-stamped issue throws
+ *   initialization entry on an already-stamped issue throws
  *   {@link LifecycleError} (the phase changed underneath `expect:
  *   undefined`), never a second stamp.
  *

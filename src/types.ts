@@ -46,8 +46,8 @@ export interface BeadsIssue {
 
 /**
  * Lease state attached to claimed issues, stored in issue metadata. These
- * three key names are the interop surface — FROZEN from Phase 2 forward;
- * renaming one after v0.1 publishes is a breaking protocol change.
+ * three key names are the frozen interop surface; renaming one in a future
+ * release is a breaking protocol change.
  */
 export interface LeaseFields {
   /** workerId() of the holder */
@@ -97,6 +97,7 @@ export const WORKGRAPH_EXECUTOR_ID_KEY = "workgraph_executor_id";
 export const WORKGRAPH_LIFECYCLE_VERSION_KEY = "workgraph_lifecycle_version";
 export const WORKGRAPH_ATTEMPT_KEY = "workgraph_attempt";
 export const WORKGRAPH_RISK_TIER_KEY = "workgraph_risk_tier";
+export const WORKGRAPH_WORKFLOW_CLASS_KEY = "workgraph_workflow_class";
 export const WORKGRAPH_ACTIVE_EXECUTION_ID_KEY = "workgraph_active_execution_id";
 export const WORKGRAPH_AUTHOR_PROVENANCE_KEY = "workgraph_author_provenance";
 export const WORKGRAPH_LAST_VERDICT_KEY = "workgraph_last_verdict";
@@ -119,6 +120,13 @@ export type WorkgraphPhase =
   | "verifying"
   | "accepted"
   | "escalated";
+
+/** Per-issue execution topology, orthogonal to judgment risk. */
+export const WorkflowClass = StringEnum(["oneshot", "reviewed", "planned"]);
+export type WorkflowClassT = "oneshot" | "reviewed" | "planned";
+
+/** Existing/unclassified lifecycle work takes the conservative reviewed path. */
+export const DEFAULT_WORKFLOW_CLASS: WorkflowClassT = "reviewed";
 
 // ---------------------------------------------------------------------------
 // Identity seam (phase 3). Three nominal identity shapes plus the provider
@@ -191,6 +199,10 @@ export type LeaseEvent =
   | "verdict-invalid"
   /** Planner tier: a planner completion carried no parseable plan. */
   | "plan-invalid"
+  /** One-shot work failed and was promoted to the reviewed workflow. */
+  | "workflow-promoted"
+  /** Successful one-shot work closed without an independent review. */
+  | "oneshot-closed"
   /** Judgment (phase 3): blocking verdict → a revision run was requested. */
   | "revision-requested"
   /** Judgment (phase 3): escalated (fingerprint repeat, bounds, no reviewer). */
@@ -334,6 +346,7 @@ export const SplitParams = Type.Object({
           description: "Judgment-gate risk tier for the child issue",
         }),
       ),
+      workflowClass: Type.Optional(WorkflowClass),
       approved: Type.Optional(
         Type.Boolean({
           description:
@@ -364,6 +377,7 @@ export const ApproveParams = Type.Object({
         "Judgment-gate risk tier (default medium: blocking gate + author independence)",
     }),
   ),
+  workflowClass: Type.Optional(WorkflowClass),
 });
 export type ApproveParamsT = Static<typeof ApproveParams>;
 

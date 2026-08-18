@@ -19,6 +19,7 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type Static, type TSchema, Type } from "typebox";
 import { Value } from "typebox/value";
+import { WorkflowClass } from "./types.ts";
 
 export const PROTOCOL_VERSION = 1;
 
@@ -150,6 +151,10 @@ export const RunRequest = Type.Object({
     acceptanceCriteria: Type.Optional(Type.String()),
     dependencies: Type.Optional(Type.Array(Type.String())),
     repoRef: Type.Optional(Type.String()),
+    /** Per-issue topology hint; absent means the conservative reviewed path. */
+    workflowClass: Type.Optional(WorkflowClass),
+    /** Judgment strictness, kept separate from workflow topology. */
+    riskTier: Type.Optional(StringEnum(["low", "medium", "high"])),
   }),
   workflowRunId: Type.String(),
   leaseEpoch: Type.Number(),

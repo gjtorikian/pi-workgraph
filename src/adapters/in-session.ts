@@ -1,6 +1,6 @@
 /**
- * The in-session compatibility executor: v0.1's sendMessage wake repackaged
- * as an EXPLICIT, configured protocol adapter. It answers discovery
+ * The in-session compatibility executor: the local sendMessage wake exposed
+ * as an explicit, configured protocol adapter. It answers discovery
  * (`executorId: "in-session"`, `isolation: "none"`, roles
  * `["implementer"]`), accepts run requests, wakes the model with the work
  * prompt over the exact mechanism dispatch.ts used (`pi.sendMessage` with

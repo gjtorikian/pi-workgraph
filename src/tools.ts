@@ -5,10 +5,10 @@
  * because bd's embedded Dolt panics on concurrent in-process access.
  *
  * Phase 3 re-cuts the surface (plan §8): `workgraph_approve` moves
- * draft/legacy work into the approved ready pool with acceptance criteria
- * and a risk tier; `workgraph_close` permits only `accepted` work (the
- * judgment gate is the sole happy path to closed — completion of dispatched
- * work is REPORTED to the coordinator, never self-closed);
+ * draft/legacy work into the approved ready pool with acceptance criteria,
+ * workflow class, and risk tier; `workgraph_close` permits only `accepted`
+ * work (reviewed/planned work closes through judgment; one-shot work through
+ * the coordinator's verification tail — executors never self-close);
  * `workgraph_override` is the ONE unguarded mutation left — an explicit
  * human close/release that bypasses phase and fencing guards and is always
  * audited with the actor and a REQUIRED reason.
@@ -63,6 +63,7 @@ import {
   reapprove,
   riskTierOf,
   transition,
+  workflowClassOf,
   workflowRunIdOf,
 } from "./lifecycle.ts";
 import { DEFAULT_RISK_TIER } from "./policy.ts";
@@ -77,9 +78,11 @@ import {
   ReleaseParams,
   SplitParams,
   StatusParams,
+  DEFAULT_WORKFLOW_CLASS,
   WORKGRAPH_EXECUTOR_ID_KEY,
   WORKGRAPH_PHASE_KEY,
   WORKGRAPH_RISK_TIER_KEY,
+  WORKGRAPH_WORKFLOW_CLASS_KEY,
 } from "./types.ts";
 
 function textResult<TDetails>(
@@ -331,6 +334,11 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
                 priority: child.priority ?? parent.priority,
                 acceptanceCriteria: child.acceptanceCriteria,
                 riskTier: child.riskTier,
+                workflowClass: child.workflowClass as
+                  | "oneshot"
+                  | "reviewed"
+                  | "planned"
+                  | undefined,
                 approved: child.approved,
               },
               actor,
@@ -376,7 +384,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     label: "Approve work",
     description:
       "Approve a draft or legacy issue for dispatch: records acceptance criteria (bd's native field), " +
-      "stamps lifecycle v1 with a risk tier, and transitions the issue to phase ready. " +
+      "stamps lifecycle v1 with a risk tier and workflow class, and transitions the issue to phase ready. " +
       "Also re-approves escalated work (back to ready, reopened). " +
       "The coordinator only dispatches approved ready work.",
     promptSnippet: "Approve a work-graph issue for dispatch",
@@ -398,21 +406,36 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
         );
       }
       const riskTier = params.riskTier ?? DEFAULT_RISK_TIER;
+      const requestedWorkflowClass =
+        params.workflowClass ??
+        (phase === "escalated"
+          ? workflowClassOf(cur)
+          : DEFAULT_WORKFLOW_CLASS);
+      // One-shot intentionally skips independent judgment. A blocking risk
+      // tier therefore promotes to reviewed instead of weakening policy.
+      const workflowClass =
+        requestedWorkflowClass === "oneshot" && riskTier !== "low"
+          ? "reviewed"
+          : requestedWorkflowClass;
+      const approvalFields = {
+        [WORKGRAPH_RISK_TIER_KEY]: riskTier,
+        [WORKGRAPH_WORKFLOW_CLASS_KEY]: workflowClass,
+      };
       if (phase === "escalated") {
         // The re-approve recovery path (failure-modes table: "escalation is
         // recoverable via re-approve"): escalated → ready under the same CAS
         // discipline, then reopen — escalation parked the issue as `blocked`,
         // and a blocked issue never re-enters the ready pool.
         await reapprove(ctx.cwd, params.id, {
-          fields: { [WORKGRAPH_RISK_TIER_KEY]: riskTier },
+          fields: approvalFields,
           actor: actor.bdActor,
         });
         await update(ctx.cwd, params.id, { status: "open" }, actor.bdActor);
       } else {
-        // draft/legacy → ready: stamps workgraph_lifecycle_version 1 (lazy
-        // migration) and the risk tier in the same guarded write.
+        // draft/legacy → ready: initializes workgraph_lifecycle_version,
+        // risk tier, and workflow class in one guarded write.
         await transition(ctx.cwd, params.id, phase, "ready", {
-          fields: { [WORKGRAPH_RISK_TIER_KEY]: riskTier },
+          fields: approvalFields,
           actor: actor.bdActor,
         });
       }
@@ -434,14 +457,19 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
         params.id,
         {
           riskTier,
+          workflowClass,
+          requestedWorkflowClass,
           acceptanceCriteria: params.acceptanceCriteria ?? null,
           actor: identitySnapshot(actor),
         },
         actor.bdActor,
       );
       return textResult(
-        `Approved ${params.id} for dispatch (risk tier ${riskTier}, phase ready).`,
-        { id: params.id, riskTier },
+        `Approved ${params.id} for dispatch (workflow ${workflowClass}, risk tier ${riskTier}, phase ready).` +
+          (workflowClass !== requestedWorkflowClass
+            ? ` Requested ${requestedWorkflowClass} was promoted because only low-risk work may skip independent review.`
+            : ""),
+        { id: params.id, riskTier, workflowClass, requestedWorkflowClass },
       );
     },
   });
@@ -548,6 +576,8 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
       }
       const riskTier = riskTierOf(issue);
       if (riskTier) lines.push(`Risk tier: ${riskTier}`);
+      const workflowClass = workflowClassOf(issue);
+      if (isLifecycleV1(issue)) lines.push(`Workflow class: ${workflowClass}`);
       const runId = workflowRunIdOf(issue);
       if (runId) {
         const attempt = attemptOf(issue);
@@ -575,6 +605,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
         issue,
         phase: phase ?? null,
         riskTier: riskTier ?? null,
+        workflowClass: isLifecycleV1(issue) ? workflowClass : null,
         workflowRunId: runId ?? null,
         attempt: attemptOf(issue) ?? null,
         lastVerdict: verdict ?? null,

@@ -1,10 +1,10 @@
 /**
- * Migration + packaging (spec-phase-6): the lazy, non-destructive legacy
- * path as a unit — legacy visibility under the default and under the
- * `compatLegacyIssues` opt-in, the once-per-session compat warning, v0.1
- * lease respect (live leases are never claimed, expired ones are migrated
- * over), metadata preservation on stamping, the CAS-throw idempotency
- * contract of the migration entry — plus the subpath-export smoke tests
+ * Legacy compatibility + packaging (spec-phase-6): version-neutral legacy
+ * handling as a unit — visibility under the default and under the
+ * `compatLegacyIssues` opt-in, the once-per-session compat warning, lease
+ * respect (live leases are never claimed, expired ones can be reclaimed),
+ * metadata preservation on stamping, the CAS-throw idempotency contract of
+ * the initialization entry — plus the subpath-export smoke tests
  * (`pi-workgraph/protocol` and the two adapter subpaths resolve through
  * the package export map via Node's package self-reference).
  *
@@ -211,9 +211,9 @@ describe("legacy visibility and compat dispatch", () => {
         w.includes(COMPAT_WARNING_MARKER),
       );
       expect(compatWarnings).toHaveLength(1);
-      // The warning names the setting and its migration effect.
+      // The warning names the setting and its compatibility effect.
       expect(compatWarnings[0]).toContain("workgraph-compat-legacy-issues");
-      expect(compatWarnings[0]).toContain("lifecycle v1");
+      expect(compatWarnings[0]).toContain("initializes lifecycle metadata");
       expect(coordinator.current()).toBeNull();
       expect(graph.showIssue(graph.seededIds[0]!).status).toBe("open");
       expect(getExecLog().some((e) => e.args.includes("--claim"))).toBe(false);
@@ -223,11 +223,11 @@ describe("legacy visibility and compat dispatch", () => {
     }
   }, 30_000);
 
-  it("compat on: the claim lazily migrates — stamps lifecycle v1, enters implementing, preserves pre-existing metadata", async () => {
+  it("compat on: the claim initializes lifecycle metadata, enters implementing, and preserves pre-existing metadata", async () => {
     resetLeasesForTest();
     const graph = makeScratchGraph({ prefix: "migclm" });
-    const id = graph.createIssue("v0.1-era task");
-    // Pre-existing metadata a v0.1 graph might carry: a foreign tooling key
+    const id = graph.createIssue("legacy task");
+    // Pre-existing metadata a legacy graph might carry: a foreign tooling key
     // and a released-lease epoch (epoch survives release — Convention §2.7).
     graph.bd([
       "update",
@@ -242,7 +242,7 @@ describe("legacy visibility and compat dispatch", () => {
     const { mock, coordinator, warnings } = makeHarness({
       compatLegacyIssues: true,
     });
-    // accept-stall: the run parks in implementing — pinning the MIGRATION
+    // accept-stall: the run parks in implementing — pinning the INITIALIZATION
     // ENTRY phase (legacy → implementing, never ready) before the normal
     // flow moves on (risk note: only workgraph_approve produces ready).
     const fake = installFakeExecutor(mock.events, {
@@ -279,10 +279,10 @@ describe("legacy visibility and compat dispatch", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Lazy migration via workgraph_approve
+// Legacy initialization via workgraph_approve
 // ---------------------------------------------------------------------------
 
-describe("lazy migration via workgraph_approve", () => {
+describe("legacy initialization via workgraph_approve", () => {
   it("approve on a legacy issue stamps v1 + ready + risk tier, preserving every pre-existing metadata key", async () => {
     const graph = makeScratchGraph({ prefix: "migapv" });
     const mock = makeToolsMock();
@@ -325,7 +325,7 @@ describe("lazy migration via workgraph_approve", () => {
     }
   }, 30_000);
 
-  it("the migration entry is CAS-safe, not silently repeatable: re-running it throws", async () => {
+  it("the initialization entry is CAS-safe, not silently repeatable: re-running it throws", async () => {
     const graph = makeScratchGraph({ prefix: "migcas" });
     const mock = makeToolsMock();
     try {
@@ -354,15 +354,15 @@ describe("lazy migration via workgraph_approve", () => {
 });
 
 // ---------------------------------------------------------------------------
-// v0.1 leases on legacy issues
+// Existing leases on legacy issues
 // ---------------------------------------------------------------------------
 
-describe("v0.1 leases on legacy issues", () => {
-  /** Seed the anomaly shape: an OPEN legacy issue carrying live v0.1 lease
+describe("existing leases on legacy issues", () => {
+  /** Seed the anomaly shape: an OPEN legacy issue carrying live lease
    *  keys (crash artifact / manual edit). A realistic in-flight claim is
    *  `in_progress` and invisible to the ready scan (tested separately). */
   function seedOpenLeasedLegacy(graph: ScratchGraph, expiresAt: string): string {
-    const id = graph.createIssue("v0.1 leased artifact");
+    const id = graph.createIssue("legacy leased artifact");
     graph.bd([
       "update",
       id,
@@ -378,7 +378,7 @@ describe("v0.1 leases on legacy issues", () => {
     return id;
   }
 
-  it("an open legacy issue with a live v0.1 lease is never claimed — even under compat (anomaly shape, guard reads the lease keys)", async () => {
+  it("an open legacy issue with a live lease is never claimed — even under compat (anomaly shape, guard reads the lease keys)", async () => {
     resetLeasesForTest();
     const graph = makeScratchGraph({ prefix: "miglv" });
     const id = seedOpenLeasedLegacy(graph, rfc3339(Date.now() + 3_600_000));
@@ -397,7 +397,7 @@ describe("v0.1 leases on legacy issues", () => {
       const shown = graph.showIssue(id);
       expect(shown.status).toBe("open");
       expect(lifecycleVersionOf(shown)).toBeUndefined();
-      // The foreign lease is untouched: holder and epoch as v0.1 wrote them.
+      // The foreign lease is untouched: holder and epoch retain their values.
       expect(leaseHolderOf(shown)).toBe("v01-worker");
       expect(leaseEpochOf(shown)).toBe(1);
       expect(getExecLog().some((e) => e.args.includes("--claim"))).toBe(false);
@@ -435,10 +435,10 @@ describe("v0.1 leases on legacy issues", () => {
     }
   }, 30_000);
 
-  it("a real v0.1 in-flight claim (in_progress) is invisible to the ready scan under compat", async () => {
+  it("an existing in-flight claim (in_progress) is invisible to the ready scan under compat", async () => {
     resetLeasesForTest();
     const graph = makeScratchGraph({ prefix: "migip" });
-    const id = graph.createIssue("v0.1 in-flight work");
+    const id = graph.createIssue("legacy in-flight work");
     graph.bd(["update", id, "--claim", "--actor", "v01-worker"]);
     graph.bd([
       "update",
@@ -476,7 +476,7 @@ describe("v0.1 leases on legacy issues", () => {
     }
   }, 30_000);
 
-  it("an unparseable v0.1 lease expiry is treated as leased: skipped and warned once across two ticks", async () => {
+  it("an unparseable legacy lease expiry is treated as leased: skipped and warned once across two ticks", async () => {
     resetLeasesForTest();
     const graph = makeScratchGraph({ prefix: "miggbg" });
     const id = seedOpenLeasedLegacy(graph, "not-a-timestamp");
@@ -509,7 +509,7 @@ describe("v0.1 leases on legacy issues", () => {
     }
   }, 30_000);
 
-  it("an EXPIRED v0.1 lease does not block compat migration — the claim bumps the epoch over it", async () => {
+  it("an expired legacy lease does not block compat initialization — the claim bumps the epoch over it", async () => {
     resetLeasesForTest();
     const graph = makeScratchGraph({ prefix: "migexp" });
     const id = seedOpenLeasedLegacy(graph, rfc3339(Date.now() - 60_000));

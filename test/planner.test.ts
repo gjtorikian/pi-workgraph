@@ -3,10 +3,9 @@
  * `ready`, and the coordinator's planner → implementer → judgment chain
  * driven through the per-role scriptable fake executor.
  *
- * The invariant this suite exists to pin is BACKWARD COMPATIBILITY: a
- * deployment whose executors do not offer the planner role must behave
- * exactly as it did before the role existed — same phase, same request,
- * same audit. Every other test here is about what happens once one does.
+ * The invariant this suite exists to pin is per-issue topology: planned work
+ * requires a planner, while reviewed work bypasses planning regardless of
+ * which capabilities happen to be online.
  *
  * Timer discipline follows the repo convention (no fake timers anywhere):
  * huge poll/heartbeat intervals so timers never fire mid-test, tiny REAL
@@ -118,7 +117,11 @@ function metadataOf(graph: ScratchGraph, id: string): Record<string, unknown> {
 function approve(
   graph: ScratchGraph,
   id: string,
-  opts: { riskTier?: string; acceptance?: string } = {},
+  opts: {
+    riskTier?: string;
+    acceptance?: string;
+    workflowClass?: "oneshot" | "reviewed" | "planned";
+  } = {},
 ): void {
   const args = [
     "update",
@@ -129,6 +132,8 @@ function approve(
     "workgraph_phase=ready",
     "--set-metadata",
     `workgraph_risk_tier=${opts.riskTier ?? "medium"}`,
+    "--set-metadata",
+    `workgraph_workflow_class=${opts.workflowClass ?? "planned"}`,
   ];
   if (opts.acceptance) args.push("--acceptance", opts.acceptance);
   args.push("--actor", "approver");
@@ -370,11 +375,14 @@ describe("coordinator planner tier", () => {
     }
   }, 60_000);
 
-  it("BACKWARD COMPAT: no planner offered → claims straight into implementing", async () => {
+  it("reviewed work skips planning even when the executor set has no planner", async () => {
     resetLeasesForTest();
     const graph = makeScratchGraph({ prefix: "plnone", seed: 1 });
     const id = graph.seededIds[0]!;
-    approve(graph, id, { acceptance: "unchanged" });
+    approve(graph, id, {
+      acceptance: "unchanged",
+      workflowClass: "reviewed",
+    });
     const { mock, coordinator } = makeHarness();
     const fake = installFakeExecutor(mock.events, {
       roles: ["implementer", "reviewer"],
@@ -392,11 +400,36 @@ describe("coordinator planner tier", () => {
         "implementer",
         "reviewer",
       ]);
+      expect(fake.requests[0]!.issue.workflowClass).toBe("reviewed");
       // No plan anywhere: not on the request, not in metadata, not a comment.
       expect(fake.requests[0]!.plan).toBeUndefined();
       expect(metadataOf(graph, id)[WORKGRAPH_PLAN_SUMMARY_KEY]).toBeUndefined();
       expect(await planCount(graph.dir, id)).toBe(0);
       expect(graph.showIssue(id).status).toBe("closed");
+    } finally {
+      fake.uninstall();
+      await coordinator.teardown(ectx.ctx);
+      graph.cleanup();
+    }
+  }, 60_000);
+
+  it("planned work stays ready when no planner is available", async () => {
+    resetLeasesForTest();
+    const graph = makeScratchGraph({ prefix: "plreq", seed: 1 });
+    const id = graph.seededIds[0]!;
+    approve(graph, id);
+    const { mock, coordinator } = makeHarness();
+    const fake = installFakeExecutor(mock.events, {
+      roles: ["implementer", "reviewer"],
+    });
+    const ectx = makeEventContext(graph.dir);
+    try {
+      await settle(mock, ectx.ctx);
+      await mock.flushEvents();
+
+      expect(fake.requests).toHaveLength(0);
+      expect(metadataOf(graph, id)[WORKGRAPH_PHASE_KEY]).toBe("ready");
+      expect(heldLeases(graph.dir)).toHaveLength(0);
     } finally {
       fake.uninstall();
       await coordinator.teardown(ectx.ctx);
@@ -512,7 +545,7 @@ describe("coordinator planner tier", () => {
       await settle(mock, ectx.ctx);
       await mock.flushEvents();
 
-      // The legacy migration entry is `implementing` and nothing else, so
+      // The legacy compatibility entry is `implementing` and nothing else, so
       // the planner tier must not be offered the issue.
       expect(fake.requests.map((r) => r.role)).toEqual(["implementer"]);
       expect(await planCount(graph.dir, id)).toBe(0);

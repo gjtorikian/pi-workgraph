@@ -47,7 +47,12 @@ function validRequest(): RunRequestT {
   return {
     ...newEnvelope(),
     executorId: "exec-a",
-    issue: { id: "wg-1", title: "do the thing" },
+    issue: {
+      id: "wg-1",
+      title: "do the thing",
+      workflowClass: "reviewed",
+      riskTier: "medium",
+    },
     workflowRunId: "workgraph-run/abc",
     leaseEpoch: 3,
     role: "implementer",
@@ -150,6 +155,23 @@ describe("schema validation", () => {
         ProtocolError,
       );
     }
+  });
+
+  it("validates optional workflow topology and risk independently", () => {
+    const request = validRequest();
+    expect(parseMessage(CH.runRequest, RunRequest, request)).toEqual(request);
+    expect(() =>
+      parseMessage(CH.runRequest, RunRequest, {
+        ...request,
+        issue: { ...request.issue, workflowClass: "mystery" },
+      }),
+    ).toThrow(ProtocolError);
+    expect(() =>
+      parseMessage(CH.runRequest, RunRequest, {
+        ...request,
+        issue: { ...request.issue, riskTier: "extreme" },
+      }),
+    ).toThrow(ProtocolError);
   });
 
   it("a valid completion parses; a bad outcome enum rejects", () => {

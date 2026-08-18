@@ -25,19 +25,20 @@
  *    offers leave the ready pool untouched (the phase-0 pin).
  *  - APPROVED WORK ONLY: the coordinator claims lifecycle-v1 issues in
  *    phase "ready" (approved via workgraph_approve); legacy issues need the
- *    explicit `compatLegacyIssues` opt-in and are lazily migrated to v1 at
+ *    explicit `compatLegacyIssues` opt-in and receive lifecycle metadata at
  *    claim. Because bd's `ready --claim` is metadata-blind, claims go
  *    through the equally-atomic claim-by-id path after client-side
  *    filtering; a claim conflict is a lost race, not an error.
  *  - Every claim mints a FRESH workflow-run holder (via the injected
  *    IdentityProvider) — re-acquiring under a reused holder would be
  *    treated as a renewal (no epoch bump) and silently bypass fencing.
- *  - Implementation completion transitions `workgraph_phase` to "judging"
- *    and NEVER closes the issue directly; the judgment gate (phase 3) is
- *    the only path to accepted+closed: independent review → policy
- *    application → bounded revisions → fingerprint escalation →
- *    verification → policy-approved close. The state machine enforces
- *    policy; prompts only explain it.
+ *  - Reviewed/planned implementation completion transitions
+ *    `workgraph_phase` to "judging"; a successful low-risk one-shot instead
+ *    follows the verification/acceptance tail directly. The judgment gate
+ *    remains the reviewed/planned path to accepted+closed: independent
+ *    review → policy application → bounded revisions → workflow promotion
+ *    or escalation → verification → policy-approved close. The state
+ *    machine enforces policy; prompts only explain it.
  *  - Judgment-time completions (reviewer/revision runs) correlate by the
  *    executionId bound at their run:accepted — `run:completed` has no
  *    inReplyTo, and the active-run matching would misroute them since one
@@ -91,6 +92,7 @@ import {
   phaseOf,
   riskTierOf,
   transition,
+  workflowClassOf,
   workflowRunIdOf,
 } from "./lifecycle.ts";
 import {
@@ -100,7 +102,7 @@ import {
   recordPlan,
   renderPlan,
 } from "./plan.ts";
-import { checkIndependence, resolvePolicy } from "./policy.ts";
+import { checkIndependence, resolvePolicy, type RiskTier } from "./policy.ts";
 import {
   CH,
   newEnvelope,
@@ -131,9 +133,11 @@ import type {
   Lease,
   LeaseActor,
   PlanT,
+  WorkflowClassT,
   VerdictT,
 } from "./types.ts";
 import {
+  Plan,
   Verdict,
   WORKGRAPH_ACTIVE_EXECUTION_ID_KEY,
   WORKGRAPH_ATTEMPT_KEY,
@@ -145,6 +149,7 @@ import {
   WORKGRAPH_PLAN_SUMMARY_KEY,
   WORKGRAPH_PLANNER_PROVENANCE_KEY,
   WORKGRAPH_WORKFLOW_RUN_ID_KEY,
+  WORKGRAPH_WORKFLOW_CLASS_KEY,
 } from "./types.ts";
 import {
   artifactDigest,
@@ -173,7 +178,7 @@ export interface CoordinatorDeps {
   identity?: IdentityProvider;
   /**
    * Warning sink (default console.error). The once-per-session compat
-   * warnings (legacy auto-dispatch active, unreadable v0.1 lease metadata)
+   * warnings (legacy auto-dispatch active, unreadable lease metadata)
    * assert through this seam — the pi-subagents adapter's injectable-warn
    * pattern.
    */
@@ -187,6 +192,26 @@ export interface CoordinatorDeps {
  * constant (decision log).
  */
 export const MAX_REVIEW_RETRIES = 2;
+
+/**
+ * Resolve topology defensively. Approval already promotes non-low one-shot
+ * requests, but hand-written metadata must not be able to bypass a blocking
+ * risk policy.
+ */
+function effectiveWorkflowClass(issue: BeadsIssue): WorkflowClassT {
+  const workflowClass = workflowClassOf(issue);
+  return workflowClass === "oneshot" && riskTierOf(issue) !== "low"
+    ? "reviewed"
+    : workflowClass;
+}
+
+/** Protocol-safe form of the same conservative risk fallback policy uses. */
+function effectiveRiskTier(issue: BeadsIssue): RiskTier {
+  const riskTier = riskTierOf(issue);
+  return riskTier === "low" || riskTier === "medium" || riskTier === "high"
+    ? riskTier
+    : "medium";
+}
 
 /** One workflow run the coordinator supervises. */
 export interface CoordinatorRun {
@@ -287,11 +312,11 @@ export function registerCoordinator(
   }
 
   /**
-   * Whether a LEGACY issue carries a live v0.1 lease that must be
-   * respected: never claimed, regardless of `compatLegacyIssues` (the
-   * migration contract — the lease trio is the frozen interop surface, and
-   * `acquireLease` would otherwise stamp over the foreign holder with
-   * epoch + 1). Tolerant parse per the lease-accessor discipline: a holder
+   * Whether a LEGACY issue carries a live lease that must be respected:
+   * never claimed, regardless of `compatLegacyIssues` (the lease trio is
+   * the frozen interop surface, and `acquireLease` would otherwise stamp
+   * over the foreign holder with epoch + 1). Tolerant parse per the
+   * lease-accessor discipline: a holder
    * whose expiry is missing or unparseable cannot be proven expired —
    * treat the issue as leased and warn once per issue.
    */
@@ -610,6 +635,119 @@ export function registerCoordinator(
   // completion can never race past its subscription.
   // -------------------------------------------------------------------------
 
+  /**
+   * Finish a one-shot implementation. Success follows the explicit
+   * verification/acceptance tail and closes; failure promotes the issue to
+   * the reviewed workflow and returns it to the ready pool for a stronger
+   * implementation + independent judgment pass.
+   */
+  async function finishOneshot(
+    run: CoordinatorRun,
+    msg: RunCompletedT,
+  ): Promise<void> {
+    run.executionId = msg.executionId;
+    run.evidence = [...msg.evidence];
+    if (msg.outcome !== "success") {
+      await setMetadata(
+        run.cwd,
+        run.lease.issueId,
+        {
+          [WORKGRAPH_PHASE_KEY]: "ready",
+          [WORKGRAPH_WORKFLOW_CLASS_KEY]: "reviewed",
+          [WORKGRAPH_ACTIVE_EXECUTION_ID_KEY]: "",
+        },
+        run.actor.bdActor,
+      );
+      await recordLeaseEvent(
+        run.cwd,
+        "workflow-promoted",
+        run.lease.issueId,
+        {
+          workflowRunId: run.workflowRunId,
+          from: "oneshot",
+          to: "reviewed",
+          outcome: msg.outcome,
+          executionId: msg.executionId,
+        },
+        run.actor.bdActor,
+      );
+      emitActivity({
+        kind: "transition",
+        issueId: run.lease.issueId,
+        phase: "ready",
+        workflowRunId: run.workflowRunId,
+        actor: run.actor.bdActor,
+        summary: `one-shot ${msg.outcome}; promoted to reviewed`,
+      });
+      state.active = null;
+      if (heldRuns().length === 0) stopHeartbeat();
+      try {
+        await releaseLease(run.cwd, run.lease, run.actor);
+      } catch (e) {
+        if (!(e instanceof FencingError)) throw e;
+      }
+      return;
+    }
+
+    await transition(run.cwd, run.lease.issueId, "implementing", "verifying", {
+      fields: {
+        [WORKGRAPH_AUTHOR_PROVENANCE_KEY]: JSON.stringify(msg.provenance),
+      },
+      actor: run.actor.bdActor,
+    });
+    run.phase = "verifying";
+    emitActivity({
+      kind: "transition",
+      issueId: run.lease.issueId,
+      phase: "verifying",
+      workflowRunId: run.workflowRunId,
+      actor: run.actor.bdActor,
+      summary: `one-shot implementation completed by ${run.executorId}`,
+    });
+    // No verifier commands are configured in protocol v1, so this is the
+    // same explicit pass-through verification tail used after judgment.
+    await transition(run.cwd, run.lease.issueId, "verifying", "accepted", {
+      actor: run.actor.bdActor,
+    });
+    emitActivity({
+      kind: "transition",
+      issueId: run.lease.issueId,
+      phase: "accepted",
+      workflowRunId: run.workflowRunId,
+      actor: run.actor.bdActor,
+      summary: "one-shot verification passed",
+    });
+    await close(
+      run.cwd,
+      run.lease.issueId,
+      "accepted by the one-shot workflow",
+      run.actor.bdActor,
+    );
+    untrackLease(run.cwd, run.lease.issueId);
+    state.active = null;
+    if (heldRuns().length === 0) stopHeartbeat();
+    emitActivity({
+      kind: "close",
+      issueId: run.lease.issueId,
+      phase: "accepted",
+      workflowRunId: run.workflowRunId,
+      actor: run.actor.bdActor,
+      summary: "closed after one-shot verification",
+    });
+    await recordLeaseEvent(
+      run.cwd,
+      "oneshot-closed",
+      run.lease.issueId,
+      {
+        workflowRunId: run.workflowRunId,
+        executionId: msg.executionId,
+        provenance: msg.provenance,
+        actor: identitySnapshot(run.actor),
+      },
+      run.actor.bdActor,
+    );
+  }
+
   async function onCompleted(raw: unknown): Promise<void> {
     let msg: RunCompletedT;
     try {
@@ -728,6 +866,8 @@ export function registerCoordinator(
       // deliberately does not — see the tail of this function.
       if (run.role === "planner") {
         startImplementation = await acceptPlan(run, msg);
+      } else if (effectiveWorkflowClass(run.issue) === "oneshot") {
+        await finishOneshot(run, msg);
       } else {
         try {
           await transition(run.cwd, run.lease.issueId, "implementing", "judging", {
@@ -965,6 +1105,8 @@ export function registerCoordinator(
       issue: {
         id: run.issue.id,
         title: run.issue.title,
+        workflowClass: effectiveWorkflowClass(run.issue),
+        riskTier: effectiveRiskTier(run.issue),
         ...(run.issue.description !== undefined
           ? { description: run.issue.description }
           : {}),
@@ -1160,6 +1302,68 @@ export function registerCoordinator(
   }
 
   /**
+   * A reviewed workflow that cannot converge gets one structural escalation:
+   * promote it to planned and return it ready. A planned workflow that still
+   * cannot converge takes the ordinary blocked escalation path.
+   */
+  async function promoteReviewedToPlanned(
+    run: CoordinatorRun,
+    reason: string,
+    fields: Record<string, string> = {},
+  ): Promise<void> {
+    const cur = await show(run.cwd, run.lease.issueId);
+    const actual = phaseOf(cur);
+    if (actual !== "judging") {
+      throw new LifecycleError(
+        run.lease.issueId,
+        "judging",
+        actual,
+        "ready",
+        "phase changed underneath workflow promotion",
+      );
+    }
+    await setMetadata(
+      run.cwd,
+      run.lease.issueId,
+      {
+        ...fields,
+        [WORKGRAPH_PHASE_KEY]: "ready",
+        [WORKGRAPH_WORKFLOW_CLASS_KEY]: "planned",
+        [WORKGRAPH_ATTEMPT_KEY]: "1",
+        [WORKGRAPH_ACTIVE_EXECUTION_ID_KEY]: "",
+        [WORKGRAPH_FAILURE_FINGERPRINT_KEY]: "",
+      },
+      run.actor.bdActor,
+    );
+    await recordLeaseEvent(
+      run.cwd,
+      "workflow-promoted",
+      run.lease.issueId,
+      {
+        workflowRunId: run.workflowRunId,
+        from: "reviewed",
+        to: "planned",
+        reason,
+      },
+      run.actor.bdActor,
+    );
+    emitActivity({
+      kind: "transition",
+      issueId: run.lease.issueId,
+      phase: "ready",
+      workflowRunId: run.workflowRunId,
+      actor: run.actor.bdActor,
+      summary: `${reason}; promoted reviewed → planned`,
+    });
+    try {
+      await releaseLease(run.cwd, run.lease, run.actor);
+    } catch (e) {
+      if (!(e instanceof FencingError)) throw e;
+    }
+    dropJudgedRun(run);
+  }
+
+  /**
    * Request one revision run (role `revision`, priorFindings = the verdict
    * serialized one canonical-JSON finding per entry — the protocol field is
    * frozen as Array<string>) and await its fenced completion. Returns the
@@ -1206,6 +1410,8 @@ export function registerCoordinator(
       issue: {
         id: run.issue.id,
         title: run.issue.title,
+        workflowClass: effectiveWorkflowClass(run.issue),
+        riskTier: effectiveRiskTier(run.issue),
         ...(run.issue.description !== undefined
           ? { description: run.issue.description }
           : {}),
@@ -1421,6 +1627,8 @@ export function registerCoordinator(
         issue: {
           id: run.issue.id,
           title: run.issue.title,
+          workflowClass: effectiveWorkflowClass(run.issue),
+          riskTier: effectiveRiskTier(issue),
           ...(run.issue.description !== undefined
             ? { description: run.issue.description }
             : {}),
@@ -1554,6 +1762,14 @@ export function registerCoordinator(
         const digest = artifactDigest(author.artifacts);
         const fingerprint = failureFingerprint(blocking, digest);
         if (failureFingerprintOf(issue) === fingerprint) {
+          if (effectiveWorkflowClass(issue) === "reviewed") {
+            await promoteReviewedToPlanned(
+              run,
+              "repeated blocking-finding fingerprint on an unchanged artifact digest",
+              { [WORKGRAPH_LAST_VERDICT_KEY]: summary },
+            );
+            return;
+          }
           await escalateRun(
             run,
             "judging",
@@ -1563,6 +1779,14 @@ export function registerCoordinator(
           return;
         }
         if (attempt - 1 >= policy.maxRevisions) {
+          if (effectiveWorkflowClass(issue) === "reviewed") {
+            await promoteReviewedToPlanned(
+              run,
+              `maxRevisions (${policy.maxRevisions}) exhausted`,
+              { [WORKGRAPH_LAST_VERDICT_KEY]: summary },
+            );
+            return;
+          }
           await escalateRun(
             run,
             "judging",
@@ -1751,7 +1975,7 @@ export function registerCoordinator(
     // APPROVED WORK ONLY: lifecycle-v1 issues must be in phase "ready"
     // (workgraph_approve); legacy issues (no lifecycle version) dispatch
     // only under the explicit compat opt-in (README "Legacy compatibility")
-    // — and even under compat, a legacy issue carrying a live v0.1 lease is
+    // — and even under compat, a legacy issue carrying a live lease is
     // respected, never claimed.
     const compat = config.compatLegacyIssues ?? false;
     const eligible = pool.filter((issue) => {
@@ -1759,15 +1983,15 @@ export function registerCoordinator(
       return compat && !legacyLiveLease(issue);
     });
     // Compat dispatch is about to include legacy work: say so ONCE per
-    // session, naming the setting and its migration effect (phase 6 —
+    // session, naming the setting and its effect (phase 6 —
     // "warning names the setting each session" is the failure-modes
     // mitigation for users left on compat forever).
     if (compat && eligible.some((issue) => !isLifecycleV1(issue))) {
       warnOnce(
         "[pi-workgraph] workgraph-compat-legacy-issues is enabled: legacy issues " +
           "(no workgraph_lifecycle_version) are auto-dispatched, and each claim " +
-          "lazily migrates the issue — stamping lifecycle v1 and entering phase " +
-          '"implementing". This setting is transitional; prefer approving work ' +
+          "initializes lifecycle metadata and enters phase " +
+          '"implementing". Prefer approving work ' +
           "explicitly with workgraph_approve.",
       );
     }
@@ -1790,24 +2014,26 @@ export function registerCoordinator(
       return;
     }
 
-    // ROLE SELECTION. Planning is a tier, not a mandatory stage: prefer a
-    // planner when one is offered, and fall back to dispatching the
-    // implementer directly when none is — a graph whose executors implement
-    // but do not plan behaves exactly as it did before the role existed.
+    // ROLE SELECTION. Workflow depth is now per issue: only `planned` work
+    // enters planning, and it never silently degrades when a planner is
+    // unavailable. Reviewed and one-shot work go straight to implementation
+    // even while planner-capable executors are online.
     //
     // Both selections run against the SAME discovery round: re-discovering
     // per role would let the offer set change between the two calls and
     // could claim into `planning` on the strength of a planner that is gone
     // by the time we dispatch.
     //
-    // LEGACY issues never plan: their only migration entry is
+    // LEGACY issues never plan: their compatibility entry is
     // `implementing` (lifecycle.ts LEGACY_ENTRY), so offering them the
     // planner tier would claim a lease and then throw on the transition.
     // Compat mode stays byte-for-byte what it was.
     const candidate = eligible[0]!;
-    let role: "planner" | "implementer" = isLifecycleV1(candidate)
-      ? "planner"
-      : "implementer";
+    const workflowClass = effectiveWorkflowClass(candidate);
+    let role: "planner" | "implementer" =
+      isLifecycleV1(candidate) && workflowClass === "planned"
+        ? "planner"
+        : "implementer";
     let selected;
     try {
       if (role === "planner") {
@@ -1831,13 +2057,12 @@ export function registerCoordinator(
               inFlightCounts(),
             )
           : undefined;
-        // A pinned executor that does not offer the planner role is not an
-        // error — it means this deployment has no planner tier. Fall through
-        // rather than refusing to dispatch: the pin's guarantee is "never
-        // silently select someone else", and dropping to the implementer
-        // role on the SAME pinned executor keeps that promise.
+        // A pin overrides registry filters, so re-check the required role.
         if (selected && !selected.roles.includes("planner")) selected = undefined;
-        if (!selected) role = "implementer";
+        if (!selected) {
+          logSkipOnce("planned work requires an eligible planner — no claim");
+          return;
+        }
       }
       if (role === "implementer") {
         selected = selectExecutor(
@@ -1846,6 +2071,9 @@ export function registerCoordinator(
           { executorId: config.executorId },
           inFlightCounts(),
         );
+        if (selected && !selected.roles.includes("implementer")) {
+          selected = undefined;
+        }
       }
     } catch (e) {
       if (e instanceof ExecutorSelectionError) {
@@ -1856,7 +2084,7 @@ export function registerCoordinator(
       throw e;
     }
     if (!selected) {
-      logSkipOnce("no eligible executor for role implementer — no claim");
+      logSkipOnce(`no eligible executor for role ${role} — no claim`);
       return;
     }
     // The phase the claim enters, and the phase every downstream write in
@@ -1919,8 +2147,8 @@ export function registerCoordinator(
     // between claim and accept is reconcilable from metadata (phase 4) and
     // never orphans silently. The write goes through the guarded lifecycle
     // transition (ready → planning when a planner was selected, else ready →
-    // implementing; a compat claim of a legacy issue is the migration entry,
-    // always → implementing, and stamps lifecycle v1) — phase, run id,
+    // implementing; a compat claim of a legacy issue is its initialization
+    // entry, always → implementing, and stamps lifecycle v1) — phase, run id,
     // executor id, and attempt land in ONE setMetadata call.
     try {
       await transition(
@@ -1968,6 +2196,8 @@ export function registerCoordinator(
       issue: {
         id: run.issue.id,
         title: run.issue.title,
+        workflowClass: effectiveWorkflowClass(run.issue),
+        riskTier: effectiveRiskTier(outcome.issue),
         ...(run.issue.description !== undefined
           ? { description: run.issue.description }
           : {}),
@@ -1980,6 +2210,7 @@ export function registerCoordinator(
       role,
       attempt: 1,
       workspace: { baseRevision: "", requiresIsolation: false },
+      ...(role === "planner" ? { outputSchema: Plan } : {}),
     };
 
     // Bounded accept window; the correlated subscription is registered

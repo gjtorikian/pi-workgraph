@@ -49,6 +49,7 @@ import {
   WORKGRAPH_ATTEMPT_KEY,
   WORKGRAPH_LAST_VERDICT_KEY,
   WORKGRAPH_PHASE_KEY,
+  WORKGRAPH_WORKFLOW_CLASS_KEY,
   type VerdictT,
 } from "../src/types.ts";
 import { installFakeExecutor } from "./helpers/fake-executor.ts";
@@ -127,7 +128,11 @@ function metadataOf(graph: ScratchGraph, id: string): Record<string, unknown> {
 function approve(
   graph: ScratchGraph,
   id: string,
-  opts: { riskTier?: string; acceptance?: string } = {},
+  opts: {
+    riskTier?: string;
+    acceptance?: string;
+    workflowClass?: "oneshot" | "reviewed" | "planned";
+  } = {},
 ): void {
   const args = [
     "update",
@@ -138,6 +143,8 @@ function approve(
     "workgraph_phase=ready",
     "--set-metadata",
     `workgraph_risk_tier=${opts.riskTier ?? "medium"}`,
+    "--set-metadata",
+    `workgraph_workflow_class=${opts.workflowClass ?? "reviewed"}`,
   ];
   if (opts.acceptance) args.push("--acceptance", opts.acceptance);
   args.push("--actor", "approver");
@@ -535,7 +542,7 @@ describe("judgment gate flows", () => {
     }
   }, 60_000);
 
-  it("two identical blocking verdicts on an unchanged artifact digest escalate — no third revision", async () => {
+  it("two identical blocking verdicts promote reviewed work to planned — no third revision", async () => {
     resetLeasesForTest();
     const graph = makeScratchGraph({ prefix: "jgfp", seed: 1 });
     const id = graph.seededIds[0]!;
@@ -559,15 +566,17 @@ describe("judgment gate flows", () => {
       await mock.flushEvents();
 
       const shown = graph.showIssue(id);
-      expect(shown.status).toBe("blocked");
+      expect(shown.status).toBe("open");
       const metadata = metadataOf(graph, id);
-      expect(metadata[WORKGRAPH_PHASE_KEY]).toBe("escalated");
+      expect(metadata[WORKGRAPH_PHASE_KEY]).toBe("ready");
+      expect(metadata[WORKGRAPH_WORKFLOW_CLASS_KEY]).toBe("planned");
       // Exactly ONE revision ran (the repeat escalated instead of a second).
       expect(await auditCount(graph.dir, id, "revision-requested")).toBe(1);
-      expect(Number(metadata[WORKGRAPH_ATTEMPT_KEY])).toBe(2);
+      // The promoted planned workflow starts a fresh attempt sequence.
+      expect(Number(metadata[WORKGRAPH_ATTEMPT_KEY])).toBe(1);
       // Both verdicts were persisted before the gate decided.
       expect(await verdictCount(graph.dir, id)).toBe(2);
-      expect(await auditCount(graph.dir, id, "escalated")).toBe(1);
+      expect(await auditCount(graph.dir, id, "workflow-promoted")).toBe(1);
       expect(heldLeases(graph.dir)).toHaveLength(0);
     } finally {
       fake.uninstall();
@@ -622,7 +631,7 @@ describe("judgment gate flows", () => {
     }
   }, 60_000);
 
-  it("maxRevisions exhausted escalates instead of requesting another revision", async () => {
+  it("maxRevisions exhausted promotes reviewed work to planned", async () => {
     resetLeasesForTest();
     const graph = makeScratchGraph({ prefix: "jgmax", seed: 1 });
     const id = graph.seededIds[0]!;
@@ -649,10 +658,13 @@ describe("judgment gate flows", () => {
       await mock.flushEvents();
 
       const shown = graph.showIssue(id);
-      expect(shown.status).toBe("blocked");
-      expect(metadataOf(graph, id)[WORKGRAPH_PHASE_KEY]).toBe("escalated");
+      expect(shown.status).toBe("open");
+      expect(metadataOf(graph, id)[WORKGRAPH_PHASE_KEY]).toBe("ready");
+      expect(metadataOf(graph, id)[WORKGRAPH_WORKFLOW_CLASS_KEY]).toBe(
+        "planned",
+      );
       expect(await auditCount(graph.dir, id, "revision-requested")).toBe(1);
-      expect(await auditCount(graph.dir, id, "escalated")).toBe(1);
+      expect(await auditCount(graph.dir, id, "workflow-promoted")).toBe(1);
       expect(await verdictCount(graph.dir, id)).toBe(2);
     } finally {
       fake.uninstall();
@@ -695,6 +707,67 @@ describe("judgment gate flows", () => {
       expect(verdicts).toHaveLength(1);
       expect(verdicts[0]!.text).toContain("style-nit");
       expect(await auditCount(graph.dir, id, "revision-requested")).toBe(0);
+    } finally {
+      fake.uninstall();
+      await coordinator.teardown(ectx.ctx);
+      graph.cleanup();
+    }
+  }, 60_000);
+
+  it("low-risk one-shot work verifies and closes without requesting review", async () => {
+    resetLeasesForTest();
+    const graph = makeScratchGraph({ prefix: "jgones", seed: 1 });
+    const id = graph.seededIds[0]!;
+    approve(graph, id, { riskTier: "low", workflowClass: "oneshot" });
+    const { mock, coordinator } = makeHarness();
+    const fake = installFakeExecutor(mock.events, {
+      roles: ["implementer", "reviewer"],
+      roleScripts: { implementer: { provenance: IMPL_PROV } },
+    });
+    const ectx = makeEventContext(graph.dir);
+    try {
+      await settle(mock, ectx.ctx);
+      await mock.flushEvents();
+
+      expect(fake.requests.map((r) => r.role)).toEqual(["implementer"]);
+      expect(fake.requests[0]!.issue.workflowClass).toBe("oneshot");
+      expect(graph.showIssue(id).status).toBe("closed");
+      expect(metadataOf(graph, id)[WORKGRAPH_PHASE_KEY]).toBe("accepted");
+      expect(await auditCount(graph.dir, id, "oneshot-closed")).toBe(1);
+      expect(heldLeases(graph.dir)).toHaveLength(0);
+    } finally {
+      fake.uninstall();
+      await coordinator.teardown(ectx.ctx);
+      graph.cleanup();
+    }
+  }, 60_000);
+
+  it("failed one-shot work is promoted to reviewed and returned ready", async () => {
+    resetLeasesForTest();
+    const graph = makeScratchGraph({ prefix: "jgprom", seed: 1 });
+    const id = graph.seededIds[0]!;
+    approve(graph, id, { riskTier: "low", workflowClass: "oneshot" });
+    const { mock, coordinator } = makeHarness();
+    const fake = installFakeExecutor(mock.events, {
+      roles: ["implementer", "reviewer"],
+      roleScripts: {
+        implementer: { provenance: IMPL_PROV, outcome: "failure" },
+      },
+    });
+    const ectx = makeEventContext(graph.dir);
+    try {
+      await settle(mock, ectx.ctx);
+      await mock.flushEvents();
+
+      expect(fake.requests.map((r) => r.role)).toEqual(["implementer"]);
+      const shown = graph.showIssue(id);
+      expect(shown.status).toBe("open");
+      expect(metadataOf(graph, id)[WORKGRAPH_PHASE_KEY]).toBe("ready");
+      expect(metadataOf(graph, id)[WORKGRAPH_WORKFLOW_CLASS_KEY]).toBe(
+        "reviewed",
+      );
+      expect(await auditCount(graph.dir, id, "workflow-promoted")).toBe(1);
+      expect(heldLeases(graph.dir)).toHaveLength(0);
     } finally {
       fake.uninstall();
       await coordinator.teardown(ectx.ctx);
