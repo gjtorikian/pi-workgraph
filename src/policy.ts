@@ -127,7 +127,7 @@ export interface IndependenceResult {
  * FAIL CLOSED: on any required axis, a missing value on either side counts
  * as a match — a reviewer that does not report its model/provider is never
  * independent under a policy that requires them. The reviewer is
- * independent when it provably differs on at least one required axis.
+ * independent when it provably differs on every required axis.
  *
  * The executionId floor applies under EVERY policy: a "review" reported
  * from the author's own execution is self-acceptance, never judgment.
@@ -159,12 +159,12 @@ export function checkIndependence(
     return a === b;
   };
 
-  const differs = required.some((axis) => !matches(axis));
+  const differs = required.every((axis) => !matches(axis));
   if (differs) return { independent: true };
   return {
     independent: false,
     reason:
-      `reviewer provenance matches the author on every required axis ` +
+      `reviewer provenance does not differ from the author on every required axis ` +
       `(${required.join(", ")}) — missing values fail closed`,
   };
 }

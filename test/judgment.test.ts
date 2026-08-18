@@ -347,11 +347,29 @@ describe("policy and independence", () => {
       checkIndependence({ author: IMPL_PROV, reviewer: IMPL_PROV }, blocking)
         .independent,
     ).toBe(false);
-    // Differing on a required axis → independent.
+    // Differing on every required axis → independent.
     expect(
       checkIndependence({ author: IMPL_PROV, reviewer: REV_PROV }, blocking)
         .independent,
     ).toBe(true);
+    expect(
+      checkIndependence(
+        {
+          author: IMPL_PROV,
+          reviewer: { ...REV_PROV, provider: IMPL_PROV.provider },
+        },
+        blocking,
+      ).independent,
+    ).toBe(false);
+    expect(
+      checkIndependence(
+        {
+          author: IMPL_PROV,
+          reviewer: { ...REV_PROV, model: IMPL_PROV.model },
+        },
+        blocking,
+      ).independent,
+    ).toBe(false);
     // FAIL CLOSED: missing provenance on a required axis counts as a match.
     expect(
       checkIndependence(
