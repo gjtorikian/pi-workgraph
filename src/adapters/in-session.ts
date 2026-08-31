@@ -3,9 +3,15 @@
  * as an explicit, configured protocol adapter. It answers discovery
  * (`executorId: "in-session"`, `isolation: "none"`, roles
  * `["implementer"]`), accepts run requests, wakes the model with the work
- * prompt over the exact mechanism dispatch.ts used (`pi.sendMessage` with
- * `triggerTurn: true, deliverAs: "nextTurn"`), and reports `run:completed`
- * when the session settles after the work turn.
+ * prompt (`pi.sendMessage` with `triggerTurn: true, deliverAs:
+ * "followUp"`), and reports `run:completed` when the session settles after
+ * the work turn.
+ *
+ * The wake MUST NOT use dispatch.ts's original `deliverAs: "nextTurn"`:
+ * pi ignores `triggerTurn` for "nextTurn" delivery (the message queues for
+ * the next USER prompt), so in a promptless session — `pi --mode rpc`
+ * driven by an external launcher — the work prompt would sit queued
+ * forever while the coordinator renews the lease indefinitely.
  *
  * KNOWN WEAKNESS (by design — this is a *compatibility* adapter): the
  * completion signal is "the turn ended". `agent_settled` can fire for a
@@ -178,7 +184,10 @@ export function registerInSessionExecutor(
             content: buildInSessionPrompt(msg),
             display: true,
           },
-          { triggerTurn: true, deliverAs: "nextTurn" },
+          // "followUp", never "nextTurn": pi ignores triggerTurn for
+          // nextTurn, and a promptless RPC session has no next user prompt
+          // to flush the queue — the run would never start a turn.
+          { triggerTurn: true, deliverAs: "followUp" },
         );
       } catch (e) {
         const reason = e instanceof Error ? e.message : String(e);

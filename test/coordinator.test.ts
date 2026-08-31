@@ -825,17 +825,35 @@ describe("in-session adapter (standalone)", () => {
       executorId: IN_SESSION_EXECUTOR_ID,
     });
 
-    // The wake IS the old dispatch mechanism…
+    // The wake reuses dispatch.ts's message shape…
     expect(mock.sendMessages).toHaveLength(1);
     const wake = mock.sendMessages[0]!;
     expect(wake.message.customType).toBe(DISPATCH_MESSAGE_TYPE);
-    expect(wake.options).toEqual({ triggerTurn: true, deliverAs: "nextTurn" });
+    expect(wake.options).toEqual({ triggerTurn: true, deliverAs: "followUp" });
     // …with phase-2 semantics: completion is reported, never self-closed.
     const prompt = String(wake.message.content);
     expect(prompt).toContain("wg-42");
     expect(prompt).toContain(request.workflowRunId);
     expect(prompt).toContain("moves the issue to judging");
     expect(prompt).not.toContain("call workgraph_close");
+  });
+
+  it("wakes with a delivery mode that self-triggers when idle — never nextTurn", () => {
+    // Regression: pi ignores `triggerTurn` for deliverAs "nextTurn" (the
+    // message queues for the next USER prompt). A promptless `pi --mode
+    // rpc` session — the pi-workgraph-ui launch path — has no next user
+    // prompt, so a nextTurn wake left the issue in "implementing" with the
+    // lease renewing for days while zero turns ran. The wake must use a
+    // delivery mode whose triggerTurn actually fires on an idle agent
+    // ("steer" or "followUp" per pi's sendMessage contract).
+    const { mock } = makeAdapterHarness();
+    mock.events.emit(CH.runRequest, makeRunRequest());
+
+    expect(mock.sendMessages).toHaveLength(1);
+    const options = mock.sendMessages[0]!.options;
+    expect(options?.triggerTurn).toBe(true);
+    expect(options?.deliverAs).not.toBe("nextTurn");
+    expect(["steer", "followUp"]).toContain(options?.deliverAs);
   });
 
   it("reports EXACTLY one completion: first settle completes, re-settles are silent", async () => {
@@ -968,7 +986,7 @@ describe("in-session integration", () => {
       expect(mock.sendMessages).toHaveLength(2);
       for (const sent of mock.sendMessages) {
         expect(sent.message.customType).toBe(DISPATCH_MESSAGE_TYPE);
-        expect(sent.options).toEqual({ triggerTurn: true, deliverAs: "nextTurn" });
+        expect(sent.options).toEqual({ triggerTurn: true, deliverAs: "followUp" });
       }
 
       // Claims still go through bd's atomic claim path, exclusively —
