@@ -10,8 +10,17 @@
  *
  * Run via `npm run test:adapter`.
  */
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
@@ -103,6 +112,31 @@ function makeRunRequest(overrides: Partial<RunRequestT> = {}): RunRequestT {
 function busOn(mock: MockPi, channel: string): unknown[] {
   return mock.busEvents.filter((e) => e.channel === channel).map((e) => e.data);
 }
+
+// ---------------------------------------------------------------------------
+// the default version probe
+// ---------------------------------------------------------------------------
+
+describe("defaultProbeVersion", () => {
+  it("reads pi's npm package store via PI_CODING_AGENT_DIR when node resolution cannot see it", () => {
+    // A git-installed extension cannot resolve pi-subagents through its own
+    // node_modules chain — pi keeps `npm:` packages under
+    // `<config dir>/npm/node_modules`, so the probe must check there.
+    const agentDir = mkdtempSync(join(tmpdir(), "pi-agent-"));
+    const pkgDir = join(agentDir, "npm", "node_modules", "pi-subagents");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ version: "9.8.7" }));
+    const prev = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    try {
+      expect(defaultProbeVersion()).toBe("9.8.7");
+    } finally {
+      if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = prev;
+      rmSync(agentDir, { recursive: true, force: true });
+    }
+  });
+});
 
 // ---------------------------------------------------------------------------
 // registration gating: config gate + version gate

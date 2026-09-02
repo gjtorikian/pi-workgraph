@@ -38,6 +38,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type {
   SubagentsExecutorConfig,
@@ -180,8 +181,17 @@ export function defaultProbeVersion(): string | undefined {
     const version = read(resolved);
     if (version !== undefined) return version;
   } catch {
-    // not resolvable from here — fall through to the node_modules walk
+    // not resolvable from here — fall through to the pi package store
   }
+  // Pi installs `npm:` packages under `<config dir>/npm/node_modules`, which
+  // node resolution from a git-installed extension never visits — probe it
+  // directly (PI_CODING_AGENT_DIR is pi's documented config-dir override).
+  const agentDir =
+    process.env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".pi", "agent");
+  const fromStore = read(
+    join(agentDir, "npm", "node_modules", SUBAGENTS_PACKAGE_NAME, "package.json"),
+  );
+  if (fromStore !== undefined) return fromStore;
   let dir = process.cwd();
   for (;;) {
     const version = read(
