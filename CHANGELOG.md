@@ -1,3 +1,11 @@
+## [0.2.1](https://github.com/gjtorikian/pi-workgraph/compare/v0.2.0...v0.2.1) (2026-09-02)
+
+### Bug Fixes
+
+* **coordinator:** reset phase before lease release ([7bab621](https://github.com/gjtorikian/pi-workgraph/commit/7bab6212b04dc0816ca000487a501aff81555846))
+* **in-session:** wake via followUp — nextTurn never triggers a turn in promptless RPC sessions ([7e3dde9](https://github.com/gjtorikian/pi-workgraph/commit/7e3dde9ea8d9107f7397943583f3f81e488cf1ba))
+
+
 ## [0.2.0](https://github.com/gjtorikian/pi-workgraph/compare/v0.1.0...v0.2.0) (2026-08-18)
 
 ### Features
