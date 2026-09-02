@@ -48,7 +48,9 @@ import {
   type RunRequestT,
 } from "../src/protocol.ts";
 import {
+  LEASE_HOLDER_KEY,
   WORKFLOW_RUN_PREFIX,
+  WORKGRAPH_ACTIVE_EXECUTION_ID_KEY,
   WORKGRAPH_EXECUTOR_ID_KEY,
   WORKGRAPH_PHASE_KEY,
   WORKGRAPH_WORKFLOW_RUN_ID_KEY,
@@ -998,6 +1000,47 @@ describe("in-session integration", () => {
       }
     } finally {
       await coordinator.teardown(ectx.ctx);
+      graph.cleanup();
+    }
+  }, 120_000);
+
+  it("teardown resets a released implementing run to ready (redispatchable, not stranded)", async () => {
+    // Regression: graceful shutdown (UI Stop → SIGTERM → session_shutdown)
+    // released the in-session run's lease but left `workgraph_phase` at
+    // "implementing". Claiming takes phase "ready" only, and with no lease
+    // left to expire the TTL sweep never fires either — the issue was
+    // stranded until a human reset the metadata by hand.
+    resetLeasesForTest();
+    const graph = makeScratchGraph({ prefix: "coordtd", seed: 1 });
+    const mock = makeMockPi();
+    bindExec((command, args, options) => mock.exec(command, args, options));
+    setWorkerIdOverride(WORKER);
+    const config: WorkgraphConfig = { ...CONFIG, compatInSessionExecutor: true };
+    registerInSessionExecutor(asExtensionAPI(mock), { getConfig: () => config });
+    const coordinator = registerCoordinator(asExtensionAPI(mock), {
+      getConfig: () => config,
+    });
+    const ectx = makeEventContext(graph.dir);
+    try {
+      // ONE settle: claim + wake, work turn never completes — this is the
+      // mid-implementation shutdown.
+      await settle(mock, ectx.ctx);
+      await mock.flushEvents();
+
+      const id = graph.seededIds[0]!;
+      expect(metadataOf(graph, id)[WORKGRAPH_PHASE_KEY]).toBe("implementing");
+
+      await coordinator.teardown(ectx.ctx);
+
+      const md = metadataOf(graph, id);
+      expect(md[WORKGRAPH_PHASE_KEY], "phase reset for redispatch").toBe(
+        "ready",
+      );
+      expect(md[WORKGRAPH_ACTIVE_EXECUTION_ID_KEY] ?? "").toBe("");
+      expect(md[LEASE_HOLDER_KEY], "lease released").toBeUndefined();
+      expect(graph.showIssue(id).status).toBe("open");
+    } finally {
+      await coordinator.teardown(ectx.ctx); // idempotent
       graph.cleanup();
     }
   }, 120_000);

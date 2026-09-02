@@ -2414,6 +2414,42 @@ export function registerCoordinator(
           continue;
         }
       }
+      // Redispatchability reset BEFORE the release (sweep.ts discipline):
+      // releasing while `workgraph_phase` is still an in-flight work phase
+      // strands the issue — claiming takes phase "ready" only, and with
+      // the lease gone the TTL sweep can never reclaim it either. Judging
+      // and verifying keep their phase: reconciliation resumes those from
+      // the durable trail, and a reset would discard the review state.
+      // Fenced by the same epoch+holder releaseLease is about to verify;
+      // best-effort — a failed reset must never block the release.
+      try {
+        const issue = await show(run.cwd, run.lease.issueId);
+        const phase = phaseOf(issue);
+        const stillOurs =
+          leaseEpochOf(issue) === run.lease.epoch &&
+          leaseHolderOf(issue) === run.actor.holder;
+        if (
+          stillOurs &&
+          (phase === "planning" ||
+            phase === "implementing" ||
+            phase === "revising")
+        ) {
+          await setMetadata(
+            run.cwd,
+            run.lease.issueId,
+            {
+              [WORKGRAPH_PHASE_KEY]: "ready",
+              [WORKGRAPH_ACTIVE_EXECUTION_ID_KEY]: "",
+            },
+            run.actor.bdActor,
+          );
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error(
+          `[pi-workgraph] coordinator teardown could not reset ${run.lease.issueId} for redispatch: ${msg}`,
+        );
+      }
       try {
         await releaseLease(run.cwd, run.lease, run.actor);
       } catch (e) {
