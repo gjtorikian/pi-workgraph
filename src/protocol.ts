@@ -341,10 +341,11 @@ export type ActivityT = Static<typeof Activity>;
  * Upstream's event names are NOT a declared public API and upstream
  * advertises no version on its bus (verified: zero handshake/version events
  * anywhere in pi-subagents @ commit 3fc6b6b) — so the bridge probes the
- * INSTALLED package's package.json (a filesystem read, never an import) and
- * refuses to bridge unless the version falls inside this range. The range
- * is a `major.minor` prefix: `"0.34"` accepts every `0.34.x` patch and
- * nothing else. `subagentsExecutor.versionRange` config overrides it.
+ * INSTALLED package's package.json (a filesystem read, never an import).
+ * By default any installed version bridges; an explicit
+ * `subagentsExecutor.versionRange` (`major.minor` prefix: `"0.34"` accepts
+ * every `0.34.x` patch and nothing else) restores strict gating. The
+ * constant below records the last contract-verified upstream line.
  *
  * Re-verified against pi-subagents 0.34.8: event names, request parameters,
  * response shape, structured output, progress, and cancellation are intact.

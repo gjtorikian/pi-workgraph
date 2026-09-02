@@ -29,9 +29,9 @@ export type SubagentsWorkflowRoutes = Partial<
 export interface SubagentsExecutorConfig {
   enabled: boolean;
   /**
-   * Accepted upstream `major.minor` version prefix (e.g. "0.34" accepts
-   * every 0.34.x). Default: the contract-verified
-   * `SUBAGENTS_SUPPORTED_VERSION_RANGE` from protocol.ts.
+   * Optional strict gate: accepted upstream `major.minor` version prefix
+   * (e.g. "0.34" accepts every 0.34.x). Unset (the default) accepts any
+   * installed version.
    */
   versionRange?: string;
   /** Optional workflow-class + role overrides for named subagent profiles. */

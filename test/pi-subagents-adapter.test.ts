@@ -157,8 +157,11 @@ describe("bridge registration gating", () => {
     expect(mock.busHandlerCount()).toBe(0);
   });
 
-  it("version mismatch: one warning, no offer, zero subscriptions", () => {
-    const { mock, bridge, warnings } = makeBridgeHarness({}, () => "0.99.0");
+  it("explicit versionRange mismatch: one warning, no offer, zero subscriptions", () => {
+    const { mock, bridge, warnings } = makeBridgeHarness(
+      { subagentsExecutor: { enabled: true, versionRange: "0.34" } },
+      () => "0.99.0",
+    );
     expect(bridge.active()).toBe(false);
     expect(mock.busHandlerCount()).toBe(0);
     expect(warnings).toHaveLength(1);
@@ -166,6 +169,13 @@ describe("bridge registration gating", () => {
     expect(warnings[0]).toMatch(/0\.34\.x/);
     mock.events.emit(CH.discover, newEnvelope());
     expect(busOn(mock, CH.offer)).toHaveLength(0);
+  });
+
+  it("no configured versionRange bridges any installed version", () => {
+    const { bridge, warnings } = makeBridgeHarness({}, () => "9.9.9");
+    expect(bridge.active()).toBe(true);
+    expect(warnings).toHaveLength(0);
+    bridge.teardown();
   });
 
   it("no probe result (package not installed) is treated as a mismatch", () => {

@@ -551,16 +551,17 @@ medium/high risk).
 > declares no pi-subagents dependency in any block (CI enforces it).
 > Because those event names are not a declared public API, the adapter
 > validates the _installed_ upstream package version (a package.json read,
-> never an import; upstream advertises no version on its bus) and registers
-> nothing on a mismatch. Expect breakage across upstream minor versions
-> until upstream adopts the generic protocol.
+> never an import; upstream advertises no version on its bus). By default
+> any installed version bridges; set `versionRange` to gate strictly.
+> Expect breakage across upstream minor versions until upstream adopts the
+> generic protocol.
 
 The bridge ships **disabled**. Opt in explicitly:
 
 ```bash
 # flag (or env WORKGRAPH_SUBAGENTS_EXECUTOR)
 --workgraph-subagents-executor=true
-# or with an explicit accepted upstream major.minor range:
+# or pin an accepted upstream major.minor range (optional strict gate):
 --workgraph-subagents-executor='{"enabled":true,"versionRange":"0.34"}'
 ```
 

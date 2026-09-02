@@ -5,8 +5,8 @@
  * imports ZERO pi-subagents code, and this package declares no pi-subagents
  * entry in any dependency block (the CI dep-check enforces it). Upstream
  * event names are not a declared public API, so the adapter ships
- * EXPERIMENTAL and refuses to bridge when the installed upstream version
- * falls outside the harvested range (see the version gate below).
+ * EXPERIMENTAL and bridges any installed upstream version by default — an
+ * explicit `versionRange` config restores strict gating (see below).
  *
  * Two contract rules this module owns:
  *  - UNCONFIGURED = NOT REGISTERED. index.ts never calls
@@ -52,7 +52,6 @@ import {
   RunCancel,
   RunRequest,
   SUBAGENTS_PACKAGE_NAME,
-  SUBAGENTS_SUPPORTED_VERSION_RANGE,
   subagentsVersionInRange,
   type ExecutorOfferT,
   type ExecutorRoleT,
@@ -326,13 +325,17 @@ export function registerPiSubagentsExecutor(
   const configured = deps.getConfig().subagentsExecutor;
   if (configured?.enabled !== true) return inert;
 
-  // VERSION GATE: no handshake exists upstream (PR candidate #1), so probe
-  // the installed package. No probe result or an out-of-range version →
-  // warn ONCE, register NOTHING.
+  // VERSION GATE (opt-in): no handshake exists upstream (PR candidate #1),
+  // so probe the installed package. Default: any installed version bridges.
+  // An explicit `versionRange` restores strict gating; a missing package
+  // (no probe result) always refuses — warn ONCE, register NOTHING.
   const probe = deps.probeVersion ?? defaultProbeVersion;
   const version = probe();
-  const range = configured.versionRange ?? SUBAGENTS_SUPPORTED_VERSION_RANGE;
-  if (version === undefined || !subagentsVersionInRange(version, range)) {
+  const range = configured.versionRange;
+  if (
+    version === undefined ||
+    (range !== undefined && !subagentsVersionInRange(version, range))
+  ) {
     warnOnce(
       `[pi-workgraph] pi-subagents bridge disabled: ${
         version === undefined
