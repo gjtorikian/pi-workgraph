@@ -1,3 +1,10 @@
+## [0.3.1](https://github.com/gjtorikian/pi-workgraph/compare/v0.3.0...v0.3.1) (2026-09-02)
+
+### Bug Fixes
+
+* **subagents:** Probe pi's package store for the upstream version ([e942914](https://github.com/gjtorikian/pi-workgraph/commit/e9429140f77afb5a203115d23ad990612c0f68b8))
+
+
 ## [0.3.0](https://github.com/gjtorikian/pi-workgraph/compare/v0.2.1...v0.3.0) (2026-09-02)
 
 ### Features
