@@ -1,3 +1,11 @@
+## [0.3.0](https://github.com/gjtorikian/pi-workgraph/compare/v0.2.1...v0.3.0) (2026-09-02)
+
+### Features
+
+* Add lease-convention git push guard ([5786cb1](https://github.com/gjtorikian/pi-workgraph/commit/5786cb1c95dadf27dc9eb5e35c2c64d47039ef0f))
+* **subagents:** Bridge any installed version by default ([ea28d4f](https://github.com/gjtorikian/pi-workgraph/commit/ea28d4f1e0e5376fc17819fc1e9c607ffd325754))
+
+
 ## [0.2.1](https://github.com/gjtorikian/pi-workgraph/compare/v0.2.0...v0.2.1) (2026-09-02)
 
 ### Bug Fixes
