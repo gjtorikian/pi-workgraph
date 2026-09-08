@@ -58,13 +58,13 @@ export const DEFAULT_POLICY: PolicyConfig = {
   },
   medium: {
     gateMode: "blocking",
-    requireAuthorIndependence: { model: true, provider: true },
+    requireAuthorIndependence: { model: true },
     maxRevisions: 3,
     escalate: "block",
   },
   high: {
     gateMode: "blocking",
-    requireAuthorIndependence: { model: true, provider: true },
+    requireAuthorIndependence: { model: true },
     maxRevisions: 3,
     escalate: "block",
   },

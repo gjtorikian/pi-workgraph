@@ -331,7 +331,6 @@ describe("policy and independence", () => {
     expect(resolvePolicy("medium").gateMode).toBe("blocking");
     expect(resolvePolicy("high").requireAuthorIndependence).toEqual({
       model: true,
-      provider: true,
     });
     // Unknown/missing tier falls back to medium (blocking — conservative).
     expect(resolvePolicy(undefined).gateMode).toBe("blocking");
@@ -342,7 +341,6 @@ describe("policy and independence", () => {
     expect(merged.gateMode).toBe("blocking");
     expect(merged.requireAuthorIndependence).toEqual({
       model: true,
-      provider: true,
     });
   });
 
@@ -367,7 +365,7 @@ describe("policy and independence", () => {
         },
         blocking,
       ).independent,
-    ).toBe(false);
+    ).toBe(true);
     expect(
       checkIndependence(
         {

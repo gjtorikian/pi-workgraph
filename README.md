@@ -544,7 +544,7 @@ the coordinator selects by role and validates reported provenance, and
 deliberately does no model routing (see `src/policy.ts`). An adapter that
 maps role → model gets tiering; the judgment gate's
 `requireAuthorIndependence` then enforces that the reviewer differs from the
-author on every required provenance axis (model and provider by default for
+author on every required provenance axis (model by default for
 medium/high risk).
 
 ### 6. Optional executor: the pi-subagents bridge
