@@ -624,6 +624,12 @@ gap by design: the expiry sweep's reclaims and restart recovery's
 re-adopt/abandon paths emit no activity — observers needing those must
 read the audit comment trail.
 
+Executors may also publish `workgraph:v1:run:progress` for display-only
+updates. The Pi adapter includes the role, reported model, current tool note,
+and a bounded snapshot of visible worker output when upstream provides it.
+These updates are advisory; they are never acceptance evidence or lifecycle
+transitions. Observers own their transport, filtering, and presentation.
+
 **Remote transports**: the protocol can cross machines through a conforming
 transport adapter — see the
 [Agent IRC transport adapter contract](docs/agent-irc-transport.md)
@@ -657,3 +663,33 @@ TTLs), so the whole suite runs in a couple of minutes.
 ## License
 
 [MIT](./LICENSE)
+
+
+### Caller-defined finalization
+
+Set `WORKGRAPH_FINALIZATION` to JSON containing `instructions` and an optional
+`timeoutMs` (default 3600000). After verification, the coordinator dispatches a
+`finalizer` role with those instructions and a structured result schema. It closes
+the issue only when both the execution and the result report success. A missing
+executor, malformed result, or blocked/failed result escalates the issue.
+
+The core defines no skill names, hosting service, or publication task. Results
+contain `outcome` (success/blocked/failure), `summary`, optional `artifacts`, and
+opaque `data`. The result is stored in `workgraph_finalization_result`;
+`workgraph_finalization_status` reports progress. UIs may supply their own presets.
+
+The Pi subagents adapter accepts per-role `options` alongside `routes` in
+`WORKGRAPH_SUBAGENTS_EXECUTOR`: opaque `model`, optional `thinking` (requires
+an explicit model), and `skills` names. Thinking is encoded using Pi's model
+suffix. Explicit skills are passed via Pi's native skill selection. With
+finalization enabled, the adapter creates one retained Git worktree per workflow
+and shares it across implementation, review, revision, and finalization. It
+requires a clean source checkout and never removes the workflow branch or worktree.
+Accepted plans are included in every downstream task. Pi executor children retain
+workgraph tools but do not start additional coordinators or recovery sweeps.
+
+Finalization is opt-in. Existing runs without it keep their previous behavior.
+Interrupted verification/finalization is parked for operator recovery; it is
+never automatically repeated, since its external effects may already have happened.
+After an unacknowledged cancellation the lease is left to expire. Inspect the
+retained worktree and any external result before overriding or reapproving work.

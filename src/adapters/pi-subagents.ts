@@ -61,9 +61,16 @@ import {
   type RunRequestT,
 } from "../protocol.ts";
 import { DEFAULT_WORKFLOW_CLASS, type WorkflowClassT } from "../types.ts";
+import { workflowWorkspace, type WorkflowWorkspace } from "./workspace.ts";
 
 export const PI_SUBAGENTS_EXECUTOR_ID = "pi-subagents";
 export const PI_SUBAGENTS_ADAPTER_VERSION = "0.1.0";
+
+/** Pi's child runtime may inherit ambient extensions. It must not start a
+ * second workgraph scheduler while executing a role for its parent. */
+export function isPiSubagentProcess(env = process.env): boolean {
+  return !!env.PI_SUBAGENT_RUN_ID;
+}
 
 /**
  * Upstream event names and shapes re-verified against pi-subagents 0.34.8.
@@ -103,6 +110,7 @@ export const ROLE_MAP: Partial<
   implementer: { agent: "worker", worktree: true },
   revision: { agent: "worker", worktree: true },
   reviewer: { agent: "reviewer", worktree: false },
+  finalizer: { agent: "worker", worktree: false },
 };
 
 export const PI_SUBAGENTS_ROLES: ExecutorRoleT[] = [
@@ -124,7 +132,7 @@ export function resolveSubagentAgent(
   );
 }
 
-/** Advertised and enforced concurrent-run cap (a scheduling hint). */
+/** Accepted runs, including queued work. Upstream foreground calls are serial. */
 export const PI_SUBAGENTS_MAX_CONCURRENCY = 4;
 
 /**
@@ -189,7 +197,13 @@ export function defaultProbeVersion(): string | undefined {
   const agentDir =
     process.env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".pi", "agent");
   const fromStore = read(
-    join(agentDir, "npm", "node_modules", SUBAGENTS_PACKAGE_NAME, "package.json"),
+    join(
+      agentDir,
+      "npm",
+      "node_modules",
+      SUBAGENTS_PACKAGE_NAME,
+      "package.json",
+    ),
   );
   if (fromStore !== undefined) return fromStore;
   let dir = process.cwd();
@@ -208,6 +222,7 @@ export function defaultProbeVersion(): string | undefined {
  *  slash events carry no executionId, so the bridge mints one and keeps the
  *  correlation for update/response/cancel routing. */
 interface BridgedRun {
+  workspace?: WorkflowWorkspace;
   requestId: string;
   workflowRunId: string;
   executionId: string;
@@ -216,7 +231,12 @@ interface BridgedRun {
   role: ExecutorRoleT;
   /** messageId of the `run:request` (inReplyTo on accepted/rejected). */
   requestMessageId: string;
-  /** Upstream emitted `started` — the run was accepted. */
+  /** Accepted by our queue or by upstream's started event. */
+  accepted: boolean;
+  /** The request has been forwarded upstream. */
+  submitted: boolean;
+  params: Record<string, unknown>;
+  /** Upstream emitted `started`. */
   started: boolean;
   /** A workgraph `run:cancel` was forwarded upstream: the post-cancel
    *  response maps to `run:cancelled`, never to a failed completion —
@@ -283,13 +303,19 @@ export function buildSubagentTask(
   if (msg.issue.acceptanceCriteria) {
     lines.push("", `Acceptance criteria: ${msg.issue.acceptanceCriteria}`);
   }
+  if (msg.plan) lines.push("", "Accepted implementation plan:", msg.plan);
+  if (msg.instructions)
+    lines.push("", "Workflow instructions:", msg.instructions);
   if (msg.role === "reviewer") {
     lines.push(
       "",
       "You are an INDEPENDENT reviewer: evaluate the implementation against the acceptance criteria and report your verdict as structured output matching the provided schema.",
     );
     if (Array.isArray(msg.artifacts) && msg.artifacts.length > 0) {
-      lines.push("Artifacts under review:", ...msg.artifacts.map((a) => `- ${a}`));
+      lines.push(
+        "Artifacts under review:",
+        ...msg.artifacts.map((a) => `- ${a}`),
+      );
     }
   }
   if (msg.role === "planner") {
@@ -303,6 +329,18 @@ export function buildSubagentTask(
       "",
       "Prior judgment findings to address:",
       ...msg.priorFindings.map((f) => `- ${f}`),
+    );
+  }
+  if (msg.role === "finalizer") {
+    lines.push(
+      "",
+      "Perform the supplied post-verification task and report its actual outcome using the requested structured output.",
+    );
+  }
+  if (msg.role === "implementer" || msg.role === "revision") {
+    lines.push(
+      "",
+      "Implement and validate the changes. Leave the result in this workspace for independent review and subsequent workflow stages.",
     );
   }
   lines.push(
@@ -363,13 +401,42 @@ export function registerPiSubagentsExecutor(
   const runs = new Map<string, BridgedRun>();
   const unsubs: (() => void)[] = [];
 
+  function accept(run: BridgedRun): void {
+    if (run.accepted) return;
+    run.accepted = true;
+    pi.events.emit(CH.runAccepted, {
+      ...newEnvelope(nowFn),
+      inReplyTo: run.requestMessageId,
+      workflowRunId: run.workflowRunId,
+      executionId: run.executionId,
+      issueId: run.issueId,
+      leaseEpoch: run.leaseEpoch,
+      executorId: PI_SUBAGENTS_EXECUTOR_ID,
+    });
+  }
+
+  // pi-subagents rejects overlapping foreground calls, even though its slash
+  // bridge emits started before checking that lock. Own queued requests so
+  // they can be accepted within the protocol deadline and cancelled locally.
+  function launchNext(): void {
+    if ([...runs.values()].some((run) => run.submitted)) return;
+    const run = runs.values().next().value as BridgedRun | undefined;
+    if (!run) return;
+    run.submitted = true;
+    pi.events.emit(UPSTREAM_EVENTS.request, {
+      requestId: run.requestId,
+      params: run.params,
+    });
+  }
+
   function findByWorkflowRun(
     workflowRunId: string,
     executionId?: string,
   ): BridgedRun | undefined {
     for (const run of runs.values()) {
       if (run.workflowRunId !== workflowRunId) continue;
-      if (executionId !== undefined && run.executionId !== executionId) continue;
+      if (executionId !== undefined && run.executionId !== executionId)
+        continue;
       return run;
     }
     return undefined;
@@ -425,10 +492,14 @@ export function registerPiSubagentsExecutor(
       );
     }
     const artifacts: string[] = [];
+    if (run.workspace) artifacts.push(run.workspace.path);
     const artifactPaths = first?.artifactPaths;
     if (artifactPaths !== null && typeof artifactPaths === "object") {
-      for (const value of Object.values(artifactPaths as Record<string, unknown>)) {
-        if (typeof value === "string" && value.length > 0) artifacts.push(value);
+      for (const value of Object.values(
+        artifactPaths as Record<string, unknown>,
+      )) {
+        if (typeof value === "string" && value.length > 0)
+          artifacts.push(value);
       }
     }
     // REPORTED provenance: the effective model, without Pi's thinking suffix.
@@ -451,7 +522,12 @@ export function registerPiSubagentsExecutor(
       run.role === "planner" && first?.structuredOutput !== undefined
         ? first.structuredOutput
         : undefined;
-    const completed: RunCompletedT & { verdict?: unknown; plan?: unknown } = {
+    const completed: RunCompletedT & {
+      verdict?: unknown;
+      plan?: unknown;
+      finalization?: unknown;
+      workspace?: WorkflowWorkspace;
+    } = {
       ...newEnvelope(nowFn),
       workflowRunId: run.workflowRunId,
       executionId: run.executionId,
@@ -460,6 +536,9 @@ export function registerPiSubagentsExecutor(
       outcome,
       artifacts,
       evidence,
+      ...(!first
+        ? { executionError: payload.errorText || "upstream returned no completed child result" }
+        : {}),
       provenance: {
         harness: "pi-subagents",
         ...(model !== undefined ? { model } : {}),
@@ -467,6 +546,10 @@ export function registerPiSubagentsExecutor(
       },
       ...(verdict !== undefined ? { verdict } : {}),
       ...(plan !== undefined ? { plan } : {}),
+      ...(run.role === "finalizer"
+        ? { finalization: first?.structuredOutput }
+        : {}),
+      ...(run.workspace ? { workspace: run.workspace } : {}),
     };
     pi.events.emit(CH.runCompleted, completed);
   }
@@ -485,14 +568,16 @@ export function registerPiSubagentsExecutor(
         inReplyTo: msg.messageId,
         executorId: PI_SUBAGENTS_EXECUTOR_ID,
         adapterVersion: PI_SUBAGENTS_ADAPTER_VERSION,
-        roles: [...PI_SUBAGENTS_ROLES],
+        roles: deps.getConfig().finalization
+          ? [...PI_SUBAGENTS_ROLES, "finalizer"]
+          : [...PI_SUBAGENTS_ROLES],
         harness: "pi-subagents",
         isolation: "worktree",
         supportsCancellation: true,
         supportsReconciliation: false,
         profileSemantics: "named",
         maxConcurrency: PI_SUBAGENTS_MAX_CONCURRENCY,
-        available: true,
+        available: runs.size < PI_SUBAGENTS_MAX_CONCURRENCY,
         priority: PI_SUBAGENTS_PRIORITY,
       };
       pi.events.emit(CH.offer, offer);
@@ -523,6 +608,10 @@ export function registerPiSubagentsExecutor(
       };
 
       const mapping = ROLE_MAP[msg.role];
+      if (msg.role === "finalizer" && !deps.getConfig().finalization) {
+        reject("finalization is disabled");
+        return;
+      }
       const requestedWorkflowClass = msg.issue.workflowClass;
       const workflowClass: WorkflowClassT =
         requestedWorkflowClass === "oneshot" ||
@@ -540,6 +629,32 @@ export function registerPiSubagentsExecutor(
         return;
       }
 
+      let workspace: WorkflowWorkspace | undefined;
+      if (deps.getConfig().finalization && msg.role !== "planner") {
+        try {
+          if (!msg.workspace.repoPath)
+            throw new Error("workflow request is missing its repository path");
+          workspace = workflowWorkspace(
+            msg.workspace.repoPath,
+            msg.workflowRunId,
+            msg.issue.id,
+            msg.role === "implementer",
+          );
+        } catch (error) {
+          reject(error instanceof Error ? error.message : String(error));
+          return;
+        }
+      }
+      const roleOptions =
+        configured.options?.[msg.role as keyof SubagentsRoleRoutes];
+      if (roleOptions?.thinking && !roleOptions.model) {
+        reject("a thinking override requires an explicit model");
+        return;
+      }
+      const model =
+        roleOptions?.model && roleOptions.thinking
+          ? `${roleOptions.model.replace(/:(off|minimal|low|medium|high|xhigh|max)$/, "")}:${roleOptions.thinking}`
+          : roleOptions?.model;
       const run: BridgedRun = {
         requestId: crypto.randomUUID(),
         workflowRunId: msg.workflowRunId,
@@ -548,32 +663,41 @@ export function registerPiSubagentsExecutor(
         leaseEpoch: msg.leaseEpoch,
         role: msg.role,
         requestMessageId: msg.messageId,
+        accepted: false,
+        submitted: false,
         started: false,
         cancelPending: false,
-      };
-      runs.set(run.requestId, run);
-
-      // The bridged launch: a FRESH context per run (a reviewer run is a
-      // separate launch by construction, never a continuation of the
-      // implementer's session — invariant 6's structural half).
-      pi.events.emit(UPSTREAM_EVENTS.request, {
-        requestId: run.requestId,
+        ...(workspace ? { workspace } : {}),
         params: {
           agent,
-          task: buildSubagentTask(msg as RunRequestT & { artifacts?: string[] }),
-          worktree: mapping.worktree,
           // The slash response must contain the finished child result. Pi's
           // default background mode returns a launch receipt immediately.
           async: false,
           foregroundOnly: true,
+          task: buildSubagentTask(
+            msg as RunRequestT & { artifacts?: string[] },
+          ),
+          worktree: workspace ? false : mapping.worktree,
+          ...(workspace ? { cwd: workspace.path } : {}),
+          ...(model ? { model } : {}),
+          ...(roleOptions?.skills ? { skill: roleOptions.skills } : {}),
+          ...(msg.role === "finalizer"
+            ? {
+                timeoutMs:
+                  deps.getConfig().finalization?.timeoutMs ?? 3_600_000,
+              }
+            : {}),
           context: "fresh",
           ...(msg.outputSchema !== undefined
             ? { outputSchema: msg.outputSchema }
             : {}),
         },
-      });
-      // `run:accepted` waits for upstream's `started` — accepting before
-      // upstream confirmed would report a run that may never exist.
+      };
+      runs.set(run.requestId, run);
+      // A queued acceptance reserves an execution owned by this adapter;
+      // it does not claim that an upstream child has already started.
+      if (runs.size > 1) accept(run);
+      launchNext();
     }),
   );
 
@@ -586,15 +710,7 @@ export function registerPiSubagentsExecutor(
       const run = runs.get(requestId);
       if (!run || run.started) return;
       run.started = true;
-      pi.events.emit(CH.runAccepted, {
-        ...newEnvelope(nowFn),
-        inReplyTo: run.requestMessageId,
-        workflowRunId: run.workflowRunId,
-        executionId: run.executionId,
-        issueId: run.issueId,
-        leaseEpoch: run.leaseEpoch,
-        executorId: PI_SUBAGENTS_EXECUTOR_ID,
-      });
+      accept(run);
     }),
   );
 
@@ -606,10 +722,29 @@ export function registerPiSubagentsExecutor(
         requestId?: unknown;
         currentTool?: unknown;
         toolCount?: unknown;
+        progress?: Array<{ model?: unknown; recentOutput?: unknown }>;
       };
       if (typeof payload.requestId !== "string") return;
       const run = runs.get(payload.requestId);
       if (!run || !run.started) return;
+      const progress = Array.isArray(payload.progress)
+        ? payload.progress[0]
+        : undefined;
+      const model =
+        typeof progress?.model === "string"
+          ? progress.model.replace(
+              /:(off|minimal|low|medium|high|xhigh|max)$/,
+              "",
+            )
+          : undefined;
+      // Upstream exposes visible assistant/tool output here, never thinking.
+      // Bound this advisory snapshot; consumers choose what to display.
+      const output = Array.isArray(progress?.recentOutput)
+        ? progress.recentOutput
+            .filter((line): line is string => typeof line === "string")
+            .slice(-10)
+            .map((line) => line.slice(0, 500))
+        : undefined;
       const note =
         typeof payload.currentTool === "string"
           ? `tool: ${payload.currentTool}${
@@ -625,6 +760,9 @@ export function registerPiSubagentsExecutor(
         issueId: run.issueId,
         leaseEpoch: run.leaseEpoch,
         note,
+        role: run.role,
+        ...(model ? { model } : {}),
+        ...(output?.length ? { output } : {}),
       });
     }),
   );
@@ -636,7 +774,7 @@ export function registerPiSubagentsExecutor(
       const payload = data as Partial<UpstreamResponse>;
       if (typeof payload.requestId !== "string") return;
       const run = runs.get(payload.requestId);
-      if (!run) return; // not one of ours (or already finished) — silence
+      if (!run || !run.submitted) return; // not an upstream execution
       const details = (
         payload.result as
           { details?: { asyncId?: unknown; results?: unknown[] } } | undefined
@@ -654,6 +792,8 @@ export function registerPiSubagentsExecutor(
         return;
       }
       runs.delete(run.requestId);
+      // Finish emitting this result before starting the next upstream call.
+      queueMicrotask(launchNext);
 
       if (payload.result === null || typeof payload.result !== "object") {
         // Shape drift from the harvest: the version gate is the primary
@@ -661,7 +801,7 @@ export function registerPiSubagentsExecutor(
         warnOnce(
           `[pi-workgraph] pi-subagents response payload failed validation (requestId ${run.requestId}) — upstream shape drift?`,
         );
-        if (!run.started) {
+        if (!run.accepted) {
           pi.events.emit(CH.runRejected, {
             ...newEnvelope(nowFn),
             inReplyTo: run.requestMessageId,
@@ -681,13 +821,14 @@ export function registerPiSubagentsExecutor(
           requestId: run.requestId,
           result: { details: { results: [] } },
           isError: true,
-          errorText: "upstream response payload failed validation (shape drift)",
+          errorText:
+            "upstream response payload failed validation (shape drift)",
         });
         return;
       }
 
       const response = payload as UpstreamResponse;
-      if (!run.started) {
+      if (!run.accepted) {
         // Never accepted (no upstream context, cancelled-before-start, …):
         // the coordinator is still inside its bounded accept window — this
         // is a REJECTION, never a completion.
@@ -703,7 +844,8 @@ export function registerPiSubagentsExecutor(
           leaseEpoch: run.leaseEpoch,
           executorId: PI_SUBAGENTS_EXECUTOR_ID,
           reason:
-            typeof response.errorText === "string" && response.errorText.length > 0
+            typeof response.errorText === "string" &&
+            response.errorText.length > 0
               ? `upstream: ${response.errorText}`
               : "upstream error before start",
         });
@@ -730,6 +872,12 @@ export function registerPiSubagentsExecutor(
       }
       const run = findByWorkflowRun(msg.workflowRunId, msg.executionId);
       if (run) {
+        if (!run.submitted) {
+          runs.delete(run.requestId);
+          emitCancelled(run);
+          launchNext();
+          return;
+        }
         run.cancelPending = true;
         pi.events.emit(UPSTREAM_EVENTS.cancel, { requestId: run.requestId });
         return; // the ack follows upstream's post-cancel response

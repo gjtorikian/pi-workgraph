@@ -47,7 +47,11 @@ export interface FakeSubagentsBehavior {
   interrupted?: boolean;
   detached?: boolean;
   /** `subagent:slash:update` payloads emitted before the response. */
-  updates?: Array<{ currentTool?: string; toolCount?: number }>;
+  updates?: Array<{
+    currentTool?: string;
+    toolCount?: number;
+    progress?: Array<{ model?: string; recentOutput?: unknown[] }>;
+  }>;
   /** Extra artifact paths reported on `results[0].artifactPaths`. */
   artifactPaths?: Record<string, string>;
 }
@@ -74,6 +78,8 @@ export interface FakeSubagentsHandle {
 }
 
 export interface FakeSubagentsOptions {
+  /** The foreground executor's session-wide lock, checked AFTER started. */
+  singleForeground?: boolean;
   /** Mirror modern Pi defaults and its optional forced-background policy. */
   asyncByDefault?: boolean;
   forceTopLevelAsync?: boolean;
@@ -215,6 +221,15 @@ export function installFakeSubagents(
       }
 
       events.emit(UPSTREAM_EVENTS.started, { requestId });
+      if (opts.singleForeground && inFlight.size > 0) {
+        events.emit(UPSTREAM_EVENTS.response, {
+          requestId,
+          isError: true,
+          errorText: "Rejected: a subagent call is already in progress. Issue exactly ONE subagent call per turn.",
+          result: { details: { mode: "single", results: [] } },
+        });
+        return;
+      }
       for (const update of behavior.updates ?? []) {
         events.emit(UPSTREAM_EVENTS.update, { requestId, ...update });
       }

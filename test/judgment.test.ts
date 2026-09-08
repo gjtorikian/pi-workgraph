@@ -22,6 +22,7 @@ import {
   type CoordinatorController,
 } from "../src/coordinator.ts";
 import { resetIdentityForTest, setWorkerIdOverride } from "../src/identity.ts";
+import { reclaimAndLeaveReady } from "../src/sweep.ts";
 import { heldLeases, resetLeasesForTest } from "../src/lease.ts";
 import {
   escalate,
@@ -77,7 +78,11 @@ const CONFIG: WorkgraphConfig = {
 };
 
 /** Distinct author/reviewer provenance — independent under every policy. */
-const IMPL_PROV = { harness: "fake", model: "impl-model", provider: "prov-impl" };
+const IMPL_PROV = {
+  harness: "fake",
+  model: "impl-model",
+  provider: "prov-impl",
+};
 const REV_PROV = { harness: "fake", model: "rev-model", provider: "prov-rev" };
 
 const CLEAN_VERDICT: VerdictT = { findings: [] };
@@ -783,7 +788,9 @@ describe("approved-only claiming", () => {
     resetLeasesForTest();
     const graph = makeScratchGraph({ prefix: "jgleg", seed: 1 });
     const { mock, coordinator } = makeHarness(); // compatLegacyIssues unset → false
-    const fake = installFakeExecutor(mock.events, { behavior: "accept-complete" });
+    const fake = installFakeExecutor(mock.events, {
+      behavior: "accept-complete",
+    });
     const ectx = makeEventContext(graph.dir);
     try {
       resetExecLog();
@@ -851,3 +858,162 @@ describe("approved-only claiming", () => {
     }
   }, 60_000);
 });
+
+describe("caller-defined finalization", () => {
+  it.each([
+    {
+      workflow: "reviewed" as const,
+      receipt: {
+        outcome: "success",
+        summary: "Export complete",
+        data: { exportId: "opaque-123" },
+      },
+      expected: "closed",
+    },
+    {
+      workflow: "oneshot" as const,
+      receipt: { outcome: "success", summary: "Export complete" },
+      expected: "closed",
+    },
+    {
+      workflow: "reviewed" as const,
+      receipt: { outcome: "blocked", summary: "Destination unavailable" },
+      expected: "blocked",
+    },
+    {
+      workflow: "reviewed" as const,
+      receipt: { summary: "No outcome" },
+      expected: "blocked",
+    },
+  ])(
+    "$workflow finalization ends $expected only from a validated result",
+    async ({ workflow, receipt, expected }) => {
+      const { mock, coordinator } = makeHarness({
+        finalization: {
+          instructions:
+            "Export the verified result to the configured destination",
+          timeoutMs: 1000,
+        },
+      });
+      const graph = makeScratchGraph({ prefix: "finalize" });
+      const id = graph.createIssue("finalize verified work");
+      approve(graph, id, {
+        workflowClass: workflow,
+        riskTier: workflow === "oneshot" ? "low" : "medium",
+      });
+      const fake = installFakeExecutor(mock.events, {
+        roles: ["implementer", "reviewer", "finalizer"],
+        roleScripts: {
+          implementer: { provenance: IMPL_PROV },
+          reviewer: {
+            provenance: { ...REV_PROV, provider: IMPL_PROV.provider },
+            verdict: CLEAN_VERDICT,
+          },
+          finalizer: { finalization: receipt },
+        },
+      });
+      const ectx = makeEventContext(graph.dir);
+      try {
+        await settle(mock, ectx.ctx);
+        await mock.flushEvents();
+        expect(graph.showIssue(id).status).toBe(expected);
+        expect(fake.requests.map((r) => r.role)).toEqual(
+          workflow === "oneshot"
+            ? ["implementer", "finalizer"]
+            : ["implementer", "reviewer", "finalizer"],
+        );
+        expect(fake.requests.at(-1)?.instructions).toContain(
+          "Export the verified result",
+        );
+        expect(fake.requests.at(-1)?.outputSchema).toHaveProperty(
+          "properties.outcome",
+        );
+        if (expected === "closed")
+          expect(metadataOf(graph, id).workgraph_finalization_status).toBe(
+            "success",
+          );
+        expect(heldLeases(graph.dir)).toHaveLength(0);
+      } finally {
+        fake.uninstall();
+        await coordinator.teardown(ectx.ctx);
+        graph.cleanup();
+      }
+    },
+    60_000,
+  );
+
+  it("blocks instead of silently closing when no finalizer is available", async () => {
+    const { mock, coordinator } = makeHarness({
+      finalization: { instructions: "Export the result" },
+    });
+    const graph = makeScratchGraph({ prefix: "nofinal" });
+    const id = graph.createIssue("requires finalization");
+    approve(graph, id);
+    const fake = installFakeExecutor(mock.events, {
+      roles: ["implementer", "reviewer"],
+      roleScripts: {
+        implementer: { provenance: IMPL_PROV },
+        reviewer: { provenance: REV_PROV, verdict: CLEAN_VERDICT },
+      },
+    });
+    const ectx = makeEventContext(graph.dir);
+    try {
+      await settle(mock, ectx.ctx);
+      await mock.flushEvents();
+      expect(graph.showIssue(id).status).toBe("blocked");
+      expect(metadataOf(graph, id).workgraph_finalization_status).toBe(
+        "blocked",
+      );
+    } finally {
+      fake.uninstall();
+      await coordinator.teardown(ectx.ctx);
+      graph.cleanup();
+    }
+  }, 60_000);
+});
+
+it.each(["ack", "ignore"] as const)(
+  "finalizer timeout cancels first (%s)",
+  async (cancel) => {
+    const { mock, coordinator } = makeHarness({
+      finalization: { instructions: "Export verified work", timeoutMs: 10 },
+    });
+    const graph = makeScratchGraph({ prefix: "finalcancel" });
+    const id = graph.createIssue("bounded finalization");
+    approve(graph, id, { workflowClass: "oneshot", riskTier: "low" });
+    const fake = installFakeExecutor(mock.events, {
+      roles: ["implementer", "finalizer"],
+      supportsCancellation: true,
+      cancel,
+      roleScripts: {
+        implementer: { provenance: IMPL_PROV },
+        finalizer: { behavior: "accept-stall" },
+      },
+    });
+    const ectx = makeEventContext(graph.dir);
+    try {
+      await settle(mock, ectx.ctx);
+      await mock.flushEvents();
+      expect(fake.cancels).toHaveLength(1);
+      expect(fake.cancels[0]?.executionId).toBeDefined();
+      const issue = graph.showIssue(id);
+      expect(issue.status).toBe(cancel === "ack" ? "blocked" : "in_progress");
+      if (cancel === "ignore") {
+        expect(issue.metadata?.lease_holder).toBeTruthy();
+        await reclaimAndLeaveReady(graph.dir, issue, {
+          ttlMs: 300_000,
+          now: () => Date.now() + 600_000,
+        });
+        const recovered = graph.showIssue(id);
+        expect(recovered.status).toBe("blocked");
+        expect(recovered.metadata?.workgraph_phase).toBe("escalated");
+      }
+      expect(heldLeases(graph.dir)).toHaveLength(0);
+    } finally {
+      fake.uninstall();
+      await coordinator.teardown(ectx.ctx);
+      graph.cleanup();
+    }
+  },
+  60_000,
+);

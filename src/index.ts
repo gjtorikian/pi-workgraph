@@ -9,7 +9,7 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerInSessionExecutor } from "./adapters/in-session.ts";
-import { registerPiSubagentsExecutor } from "./adapters/pi-subagents.ts";
+import { isPiSubagentProcess, registerPiSubagentsExecutor } from "./adapters/pi-subagents.ts";
 import { bdBinaryAvailable, bindExec } from "./bd.ts";
 import { registerCompactionTakeover } from "./compaction.ts";
 import { registerConfigFlags, resolveConfig } from "./config.ts";
@@ -27,6 +27,9 @@ export default function piWorkgraph(pi: ExtensionAPI): void {
   registerConfigFlags(pi);
   bindExec((command, args, options) => pi.exec(command, args, options));
   registerWorkgraphTools(pi);
+  // Executor children retain tools, while scheduling and recovery belong to
+  // the parent coordinator. Pi runtime detection stays in the Pi adapter.
+  if (isPiSubagentProcess()) return;
 
   // The in-session compatibility executor MUST register before the
   // coordinator: both listen for `agent_settled`, and registration order

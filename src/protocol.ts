@@ -24,9 +24,9 @@ import { WorkflowClass } from "./types.ts";
 export const PROTOCOL_VERSION = 1;
 
 /**
- * The twelve protocol-v1 channels. `runProgress` is reserved (no handler
- * until a consumer exists — decision log) and `activity` is emitted from
- * phase 5; both are named now so the channel table is frozen in one place.
+ * The twelve protocol-v1 channels. `runProgress` carries advisory executor
+ * telemetry; `activity` carries committed coordinator lifecycle changes.
+ * Neither channel is used to drive execution decisions.
  */
 export const CH = {
   discover: "workgraph:v1:executor:discover",
@@ -34,13 +34,13 @@ export const CH = {
   runRequest: "workgraph:v1:run:request",
   runAccepted: "workgraph:v1:run:accepted",
   runRejected: "workgraph:v1:run:rejected",
-  runProgress: "workgraph:v1:run:progress", // reserved; no handler in this phase
+  runProgress: "workgraph:v1:run:progress",
   runCompleted: "workgraph:v1:run:completed",
   runCancel: "workgraph:v1:run:cancel",
   runCancelled: "workgraph:v1:run:cancelled",
   runStatusRequest: "workgraph:v1:run:status-request",
   runStatus: "workgraph:v1:run:status",
-  activity: "workgraph:v1:activity", // reserved; emitted from phase 5
+  activity: "workgraph:v1:activity",
 } as const;
 
 export type Channel = (typeof CH)[keyof typeof CH];
@@ -87,6 +87,7 @@ export const ExecutorRole = StringEnum([
   "reviewer",
   "revision",
   "verifier",
+  "finalizer",
 ]);
 export type ExecutorRoleT = Static<typeof ExecutorRole>;
 
@@ -160,9 +161,13 @@ export const RunRequest = Type.Object({
   leaseEpoch: Type.Number(),
   role: ExecutorRole,
   attempt: Type.Number(),
+  /** Caller-supplied instructions for this role, separate from issue content. */
+  instructions: Type.Optional(Type.String()),
   workspace: Type.Object({
     baseRevision: Type.String(),
     requiresIsolation: Type.Boolean(),
+    /** Source checkout; an adapter can retain one worktree for this workflow. */
+    repoPath: Type.Optional(Type.String()),
   }),
   outputSchema: Type.Optional(Type.Unknown()),
   /** Prior judgment findings — used from phase 3. */
@@ -213,6 +218,10 @@ export const RunProgress = Type.Object({
   issueId: Type.String(),
   leaseEpoch: Type.Number(),
   note: Type.Optional(Type.String()),
+  /** Display-only telemetry; never execution or acceptance evidence. */
+  role: Type.Optional(ExecutorRole),
+  model: Type.Optional(Type.String()),
+  output: Type.Optional(Type.Array(Type.String())),
 });
 export type RunProgressT = Static<typeof RunProgress>;
 
@@ -227,6 +236,8 @@ export const RunCompleted = Type.Object({
   issueId: Type.String(),
   leaseEpoch: Type.Number(),
   outcome: RunOutcome,
+  /** Executor failed before producing a child result; no artifact to judge. */
+  executionError: Type.Optional(Type.String()),
   /** Changed files / patch refs. */
   artifacts: Type.Array(Type.String()),
   evidence: Type.Array(Type.String()),

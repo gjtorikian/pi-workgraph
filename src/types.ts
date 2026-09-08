@@ -209,6 +209,7 @@ export type LeaseEvent =
   | "escalated"
   /** Judgment (phase 3): verdict passed the gate — issue accepted and closed. */
   | "judgment-closed"
+  | "finalization-completed"
   /** Recovery (phase 4): a persisted run was re-adopted after a restart. */
   | "re-adopted"
   /** Recovery (phase 4): a persisted run was abandoned (missing, unreachable,

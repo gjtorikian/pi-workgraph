@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 /**
  * Contract tests for the OPTIONAL pi-subagents bridge (spec-phase-5):
  * registration gating (config + version gate, zero subscriptions when
@@ -50,11 +51,7 @@ import {
   type RunRequestT,
 } from "../src/protocol.ts";
 import { installFakeSubagents } from "./helpers/fake-subagents.ts";
-import {
-  asExtensionAPI,
-  makeMockPi,
-  type MockPi,
-} from "./helpers/mock-pi.ts";
+import { asExtensionAPI, makeMockPi, type MockPi } from "./helpers/mock-pi.ts";
 
 const CONFIG: WorkgraphConfig = {
   leaseTtlMs: 300_000,
@@ -125,7 +122,10 @@ describe("defaultProbeVersion", () => {
     const agentDir = mkdtempSync(join(tmpdir(), "pi-agent-"));
     const pkgDir = join(agentDir, "npm", "node_modules", "pi-subagents");
     mkdirSync(pkgDir, { recursive: true });
-    writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ version: "9.8.7" }));
+    writeFileSync(
+      join(pkgDir, "package.json"),
+      JSON.stringify({ version: "9.8.7" }),
+    );
     const prev = process.env.PI_CODING_AGENT_DIR;
     process.env.PI_CODING_AGENT_DIR = agentDir;
     try {
@@ -548,10 +548,7 @@ describe("reviewer round-trip and self-acceptance exclusion", () => {
       script: { acceptance: { status: "accepted" }, model: "rev-model" },
     });
     try {
-      mock.events.emit(
-        CH.runRequest,
-        makeRunRequest({ role: "reviewer" }),
-      );
+      mock.events.emit(CH.runRequest, makeRunRequest({ role: "reviewer" }));
       const completions = busOn(mock, CH.runCompleted) as Array<
         RunCompletedT & { verdict?: unknown }
       >;
@@ -643,7 +640,18 @@ describe("progress forwarding and addressing", () => {
     const fake = installFakeSubagents(mock.events, {
       script: {
         mode: "respond",
-        updates: [{ currentTool: "bash", toolCount: 3 }],
+        updates: [
+          {
+            currentTool: "bash",
+            toolCount: 3,
+            progress: [
+              {
+                model: "provider/model:high",
+                recentOutput: [null, "BUILD SUCCESSFUL"],
+              },
+            ],
+          },
+        ],
         model: "m-1",
       },
     });
@@ -657,6 +665,9 @@ describe("progress forwarding and addressing", () => {
         issueId: "wg-7",
         leaseEpoch: 3,
         note: "tool: bash (3 calls)",
+        role: "implementer",
+        model: "provider/model",
+        output: ["BUILD SUCCESSFUL"],
       });
     } finally {
       fake.uninstall();
@@ -759,9 +770,9 @@ describe("two executors: selection determinism", () => {
         requiresIsolation: false,
       };
       // Priority (10 vs unset=0) decides — independent of arrival order.
-      expect(
-        selectExecutor(offers, requirements, {})?.executorId,
-      ).toBe(PI_SUBAGENTS_EXECUTOR_ID);
+      expect(selectExecutor(offers, requirements, {})?.executorId).toBe(
+        PI_SUBAGENTS_EXECUTOR_ID,
+      );
       expect(
         selectExecutor([...offers].reverse(), requirements, {})?.executorId,
       ).toBe(PI_SUBAGENTS_EXECUTOR_ID);
@@ -775,8 +786,11 @@ describe("two executors: selection determinism", () => {
       ).toBe(PI_SUBAGENTS_EXECUTOR_ID);
       // Only the bridge offers reviewer.
       expect(
-        selectExecutor(offers, { role: "reviewer", requiresIsolation: false }, {})
-          ?.executorId,
+        selectExecutor(
+          offers,
+          { role: "reviewer", requiresIsolation: false },
+          {},
+        )?.executorId,
       ).toBe(PI_SUBAGENTS_EXECUTOR_ID);
       // An explicit pin still forces in-session.
       expect(
@@ -830,9 +844,10 @@ describe.skipIf(!SMOKE)(
       walk(root, 0);
       const haystack = corpus.join("\n");
       for (const name of Object.values(UPSTREAM_EVENTS)) {
-        expect(haystack, `harvested event ${name} @ ${SMOKE_VERSION}`).toContain(
-          name,
-        );
+        expect(
+          haystack,
+          `harvested event ${name} @ ${SMOKE_VERSION}`,
+        ).toContain(name);
       }
     });
   },
@@ -860,6 +875,114 @@ describe("activity payload validates against the Activity schema", () => {
       parseMessage(CH.activity, Activity, { ...message, protocolVersion: 2 }),
     ).toThrow(/activity/);
   });
+});
+
+describe("configured task context", () => {
+  it("passes the accepted plan to each downstream role without assuming a delivery system", () => {
+    for (const role of ["implementer", "reviewer", "revision", "finalizer"]) {
+      const task = buildSubagentTask(
+        makeRunRequest({
+          role,
+          plan: "Use the existing parser; test round trips",
+          instructions: "Export the result",
+        }),
+      );
+      expect(task).toContain("Use the existing parser; test round trips");
+      expect(task).toContain("Export the result");
+      expect(task).not.toMatch(/github|babysit|git:commit/i);
+    }
+  });
+  it("forwards opaque skill names and encodes thinking with the Pi model suffix", async () => {
+    const { mock, bridge } = makeBridgeHarness({
+      subagentsExecutor: {
+        enabled: true,
+        options: {
+          implementer: {
+            model: "provider/model",
+            thinking: "high",
+            skills: ["custom-implementation"],
+          },
+        },
+      },
+    });
+    const upstream = installFakeSubagents(mock.events);
+    try {
+      mock.events.emit(
+        CH.runRequest,
+        makeRunRequest({ plan: "The accepted plan" }),
+      );
+      await mock.flushEvents();
+      const request = busOn(mock, UPSTREAM_EVENTS.request)[0] as {
+        params: Record<string, unknown>;
+      };
+      expect(request.params.model).toBe("provider/model:high");
+      expect(request.params.skill).toEqual(["custom-implementation"]);
+      expect(request.params.task).toContain("The accepted plan");
+    } finally {
+      upstream.uninstall();
+      bridge.teardown();
+    }
+  });
+});
+
+it("keeps every downstream role in the implementation worktree", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "bridge-workspace-"));
+  const git = (...args: string[]) =>
+    execFileSync("git", args, { cwd: dir, encoding: "utf8" }).trim();
+  git("init", "-q");
+  git(
+    "-c",
+    "user.name=Test",
+    "-c",
+    "user.email=test@example.com",
+    "commit",
+    "--allow-empty",
+    "-qm",
+    "test: seed repository",
+  );
+  const { mock, bridge } = makeBridgeHarness({
+    finalization: { instructions: "Export to our system" },
+  });
+  const receipt = {
+    outcome: "success",
+    summary: "Exported",
+    data: { opaqueId: "abc" },
+  };
+  const upstream = installFakeSubagents(mock.events, {
+    script: { structuredOutput: receipt },
+  });
+  try {
+    for (const role of ["implementer", "reviewer", "revision", "finalizer"]) {
+      mock.events.emit(
+        CH.runRequest,
+        makeRunRequest({
+          role,
+          workspace: {
+            repoPath: dir,
+            baseRevision: "",
+            requiresIsolation: true,
+          },
+        }),
+      );
+      await mock.flushEvents();
+    }
+    expect(upstream.requests).toHaveLength(4);
+    const paths = upstream.requests.map((r) => r.params.cwd);
+    expect(paths[0]).toEqual(expect.stringContaining("checkout"));
+    expect(new Set(paths).size).toBe(1);
+    expect(upstream.requests.every((r) => r.params.worktree === false)).toBe(
+      true,
+    );
+    expect(busOn(mock, CH.runCompleted).at(-1)).toHaveProperty(
+      "finalization",
+      receipt,
+    );
+    expect(git("status", "--porcelain")).toBe("");
+  } finally {
+    upstream.uninstall();
+    bridge.teardown();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 it("does not treat a thinking suffix as a different model", async () => {

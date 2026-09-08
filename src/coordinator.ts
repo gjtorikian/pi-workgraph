@@ -46,7 +46,10 @@
  *  - The coordinator never wakes the model itself: `pi.sendMessage` belongs
  *    to the in-session compatibility adapter alone.
  */
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { recordLeaseEvent } from "./audit.ts";
 import {
   BdError,
@@ -66,6 +69,7 @@ import {
   requestRun,
   selectExecutor,
 } from "./executor-registry.ts";
+import { FinalizationResult, parseFinalizationResult } from "./finalization.ts";
 import { identitySnapshot, localIdentityProvider } from "./identity.ts";
 import {
   acquireLease,
@@ -255,6 +259,8 @@ export interface CoordinatorRun {
    *  the revisor may still be mutating, so releasing without an ack would
    *  invite a concurrent publisher (spec-phase-4 key decision). */
   revisionInFlight?: boolean;
+  reviewInFlight?: boolean;
+  finalizationInFlight?: boolean;
   /** Evidence refs from the latest fenced completion (compaction). */
   evidence?: string[];
 }
@@ -424,7 +430,10 @@ export function registerCoordinator(
    *  their own, so they render the phase their ROLE is running under —
    *  otherwise a planning run would report "implementing" while the issue
    *  sits in `planning`. */
-  function statusDetail(run: CoordinatorRun): { phase: string; executorId: string } {
+  function statusDetail(run: CoordinatorRun): {
+    phase: string;
+    executorId: string;
+  } {
     const phase =
       run.phase === "requested" || run.phase === "accepted"
         ? run.role === "planner"
@@ -486,13 +495,24 @@ export function registerCoordinator(
   async function awaitCompletion(
     box: JudgmentInbox,
     executionId: string,
+    timeoutMs?: number,
   ): Promise<RunCompletedT | null> {
+    const deadline =
+      timeoutMs === undefined ? Infinity : Date.now() + timeoutMs;
     for (;;) {
       const idx = box.messages.findIndex((m) => m.executionId === executionId);
       if (idx >= 0) return box.messages.splice(idx, 1)[0]!;
-      if (box.closed) return null;
+      if (box.closed || Date.now() >= deadline) return null;
       await new Promise<void>((resolve) => {
-        box.waiters.push(resolve);
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const wake = () => {
+          if (timer) clearTimeout(timer);
+          box.waiters = box.waiters.filter((w) => w !== wake);
+          resolve();
+        };
+        box.waiters.push(wake);
+        if (Number.isFinite(deadline))
+          timer = setTimeout(wake, Math.max(0, deadline - Date.now()));
       });
     }
   }
@@ -551,9 +571,7 @@ export function registerCoordinator(
    * (never an independent counter — restart reconciliation rebuilds this
    * state, so a lost completion self-heals; spec-phase-5 failure-modes
    * row). Counted: the active implementation run and any live revision
-   * execution. Short-lived reviewer sub-runs are awaited inline rather
-   * than tracked as state and are not counted — `maxConcurrency` is a
-   * scheduling hint, not a hard reservation.
+   * execution, review, or finalization, including executor-owned queues.
    */
   function inFlightCounts(): Map<string, number> {
     const counts = new Map<string, number>();
@@ -562,7 +580,8 @@ export function registerCoordinator(
     };
     if (state.active) bump(state.active.executorId);
     for (const run of state.judged) {
-      if (run.revisionInFlight === true) bump(run.executorId);
+      if (run.revisionInFlight || run.reviewInFlight || run.finalizationInFlight)
+        bump(run.executorId);
     }
     return counts;
   }
@@ -578,7 +597,9 @@ export function registerCoordinator(
       ...newEnvelope(nowFn),
       workflowRunId: run.workflowRunId,
       issueId: run.lease.issueId,
-      ...(run.executionId !== undefined ? { executionId: run.executionId } : {}),
+      ...(run.executionId !== undefined
+        ? { executionId: run.executionId }
+        : {}),
       reason,
     };
     pi.events.emit(CH.runCancel, cancel);
@@ -704,8 +725,16 @@ export function registerCoordinator(
       actor: run.actor.bdActor,
       summary: `one-shot implementation completed by ${run.executorId}`,
     });
-    // No verifier commands are configured in protocol v1, so this is the
-    // same explicit pass-through verification tail used after judgment.
+    if (deps.getConfig().finalization) {
+      state.active = null;
+      state.judged.push(run);
+      state.inboxes.set(run.workflowRunId, {
+        messages: [],
+        waiters: [],
+        closed: false,
+      });
+      if (!(await finalize(run, msg))) return;
+    }
     await transition(run.cwd, run.lease.issueId, "verifying", "accepted", {
       actor: run.actor.bdActor,
     });
@@ -725,6 +754,7 @@ export function registerCoordinator(
     );
     untrackLease(run.cwd, run.lease.issueId);
     state.active = null;
+    dropJudgedRun(run);
     if (heldRuns().length === 0) stopHeartbeat();
     emitActivity({
       kind: "close",
@@ -854,6 +884,7 @@ export function registerCoordinator(
           outcome: msg.outcome,
           artifacts: msg.artifacts,
           evidence: msg.evidence,
+          ...(msg.executionError ? { executionError: msg.executionError } : {}),
           provenance: msg.provenance,
         },
         run.actor.bdActor,
@@ -864,18 +895,34 @@ export function registerCoordinator(
       // judgment gate. The durable part runs inside the `completing` latch
       // (so a duplicate completion cannot double-transition); the DISPATCH
       // deliberately does not — see the tail of this function.
-      if (run.role === "planner") {
+      if (msg.executionError) {
+        await escalateRun(
+          run,
+          run.role === "planner" ? "planning" : "implementing",
+          `${run.role} execution failed: ${msg.executionError}`,
+        );
+        if (state.active === run) state.active = null;
+        if (heldRuns().length === 0) stopHeartbeat();
+      } else if (run.role === "planner") {
         startImplementation = await acceptPlan(run, msg);
       } else if (effectiveWorkflowClass(run.issue) === "oneshot") {
         await finishOneshot(run, msg);
       } else {
         try {
-          await transition(run.cwd, run.lease.issueId, "implementing", "judging", {
-            fields: {
-              [WORKGRAPH_AUTHOR_PROVENANCE_KEY]: JSON.stringify(msg.provenance),
+          await transition(
+            run.cwd,
+            run.lease.issueId,
+            "implementing",
+            "judging",
+            {
+              fields: {
+                [WORKGRAPH_AUTHOR_PROVENANCE_KEY]: JSON.stringify(
+                  msg.provenance,
+                ),
+              },
+              actor: run.actor.bdActor,
             },
-            actor: run.actor.bdActor,
-          });
+          );
         } catch (e) {
           if (e instanceof LifecycleError) {
             // A concurrent writer moved the phase under our lease (override,
@@ -976,7 +1023,11 @@ export function registerCoordinator(
         },
         run.actor.bdActor,
       );
-      await escalateRun(run, "planning", `planner returned an invalid plan: ${detail}`);
+      await escalateRun(
+        run,
+        "planning",
+        `planner returned an invalid plan: ${detail}`,
+      );
       return false;
     }
 
@@ -1118,7 +1169,11 @@ export function registerCoordinator(
       leaseEpoch: run.lease.epoch,
       role: "implementer",
       attempt: run.attempt,
-      workspace: { baseRevision: "", requiresIsolation: false },
+      workspace: {
+        repoPath: run.cwd,
+        baseRevision: "",
+        requiresIsolation: false,
+      },
       ...(run.plan !== undefined ? { plan: run.plan } : {}),
     };
     const result = await requestRun(pi.events, request, {
@@ -1297,7 +1352,12 @@ export function registerCoordinator(
       dropJudgedRun(run); // reclaimed mid-escalation: no longer ours to block
       return;
     }
-    await update(run.cwd, run.lease.issueId, { status: "blocked" }, run.actor.bdActor);
+    await update(
+      run.cwd,
+      run.lease.issueId,
+      { status: "blocked" },
+      run.actor.bdActor,
+    );
     dropJudgedRun(run);
   }
 
@@ -1421,7 +1481,11 @@ export function registerCoordinator(
       leaseEpoch: run.lease.epoch,
       role: "revision",
       attempt,
-      workspace: { baseRevision: "", requiresIsolation: false },
+      workspace: {
+        repoPath: run.cwd,
+        baseRevision: "",
+        requiresIsolation: false,
+      },
       priorFindings: canonicalFindings(verdict.findings).map((f) =>
         JSON.stringify(f),
       ),
@@ -1510,12 +1574,17 @@ export function registerCoordinator(
         executorId: revisor.executorId,
         role: "revision",
         outcome: completion.outcome,
+        ...(completion.executionError ? { executionError: completion.executionError } : {}),
         artifacts: completion.artifacts,
         evidence: completion.evidence,
         provenance: completion.provenance,
       },
       run.actor.bdActor,
     );
+    if (completion.executionError) {
+      await escalateRun(run, "revising", `revision execution failed: ${completion.executionError}`);
+      return "aborted";
+    }
     // revising → judging: any outcome is judged — the reviewer sees
     // failures too; the gate, not the implementer, decides what they mean.
     try {
@@ -1547,6 +1616,209 @@ export function registerCoordinator(
     return completion;
   }
 
+  function completionFailure(role: string, completion: RunCompletedT): string {
+    const detail = completion.executionError || completion.evidence.join("; ");
+    return `${role} execution failed (${completion.outcome})${detail ? `: ${detail.slice(0, 1500)}` : ""}`;
+  }
+
+  /** Optional caller-defined work. A missing or failed result never closes the issue. */
+  async function finalize(
+    run: CoordinatorRun,
+    author: RunCompletedT,
+  ): Promise<boolean> {
+    const config = deps.getConfig();
+    const task = config.finalization;
+    if (!task) return true;
+    const box = state.inboxes.get(run.workflowRunId);
+    if (!box || box.closed) return false;
+    const offers = await discoverExecutors(pi.events, {
+      timeoutMs: config.discoveryTimeoutMs,
+      now: nowFn,
+      onInvalid,
+    });
+    if (box.closed) return false;
+    let executor;
+    try {
+      executor = selectExecutor(
+        offers,
+        { role: "finalizer", requiresIsolation: false },
+        { executorId: config.executorId },
+        inFlightCounts(),
+      );
+    } catch (error) {
+      if (!(error instanceof ExecutorSelectionError)) throw error;
+    }
+    if (!executor) {
+      await escalateRun(
+        run,
+        "verifying",
+        "configured finalization has no capable executor",
+        { workgraph_finalization_status: "blocked" },
+      );
+      return false;
+    }
+    if (!(await fencedForJudgment(run, author)) || box.closed) {
+      untrackLease(run.cwd, run.lease.issueId);
+      dropJudgedRun(run);
+      return false;
+    }
+    await setMetadata(
+      run.cwd,
+      run.issue.id,
+      {
+        workgraph_finalization_status: "running",
+        workgraph_finalization_result: "",
+        [WORKGRAPH_EXECUTOR_ID_KEY]: executor.executorId,
+        [WORKGRAPH_ACTIVE_EXECUTION_ID_KEY]: "",
+      },
+      run.actor.bdActor,
+    );
+    if (box.closed) return false;
+    run.executorId = executor.executorId;
+    run.executionId = undefined;
+    run.isolation = executor.isolation;
+    run.supportsCancellation = executor.supportsCancellation;
+    run.finalizationInFlight = true;
+    const request: RunRequestT & { artifacts: string[] } = {
+      ...newEnvelope(nowFn),
+      executorId: executor.executorId,
+      workflowRunId: run.workflowRunId,
+      leaseEpoch: run.lease.epoch,
+      issue: {
+        id: run.issue.id,
+        title: run.issue.title,
+        workflowClass: effectiveWorkflowClass(run.issue),
+        riskTier: effectiveRiskTier(run.issue),
+        description: run.issue.description,
+        acceptanceCriteria: run.issue.acceptance_criteria,
+      },
+      role: "finalizer",
+      attempt: run.attempt,
+      workspace: {
+        repoPath: run.cwd,
+        baseRevision: "",
+        requiresIsolation: false,
+      },
+      instructions: task.instructions,
+      outputSchema: FinalizationResult,
+      artifacts: author.artifacts,
+      ...(run.plan ? { plan: run.plan } : {}),
+    };
+    const result = await requestRun(pi.events, request, {
+      timeoutMs: config.acceptTimeoutMs,
+      onInvalid,
+    });
+    if (result.kind === "accepted")
+      run.executionId = result.message.executionId;
+    if (box.closed) {
+      publishCancel(run, "coordinator stopped during finalization acceptance");
+      return false;
+    }
+    if (result.kind !== "accepted") {
+      const stopped =
+        result.kind === "rejected" ||
+        (run.supportsCancellation &&
+          (await cancelAndAwaitAck(run, config.acceptTimeoutMs)));
+      if (!stopped) {
+        untrackLease(run.cwd, run.lease.issueId);
+        dropJudgedRun(run);
+        return false;
+      }
+      run.finalizationInFlight = false;
+      await escalateRun(
+        run,
+        "verifying",
+        result.kind === "rejected"
+          ? `finalization request rejected: ${result.message.reason}`
+          : "finalization acceptance timed out",
+        { workgraph_finalization_status: "blocked" },
+      );
+      return false;
+    }
+    await setMetadata(
+      run.cwd,
+      run.issue.id,
+      { [WORKGRAPH_ACTIVE_EXECUTION_ID_KEY]: result.message.executionId },
+      run.actor.bdActor,
+    );
+    emitActivity({
+      kind: "transition",
+      issueId: run.issue.id,
+      phase: "verifying",
+      workflowRunId: run.workflowRunId,
+      summary: "running configured finalization",
+    });
+    const completion = await awaitCompletion(
+      box,
+      result.message.executionId,
+      task.timeoutMs ?? 3_600_000,
+    );
+    if (!completion) {
+      if (box.closed) return false;
+      const stopped =
+        run.supportsCancellation &&
+        (await cancelAndAwaitAck(run, config.acceptTimeoutMs));
+      if (!stopped) {
+        untrackLease(run.cwd, run.lease.issueId);
+        dropJudgedRun(run);
+        return false; // Leave the lease to expire while an executor may still be mutating.
+      }
+      run.finalizationInFlight = false;
+      await escalateRun(run, "verifying", "finalization timed out", {
+        workgraph_finalization_status: "blocked",
+      });
+      return false;
+    }
+    run.finalizationInFlight = false;
+    if (!(await fencedForJudgment(run, completion)) || box.closed) {
+      untrackLease(run.cwd, run.lease.issueId);
+      dropJudgedRun(run);
+      return false;
+    }
+    if (completion.outcome !== "success" || completion.executionError) {
+      await escalateRun(run, "verifying", completionFailure("finalizer", completion), {
+        workgraph_finalization_status: "failure",
+      });
+      return false;
+    }
+    let receipt;
+    try {
+      receipt = parseFinalizationResult(
+        (completion as RunCompletedT & { finalization?: unknown }).finalization,
+      );
+    } catch (error) {
+      await escalateRun(run, "verifying", `${String(error)}${completion.evidence.length ? `; executor evidence: ${completion.evidence.join("; ").slice(0, 1500)}` : ""}`, {
+        workgraph_finalization_status: "failure",
+      });
+      return false;
+    }
+    await recordLeaseEvent(
+      run.cwd,
+      "finalization-completed",
+      run.issue.id,
+      {
+        workflowRunId: run.workflowRunId,
+        executionId: completion.executionId,
+        outcome: completion.outcome,
+        result: receipt,
+        provenance: completion.provenance,
+      },
+      run.actor.bdActor,
+    );
+    const succeeded =
+      completion.outcome === "success" && receipt.outcome === "success";
+    const fields = {
+      workgraph_finalization_status: succeeded ? "success" : "blocked",
+      workgraph_finalization_result: JSON.stringify(receipt),
+    };
+    if (!succeeded) {
+      await escalateRun(run, "verifying", receipt.summary, fields);
+      return false;
+    }
+    await setMetadata(run.cwd, run.issue.id, fields, run.actor.bdActor);
+    return true;
+  }
+
   /** Error-isolated wrapper: a judgment failure never unwinds the bus. */
   async function judge(
     run: CoordinatorRun,
@@ -1566,6 +1838,11 @@ export function registerCoordinator(
   ): Promise<void> {
     const box = state.inboxes.get(run.workflowRunId);
     if (!box) return;
+
+    if (implementation.executionError) {
+      await escalateRun(run, "judging", completionFailure("implementer", implementation));
+      return;
+    }
 
     // The implementation result currently under judgment; a completed
     // revision replaces it (fresh artifacts + provenance).
@@ -1620,6 +1897,7 @@ export function registerCoordinator(
       }
 
       // ---- request the review ----
+      if (box.closed) return;
       const attempt = attemptOf(issue) ?? 1;
       const reviewRequest: RunRequestT & { artifacts: string[] } = {
         ...newEnvelope(nowFn),
@@ -1640,19 +1918,44 @@ export function registerCoordinator(
         leaseEpoch: run.lease.epoch,
         role: "reviewer",
         attempt,
-        workspace: { baseRevision: "", requiresIsolation: false },
+        workspace: {
+          repoPath: run.cwd,
+          baseRevision: "",
+          requiresIsolation: false,
+        },
         // The required structured-verdict output schema (a TypeBox schema
         // IS a JSON schema object).
         outputSchema: Verdict,
         // v1-tolerated extra field: the artifacts under review (non-strict
         // schemas carry fields this version's envelope does not name).
         artifacts: [...author.artifacts],
+        ...(run.plan !== undefined ? { plan: run.plan } : {}),
       };
+      run.executorId = reviewer.executorId;
+      run.executionId = undefined;
+      run.isolation = reviewer.isolation;
+      run.supportsCancellation = reviewer.supportsCancellation;
+      run.reviewInFlight = true;
       const result = await requestRun(pi.events, reviewRequest, {
         timeoutMs: config.acceptTimeoutMs,
         onInvalid,
       });
+      if (result.kind === "accepted") run.executionId = result.message.executionId;
+      if (box.closed) {
+        publishCancel(run, "coordinator stopped during review acceptance");
+        return;
+      }
       if (result.kind !== "accepted") {
+        if (result.kind === "timeout") {
+          const stopped = run.supportsCancellation &&
+            await cancelAndAwaitAck(run, config.acceptTimeoutMs);
+          if (!stopped) {
+            untrackLease(run.cwd, run.lease.issueId);
+            dropJudgedRun(run);
+            return;
+          }
+        }
+        run.reviewInFlight = false;
         excluded.add(reviewer.executorId);
         await recordLeaseEvent(
           run.cwd,
@@ -1673,10 +1976,16 @@ export function registerCoordinator(
 
       const completion = await awaitCompletion(box, result.message.executionId);
       if (!completion) return; // teardown
+      run.reviewInFlight = false;
       if (!(await fencedForJudgment(run, completion))) {
         // Our lease is gone — the whole run is stale; drop it.
         untrackLease(run.cwd, run.lease.issueId);
         dropJudgedRun(run);
+        return;
+      }
+
+      if (completion.outcome !== "success" || completion.executionError) {
+        await escalateRun(run, "judging", completionFailure("reviewer", completion));
         return;
       }
 
@@ -1698,6 +2007,7 @@ export function registerCoordinator(
             executionId: completion.executionId,
             executorId: reviewer.executorId,
             detail,
+            evidence: completion.evidence,
             retry: reviewRetries,
           },
           run.actor.bdActor,
@@ -1706,7 +2016,7 @@ export function registerCoordinator(
           await escalateRun(
             run,
             "judging",
-            `review retries exhausted (${MAX_REVIEW_RETRIES}) without a parseable verdict`,
+            `review retries exhausted (${MAX_REVIEW_RETRIES}) without a parseable verdict: ${detail}${completion.evidence.length ? `; executor evidence: ${completion.evidence.join("; ").slice(0, 1500)}` : ""}`,
           );
           return;
         }
@@ -1857,9 +2167,7 @@ export function registerCoordinator(
           actor: run.actor.bdActor,
           summary,
         });
-        // Verification runs the policy's required verifier commands; the
-        // trimmed knob set names none (a knob with one exercised value is
-        // a constant — decision log), so verification is a pass-through.
+        if (!(await finalize(run, author))) return;
         await transition(run.cwd, run.lease.issueId, "verifying", "accepted", {
           actor: run.actor.bdActor,
         });
@@ -2058,7 +2366,8 @@ export function registerCoordinator(
             )
           : undefined;
         // A pin overrides registry filters, so re-check the required role.
-        if (selected && !selected.roles.includes("planner")) selected = undefined;
+        if (selected && !selected.roles.includes("planner"))
+          selected = undefined;
         if (!selected) {
           logSkipOnce("planned work requires an eligible planner — no claim");
           return;
@@ -2096,7 +2405,10 @@ export function registerCoordinator(
     // attempts would read as a same-holder renewal (no epoch bump) and
     // silently skip re-fencing.
     const workflowRunId = ids.newWorkflowRun().id;
-    const actor: LeaseActor = { holder: workflowRunId, bdActor: ids.initiator().id };
+    const actor: LeaseActor = {
+      holder: workflowRunId,
+      bdActor: ids.initiator().id,
+    };
 
     // Claim BY ID (bd's equally-atomic `update --claim`): `ready --claim`
     // is metadata-blind and cannot honor the approved-only filter. A
@@ -2209,7 +2521,11 @@ export function registerCoordinator(
       leaseEpoch: run.lease.epoch,
       role,
       attempt: 1,
-      workspace: { baseRevision: "", requiresIsolation: false },
+      workspace: {
+        repoPath: run.cwd,
+        baseRevision: "",
+        requiresIsolation: false,
+      },
       ...(role === "planner" ? { outputSchema: Plan } : {}),
     };
 
@@ -2384,10 +2700,11 @@ export function registerCoordinator(
       // judgment runs have no live sub-execution to cancel; in-session
       // executions die with this session by definition.
       const inFlight =
-        run.executionId !== undefined &&
+        (run.executionId !== undefined || run.finalizationInFlight === true || run.reviewInFlight === true) &&
         run.isolation !== "none" &&
         ((run === active && run.phase === "accepted") ||
-          (run.phase === "revising" && run.revisionInFlight === true));
+          (run.phase === "revising" && run.revisionInFlight === true) ||
+          run.finalizationInFlight === true || run.reviewInFlight === true);
       if (inFlight) {
         const acked = run.supportsCancellation
           ? await cancelAndAwaitAck(run, config.acceptTimeoutMs)
@@ -2483,7 +2800,11 @@ export function registerCoordinator(
       }
       const config = deps.getConfig();
       const nowMs = nowFn();
-      const issues = await listRunHeldInProgress(ctx.cwd, nowMs, config.leaseTtlMs);
+      const issues = await listRunHeldInProgress(
+        ctx.cwd,
+        nowMs,
+        config.leaseTtlMs,
+      );
       const { expired, live } = partitionByExpiry(issues, nowMs);
 
       // Already-expired leases: reclaim under a NEW epoch before any
@@ -2583,7 +2904,8 @@ export function registerCoordinator(
         const phase = phaseOf(cur);
         const executorId = executorIdOf(cur);
         const executionId = activeExecutionIdOf(cur);
-        const offer = executorId !== undefined ? offersById.get(executorId) : undefined;
+        const offer =
+          executorId !== undefined ? offersById.get(executorId) : undefined;
         const makeRun = (
           runPhase: CoordinatorRun["phase"],
           runRole: CoordinatorRun["role"] = "implementer",
@@ -2639,7 +2961,8 @@ export function registerCoordinator(
               issue.id,
               {
                 workflowRunId,
-                reason: "no recorded execution (crash between claim and accept)",
+                reason:
+                  "no recorded execution (crash between claim and accept)",
               },
               actor.bdActor,
             );
@@ -2751,6 +3074,11 @@ export function registerCoordinator(
           if (phase === "revising" && run.executionId !== undefined) {
             run.revisionInFlight = true;
           }
+          if (
+            phase === "verifying" &&
+            cur.metadata?.workgraph_finalization_status === "running"
+          )
+            run.finalizationInFlight = true;
           trackLease(ctx.cwd, lease, actor);
           state.judged.push(run);
           state.inboxes.set(workflowRunId, {
@@ -2812,7 +3140,8 @@ export function registerCoordinator(
     beat,
     reconcile,
     teardown,
-    current: () => state.active ?? state.judged[state.judged.length - 1] ?? null,
+    current: () =>
+      state.active ?? state.judged[state.judged.length - 1] ?? null,
     timersActive: () => ({
       poll: state.timer !== null,
       heartbeat: state.hb !== null,

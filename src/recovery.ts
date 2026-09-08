@@ -282,6 +282,9 @@ export async function reconstructAuthorCompletion(
       outcome: outcome as RunOutcomeT,
       artifacts: stringArray(details.artifacts),
       evidence: stringArray(details.evidence),
+      ...(typeof details.executionError === "string"
+        ? { executionError: details.executionError }
+        : {}),
       provenance,
     };
   }

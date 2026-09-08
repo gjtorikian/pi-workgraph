@@ -90,6 +90,8 @@ export function buildInSessionPrompt(request: RunRequestT): string {
   if (request.issue.description) {
     lines.push("", request.issue.description);
   }
+  if (request.plan)
+    lines.push("", "Accepted implementation plan:", request.plan);
   lines.push(
     "",
     `You are executing workflow run ${request.workflowRunId} (lease epoch ${request.leaseEpoch}); the lease is heartbeated automatically while you work.`,

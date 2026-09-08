@@ -10,7 +10,12 @@ import type { WorkflowClassT } from "./types.ts";
 
 export type SubagentsRoleRoutes = Partial<
   Record<
-    "planner" | "implementer" | "reviewer" | "revision" | "verifier",
+    | "planner"
+    | "implementer"
+    | "reviewer"
+    | "revision"
+    | "verifier"
+    | "finalizer",
     string
   >
 >;
@@ -36,9 +41,22 @@ export interface SubagentsExecutorConfig {
   versionRange?: string;
   /** Optional workflow-class + role overrides for named subagent profiles. */
   routes?: SubagentsWorkflowRoutes;
+  /** Optional per-role launch settings; names and model identifiers are opaque. */
+  options?: Partial<
+    Record<
+      keyof SubagentsRoleRoutes,
+      {
+        model?: string;
+        thinking?: string;
+        skills?: string[];
+      }
+    >
+  >;
 }
 
 export interface WorkgraphConfig {
+  /** Optional caller-defined work after verification and before closure. */
+  finalization?: { instructions: string; timeoutMs?: number };
   /** Lease time-to-live in milliseconds (default 5 min). */
   leaseTtlMs: number;
   /** Heartbeat interval in milliseconds (default 60 s). */
@@ -152,6 +170,11 @@ const FLAGS = [
     description:
       'Opt-in: register the experimental pi-subagents bridge — "true" or JSON with versionRange/routes (default disabled; env WORKGRAPH_SUBAGENTS_EXECUTOR)',
   },
+  {
+    name: "workgraph-finalization",
+    description:
+      "Optional post-verification task as JSON with instructions and timeoutMs (env WORKGRAPH_FINALIZATION)",
+  },
 ] as const;
 
 /**
@@ -160,7 +183,10 @@ const FLAGS = [
  */
 export function registerConfigFlags(pi: ExtensionAPI): void {
   for (const flag of FLAGS) {
-    pi.registerFlag(flag.name, { description: flag.description, type: "string" });
+    pi.registerFlag(flag.name, {
+      description: flag.description,
+      type: "string",
+    });
   }
 }
 
@@ -196,7 +222,11 @@ function policyValue(
   if (raw === undefined) return undefined;
   try {
     const parsed: unknown = JSON.parse(raw);
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    if (
+      parsed === null ||
+      typeof parsed !== "object" ||
+      Array.isArray(parsed)
+    ) {
       return undefined;
     }
     // Structural trust boundary ends here: resolvePolicy merges per-knob
@@ -223,17 +253,23 @@ function subagentsValue(
   if (["false", "0", "no", "off"].includes(lowered)) return undefined;
   try {
     const parsed: unknown = JSON.parse(raw);
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    if (
+      parsed === null ||
+      typeof parsed !== "object" ||
+      Array.isArray(parsed)
+    ) {
       return undefined;
     }
     const record = parsed as Record<string, unknown>;
     const routes = parseSubagentsRoutes(record.routes);
+    const options = parseSubagentsOptions(record.options);
     return {
       enabled: record.enabled === true,
       ...(typeof record.versionRange === "string" && record.versionRange
         ? { versionRange: record.versionRange }
         : {}),
       ...(routes !== undefined ? { routes } : {}),
+      ...(options !== undefined ? { options } : {}),
     };
   } catch {
     console.error(
@@ -249,17 +285,14 @@ function parseSubagentsRoutes(
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
     return undefined;
   }
-  const workflowClasses: WorkflowClassT[] = [
-    "oneshot",
-    "reviewed",
-    "planned",
-  ];
+  const workflowClasses: WorkflowClassT[] = ["oneshot", "reviewed", "planned"];
   const roles: (keyof SubagentsRoleRoutes)[] = [
     "planner",
     "implementer",
     "reviewer",
     "revision",
     "verifier",
+    "finalizer",
   ];
   const input = raw as Record<string, unknown>;
   const routes: SubagentsWorkflowRoutes = {};
@@ -283,6 +316,73 @@ function parseSubagentsRoutes(
     if (Object.keys(roleRoutes).length > 0) routes[workflowClass] = roleRoutes;
   }
   return Object.keys(routes).length > 0 ? routes : undefined;
+}
+
+function parseSubagentsOptions(
+  raw: unknown,
+): SubagentsExecutorConfig["options"] {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const options: NonNullable<SubagentsExecutorConfig["options"]> = {};
+  for (const role of [
+    "planner",
+    "implementer",
+    "reviewer",
+    "revision",
+    "verifier",
+    "finalizer",
+  ] as const) {
+    const input = (raw as Record<string, unknown>)[role];
+    if (!input || typeof input !== "object" || Array.isArray(input)) continue;
+    const value = input as Record<string, unknown>;
+    options[role] = {
+      ...(typeof value.model === "string" && value.model.trim()
+        ? { model: value.model.trim() }
+        : {}),
+      ...(typeof value.thinking === "string" && value.thinking.trim()
+        ? { thinking: value.thinking.trim() }
+        : {}),
+      ...(Array.isArray(value.skills)
+        ? {
+            skills: value.skills
+              .filter(
+                (v): v is string =>
+                  typeof v === "string" && v.trim().length > 0,
+              )
+              .map((v) => v.trim()),
+          }
+        : {}),
+    };
+  }
+  return Object.keys(options).length ? options : undefined;
+}
+
+function finalizationValue(pi: ExtensionAPI): WorkgraphConfig["finalization"] {
+  const raw = stringValue(
+    pi,
+    "workgraph-finalization",
+    "WORKGRAPH_FINALIZATION",
+  );
+  if (!raw || raw === "false") return undefined;
+  const value: unknown = JSON.parse(raw);
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error("workgraph-finalization must contain instructions");
+  const input = value as Record<string, unknown>;
+  if (typeof input.instructions !== "string" || !input.instructions.trim())
+    throw new Error("workgraph-finalization requires nonempty instructions");
+  if (
+    input.timeoutMs !== undefined &&
+    (typeof input.timeoutMs !== "number" ||
+      !Number.isFinite(input.timeoutMs) ||
+      input.timeoutMs <= 0 ||
+      input.timeoutMs > 2_147_483_647)
+  )
+    throw new Error("workgraph-finalization timeoutMs must be positive");
+  return {
+    instructions: input.instructions,
+    ...(typeof input.timeoutMs === "number"
+      ? { timeoutMs: input.timeoutMs }
+      : {}),
+  };
 }
 
 function boolValue(
@@ -313,6 +413,7 @@ export function resolveConfig(pi: ExtensionAPI): WorkgraphConfig {
     DEFAULT_POLL_MS,
   );
   return {
+    finalization: finalizationValue(pi),
     leaseTtlMs: timerValue(
       pi,
       "workgraph-lease-ttl-ms",
@@ -352,8 +453,16 @@ export function resolveConfig(pi: ExtensionAPI): WorkgraphConfig {
       "WORKGRAPH_COMPAT_IN_SESSION_EXECUTOR",
       true,
     ),
-    executorId: stringValue(pi, "workgraph-executor-id", "WORKGRAPH_EXECUTOR_ID"),
-    workerIdOverride: stringValue(pi, "workgraph-worker-id", "WORKGRAPH_WORKER_ID"),
+    executorId: stringValue(
+      pi,
+      "workgraph-executor-id",
+      "WORKGRAPH_EXECUTOR_ID",
+    ),
+    workerIdOverride: stringValue(
+      pi,
+      "workgraph-worker-id",
+      "WORKGRAPH_WORKER_ID",
+    ),
     policy: policyValue(pi, "workgraph-policy", "WORKGRAPH_POLICY"),
     compatLegacyIssues: boolValue(
       pi,

@@ -45,12 +45,15 @@ export type FakeBehavior =
 export interface RoleScript {
   behavior?: FakeBehavior;
   outcome?: RunOutcomeT;
+  executionError?: string;
+  evidence?: string[];
   /** Attached verbatim as the completion's extra `verdict` field (phase-3
    *  verdict transport: non-strict schemas tolerate it). */
   verdict?: unknown;
   /** Attached verbatim as the completion's extra `plan` field (the planner
    *  tier uses the same non-strict transport as the verdict). */
   plan?: unknown;
+  finalization?: unknown;
   provenance?: RunCompletedT["provenance"];
   artifacts?: string[];
   rejectReason?: string;
@@ -108,6 +111,7 @@ export interface CompleteOverrides {
   outcome?: RunOutcomeT;
   verdict?: unknown;
   plan?: unknown;
+  finalization?: unknown;
   provenance?: RunCompletedT["provenance"];
   artifacts?: string[];
 }
@@ -167,6 +171,7 @@ export function installFakeExecutor(
   ): RunCompletedT {
     const verdict = overrides.verdict ?? script.verdict;
     const plan = overrides.plan ?? script.plan;
+    const finalization = overrides.finalization ?? script.finalization;
     return {
       ...newEnvelope(),
       workflowRunId: request.workflowRunId,
@@ -175,14 +180,15 @@ export function installFakeExecutor(
       leaseEpoch: overrides.leaseEpoch ?? request.leaseEpoch,
       outcome: overrides.outcome ?? script.outcome ?? opts.outcome ?? "success",
       artifacts: overrides.artifacts ?? script.artifacts ?? [],
-      evidence: [`fake executor ${executorId} completed ${request.issue.id}`],
-      provenance:
-        overrides.provenance ??
+      evidence: script.evidence ?? [`fake executor ${executorId} completed ${request.issue.id}`],
+      ...(script.executionError ? { executionError: script.executionError } : {}),
+      provenance: overrides.provenance ??
         script.provenance ??
         opts.provenance ?? { harness: "fake" },
       // Extra v1-tolerated fields — the verdict and plan transports.
       ...(verdict !== undefined ? { verdict } : {}),
       ...(plan !== undefined ? { plan } : {}),
+      ...(finalization !== undefined ? { finalization } : {}),
     } as RunCompletedT;
   }
 

@@ -23,6 +23,7 @@ import {
   overwriteAssigneeForReclaim,
   setMetadata,
   show,
+  update,
 } from "./bd.ts";
 import type { WorkgraphConfig } from "./config.ts";
 import { defaultLeaseActor, workerId } from "./identity.ts";
@@ -224,6 +225,10 @@ export async function reclaimAndLeaveReady(
   const executionId = activeExecutionIdOf(issue);
   const phase = phaseOf(issue);
   const v1 = isLifecycleV1(issue);
+  // Finalization can have external effects that survive a crashed executor.
+  // Reclaim its lease, but require operator recovery before any new workflow.
+  const interruptedFinalization =
+    phase === "verifying" && !!issue.metadata?.workgraph_finalization_status;
 
   const lease = await reclaim(cwd, issue, opts);
   if (!lease) return false; // lost the reclaim race — exactly one winner
@@ -259,6 +264,10 @@ export async function reclaimAndLeaveReady(
   // Redispatchability reset — one write, phase + execution-id together.
   const kv: Record<string, string> = {};
   if (v1 && isActivePhase(phase)) kv[WORKGRAPH_PHASE_KEY] = "ready";
+  if (interruptedFinalization) {
+    kv[WORKGRAPH_PHASE_KEY] = "escalated";
+    kv.workgraph_finalization_status = "blocked";
+  }
   if (executionId !== undefined) kv[WORKGRAPH_ACTIVE_EXECUTION_ID_KEY] = "";
   if (Object.keys(kv).length > 0) {
     await setMetadata(cwd, issue.id, kv, actor);
@@ -269,6 +278,13 @@ export async function reclaimAndLeaveReady(
   // session's held-lease registry.
   try {
     await releaseLease(cwd, lease, { holder: workerId(), bdActor: actor });
+    if (interruptedFinalization) {
+      await update(cwd, issue.id, { status: "blocked" }, actor);
+      await recordLeaseEvent(cwd, "escalated", issue.id, {
+        workflowRunId,
+        reason: "finalization was interrupted; inspect its effects before reapproving",
+      }, actor);
+    }
   } catch (e) {
     untrackLease(cwd, issue.id);
     if (!(e instanceof FencingError)) throw e;
