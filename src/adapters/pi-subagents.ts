@@ -235,6 +235,9 @@ interface UpstreamResponse {
 
 /** The slices of upstream's SingleResult the bridge reads (types.ts:388-422). */
 interface UpstreamSingleResult {
+  exitCode?: unknown;
+  interrupted?: unknown;
+  detached?: unknown;
   model?: unknown;
   structuredOutput?: unknown;
   finalOutput?: unknown;
@@ -384,9 +387,26 @@ export function registerPiSubagentsExecutor(
   /** Build the fenced `run:completed` from an upstream response. */
   function emitCompleted(run: BridgedRun, payload: UpstreamResponse): void {
     const first = firstResult(payload.result);
-    const outcome: RunOutcomeT = payload.isError === true ? "failure" : "success";
+    const outcome: RunOutcomeT =
+      payload.isError !== true &&
+      first?.exitCode === 0 &&
+      first.interrupted !== true &&
+      first.detached !== true &&
+      !first.error
+        ? "success"
+        : "failure";
     const evidence: string[] = [];
-    if (typeof first?.finalOutput === "string" && first.finalOutput.length > 0) {
+    if (!first) evidence.push("upstream returned no completed child result");
+    else if (outcome !== "success") {
+      evidence.push(
+        `upstream child did not complete successfully (exitCode: ${String(first.exitCode)})`,
+      );
+      if (typeof first.error === "string") evidence.push(first.error);
+    }
+    if (
+      typeof first?.finalOutput === "string" &&
+      first.finalOutput.length > 0
+    ) {
       const text = first.finalOutput;
       evidence.push(text.length > 500 ? `${text.slice(0, 500)}…` : text);
     }
@@ -411,9 +431,13 @@ export function registerPiSubagentsExecutor(
         if (typeof value === "string" && value.length > 0) artifacts.push(value);
       }
     }
-    // REPORTED provenance: results[0].model verbatim (never the request's),
+    // REPORTED provenance: the effective model, without Pi's thinking suffix.
+    // A thinking-level change does not make the same model independent.
     // provider split only from the unambiguous "provider/id" shape.
-    const model = typeof first?.model === "string" ? first.model : undefined;
+    const model =
+      typeof first?.model === "string"
+        ? first.model.replace(/:(off|minimal|low|medium|high|xhigh|max)$/, "")
+        : undefined;
     const provider = model !== undefined ? splitProvider(model) : undefined;
     // The verdict rides ONLY a reviewer run's structured output (non-strict
     // schemas tolerate the extra field — the phase-3 transport). Missing or
@@ -538,6 +562,10 @@ export function registerPiSubagentsExecutor(
           agent,
           task: buildSubagentTask(msg as RunRequestT & { artifacts?: string[] }),
           worktree: mapping.worktree,
+          // The slash response must contain the finished child result. Pi's
+          // default background mode returns a launch receipt immediately.
+          async: false,
+          foregroundOnly: true,
           context: "fresh",
           ...(msg.outputSchema !== undefined
             ? { outputSchema: msg.outputSchema }
@@ -609,6 +637,22 @@ export function registerPiSubagentsExecutor(
       if (typeof payload.requestId !== "string") return;
       const run = runs.get(payload.requestId);
       if (!run) return; // not one of ours (or already finished) — silence
+      const details = (
+        payload.result as
+          { details?: { asyncId?: unknown; results?: unknown[] } } | undefined
+      )?.details;
+      if (
+        payload.isError !== true &&
+        typeof details?.asyncId === "string" &&
+        details.results?.length === 0
+      ) {
+        // Unexpected background handoff is nonterminal. Keep ownership until
+        // a terminal response or an acknowledged cancellation, never judge it.
+        warnOnce(
+          "[pi-workgraph] upstream returned a background launch receipt despite foregroundOnly; run remains pending",
+        );
+        return;
+      }
       runs.delete(run.requestId);
 
       if (payload.result === null || typeof payload.result !== "object") {

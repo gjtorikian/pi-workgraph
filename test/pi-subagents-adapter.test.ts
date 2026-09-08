@@ -861,3 +861,95 @@ describe("activity payload validates against the Activity schema", () => {
     ).toThrow(/activity/);
   });
 });
+
+it("does not treat a thinking suffix as a different model", async () => {
+  const { mock, bridge } = makeBridgeHarness();
+  const upstream = installFakeSubagents(mock.events, {
+    script: { model: "provider/model:high" },
+  });
+  try {
+    mock.events.emit(CH.runRequest, makeRunRequest());
+    await mock.flushEvents();
+    expect(busOn(mock, CH.runCompleted)[0]).toHaveProperty(
+      "provenance.model",
+      "provider/model",
+    );
+  } finally {
+    upstream.uninstall();
+    bridge.teardown();
+  }
+});
+
+it("waits for the child even when Pi defaults to and forces background execution", () => {
+  const { mock, bridge } = makeBridgeHarness();
+  const fake = installFakeSubagents(mock.events, {
+    asyncByDefault: true,
+    forceTopLevelAsync: true,
+    script: { mode: "stall", model: "provider/implementation" },
+  });
+  try {
+    mock.events.emit(CH.runRequest, makeRunRequest());
+    expect(fake.requests[0]?.params).toMatchObject({
+      async: false,
+      foregroundOnly: true,
+    });
+    expect(busOn(mock, CH.runAccepted)).toHaveLength(1);
+    expect(busOn(mock, CH.runCompleted)).toHaveLength(0);
+    expect(bridge.activeRunCount()).toBe(1);
+    fake.respond();
+    expect(busOn(mock, CH.runCompleted)).toHaveLength(1);
+    expect(busOn(mock, CH.runCompleted)[0]).toHaveProperty(
+      "outcome",
+      "success",
+    );
+  } finally {
+    fake.uninstall();
+    bridge.teardown();
+  }
+});
+
+it("never treats a background launch receipt as a completed implementation", () => {
+  const { mock, bridge } = makeBridgeHarness();
+  const fake = installFakeSubagents(mock.events, { script: { mode: "stall" } });
+  try {
+    mock.events.emit(CH.runRequest, makeRunRequest());
+    fake.emitRawResponse({
+      requestId: fake.requests[0]!.requestId,
+      isError: false,
+      result: {
+        content: [{ type: "text", text: "Background subagent started" }],
+        details: {
+          mode: "single",
+          results: [],
+          asyncId: "background-id",
+          asyncDir: "/tmp/background-id",
+        },
+      },
+    });
+    expect(busOn(mock, CH.runCompleted)).toHaveLength(0);
+    expect(bridge.activeRunCount()).toBe(1);
+    fake.respond();
+    expect(busOn(mock, CH.runCompleted)).toHaveLength(1);
+  } finally {
+    fake.uninstall();
+    bridge.teardown();
+  }
+});
+
+it.each([{ exitCode: 1 }, { exitCode: 0, interrupted: true }])(
+  "checks child terminal status even when the outer response has no error (%j)",
+  (script) => {
+    const { mock, bridge } = makeBridgeHarness();
+    const fake = installFakeSubagents(mock.events, { script });
+    try {
+      mock.events.emit(CH.runRequest, makeRunRequest());
+      expect(busOn(mock, CH.runCompleted)[0]).toHaveProperty(
+        "outcome",
+        "failure",
+      );
+    } finally {
+      fake.uninstall();
+      bridge.teardown();
+    }
+  },
+);

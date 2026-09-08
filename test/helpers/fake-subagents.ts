@@ -43,6 +43,9 @@ export interface FakeSubagentsBehavior {
   finalOutput?: string;
   isError?: boolean;
   errorText?: string;
+  exitCode?: number;
+  interrupted?: boolean;
+  detached?: boolean;
   /** `subagent:slash:update` payloads emitted before the response. */
   updates?: Array<{ currentTool?: string; toolCount?: number }>;
   /** Extra artifact paths reported on `results[0].artifactPaths`. */
@@ -71,6 +74,9 @@ export interface FakeSubagentsHandle {
 }
 
 export interface FakeSubagentsOptions {
+  /** Mirror modern Pi defaults and its optional forced-background policy. */
+  asyncByDefault?: boolean;
+  forceTopLevelAsync?: boolean;
   /** Behavior script, consumed per request (last repeats). */
   script?: FakeSubagentsBehavior | FakeSubagentsBehavior[];
 }
@@ -79,7 +85,9 @@ function buildResult(behavior: FakeSubagentsBehavior): Record<string, unknown> {
   const single: Record<string, unknown> = {
     agent: "fake-agent",
     task: "fake-task",
-    exitCode: behavior.isError ? 1 : 0,
+    exitCode: behavior.exitCode ?? (behavior.isError ? 1 : 0),
+    interrupted: behavior.interrupted,
+    detached: behavior.detached,
     usage: {},
     ...(behavior.model !== undefined ? { model: behavior.model } : {}),
     ...(behavior.structuredOutput !== undefined
@@ -143,12 +151,34 @@ export function installFakeSubagents(
       if (typeof payload.requestId !== "string") return;
       if (payload.params === null || typeof payload.params !== "object") return;
       const requestId = payload.requestId;
+      const params = payload.params as Record<string, unknown>;
       requests.push({
         requestId,
         params: payload.params as Record<string, unknown>,
       });
 
       const behavior = nextBehavior();
+      const async =
+        opts.forceTopLevelAsync && params.foregroundOnly !== true
+          ? true
+          : (params.async ?? opts.asyncByDefault ?? true);
+      if (async) {
+        events.emit(UPSTREAM_EVENTS.started, { requestId });
+        events.emit(UPSTREAM_EVENTS.response, {
+          requestId,
+          isError: false,
+          result: {
+            content: [{ type: "text", text: "Background subagent started" }],
+            details: {
+              mode: "single",
+              results: [],
+              asyncId: "background-id",
+              asyncDir: "/tmp/background-id",
+            },
+          },
+        });
+        return;
+      }
       const mode = behavior.mode ?? "respond";
       if (mode === "silent") return;
       if (mode === "no-context") {
