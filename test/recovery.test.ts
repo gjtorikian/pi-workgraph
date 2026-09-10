@@ -1032,6 +1032,55 @@ describe("graceful shutdown", () => {
     }
   }, 30_000);
 
+  it.each(["ack", "ignore"] as const)(
+    "shutdown cancels a running or queued review before releasing (%s)",
+    async (cancel) => {
+      resetLeasesForTest();
+      const graph = makeScratchGraph({ prefix: "rcvshreview", seed: 1 });
+      const id = graph.seededIds[0]!;
+      const { mock, coordinator } = makeHarness();
+      const fake = installFakeExecutor(mock.events, {
+        roles: ["implementer", "reviewer"],
+        supportsCancellation: true,
+        cancel,
+        roleScripts: {
+          implementer: { provenance: IMPL_PROV },
+          reviewer: { behavior: "accept-stall", provenance: REV_PROV },
+        },
+      });
+      const ectx = makeEventContext(graph.dir);
+      try {
+        await settle(mock, ectx.ctx);
+        await until(
+          () =>
+            coordinator.current()?.reviewInFlight === true &&
+            coordinator.current()?.executionId !== undefined,
+          45_000,
+        );
+        const reviewId = coordinator.current()!.executionId!;
+        expect(reviewId).not.toBe(fake.completions[0]!.executionId);
+        await coordinator.teardown(ectx.ctx);
+        await mock.flushEvents();
+        expect(busOn(mock, CH.runCancel)).toEqual([
+          expect.objectContaining({ executionId: reviewId }),
+        ]);
+        if (cancel === "ack")
+          expect(leaseHolderOf(graph.showIssue(id))).toBeUndefined();
+        else {
+          expect(leaseHolderOf(graph.showIssue(id))).toBeDefined();
+          expect(
+            await auditCount(graph.dir, id, "abandoned-unacked-cancel"),
+          ).toBe(1);
+        }
+      } finally {
+        fake.uninstall();
+        await coordinator.teardown(ectx.ctx);
+        graph.cleanup();
+      }
+    },
+    60_000,
+  );
+
   it("shutdown mid-revision cancels the LIVE revision execution; unacked → abandoned, lease intact", async () => {
     resetLeasesForTest();
     const graph = makeScratchGraph({ prefix: "rcvshrev", seed: 1 });

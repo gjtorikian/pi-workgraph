@@ -180,8 +180,12 @@ export function installFakeExecutor(
       leaseEpoch: overrides.leaseEpoch ?? request.leaseEpoch,
       outcome: overrides.outcome ?? script.outcome ?? opts.outcome ?? "success",
       artifacts: overrides.artifacts ?? script.artifacts ?? [],
-      evidence: script.evidence ?? [`fake executor ${executorId} completed ${request.issue.id}`],
-      ...(script.executionError ? { executionError: script.executionError } : {}),
+      evidence: script.evidence ?? [
+        `fake executor ${executorId} completed ${request.issue.id}`,
+      ],
+      ...(script.executionError
+        ? { executionError: script.executionError }
+        : {}),
       provenance: overrides.provenance ??
         script.provenance ??
         opts.provenance ?? { harness: "fake" },

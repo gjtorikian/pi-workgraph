@@ -225,7 +225,8 @@ export function installFakeSubagents(
         events.emit(UPSTREAM_EVENTS.response, {
           requestId,
           isError: true,
-          errorText: "Rejected: a subagent call is already in progress. Issue exactly ONE subagent call per turn.",
+          errorText:
+            "Rejected: a subagent call is already in progress. Issue exactly ONE subagent call per turn.",
           result: { details: { mode: "single", results: [] } },
         });
         return;

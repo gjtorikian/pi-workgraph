@@ -277,6 +277,13 @@ describe("planner round-trip", () => {
       expect(params.context).toBe("fresh");
       expect(params.outputSchema).toEqual(schema);
       expect(String(params.task)).toContain("Do not modify product code");
+      expect(String(params.task)).toContain(
+        "calling the structured_output tool",
+      );
+      expect(String(params.task)).toContain("{ value: <your result> }");
+      expect(String(params.task)).toContain(
+        "takes precedence over the agent profile's default output format",
+      );
 
       const completions = busOn(mock, CH.runCompleted) as Array<
         RunCompletedT & { plan?: unknown }
@@ -732,6 +739,156 @@ describe("progress forwarding and addressing", () => {
 // two executors on one bus: selection determinism
 // ---------------------------------------------------------------------------
 
+describe("serial foreground execution", () => {
+  it("accepts queued roles promptly and launches them in order without overlapping", async () => {
+    const { mock, bridge } = makeBridgeHarness();
+    const fake = installFakeSubagents(mock.events, {
+      singleForeground: true,
+      script: { mode: "stall", structuredOutput: { findings: [] } },
+    });
+    try {
+      for (const role of ["implementer", "reviewer", "revision"] as const) {
+        mock.events.emit(
+          CH.runRequest,
+          makeRunRequest({ role, workflowRunId: `workgraph-run/${role}` }),
+        );
+      }
+      expect(fake.requests).toHaveLength(1);
+      expect(busOn(mock, CH.runAccepted)).toHaveLength(3);
+      expect(busOn(mock, CH.runCompleted)).toHaveLength(0);
+      for (let i = 0; i < 3; i++) {
+        fake.respond();
+        await Promise.resolve();
+        expect(fake.requests).toHaveLength(Math.min(i + 2, 3));
+      }
+      expect(fake.requests.map((r) => r.params.agent)).toEqual([
+        "worker",
+        "reviewer",
+        "worker",
+      ]);
+      expect(busOn(mock, CH.runAccepted)).toHaveLength(3);
+      expect(
+        busOn(mock, CH.runCompleted).map((c) => (c as RunCompletedT).outcome),
+      ).toEqual(["success", "success", "success"]);
+      expect(busOn(mock, CH.runRejected)).toHaveLength(0);
+      expect(bridge.activeRunCount()).toBe(0);
+    } finally {
+      fake.uninstall();
+      bridge.teardown();
+    }
+  });
+
+  it("cancels a queued execution without launching it or forwarding an unknown cancel upstream", async () => {
+    const { mock, bridge } = makeBridgeHarness();
+    const fake = installFakeSubagents(mock.events, {
+      singleForeground: true,
+      script: { mode: "stall" },
+    });
+    try {
+      mock.events.emit(CH.runRequest, makeRunRequest());
+      mock.events.emit(
+        CH.runRequest,
+        makeRunRequest({
+          role: "reviewer",
+          workflowRunId: "workgraph-run/queued",
+        }),
+      );
+      const queued = busOn(mock, CH.runAccepted)[1] as { executionId: string };
+      mock.events.emit(CH.runCancel, {
+        ...newEnvelope(),
+        workflowRunId: "workgraph-run/queued",
+        issueId: "wg-7",
+        executionId: queued.executionId,
+      });
+      expect(busOn(mock, CH.runCancelled)).toEqual([
+        expect.objectContaining({ executionId: queued.executionId }),
+      ]);
+      expect(fake.cancels).toHaveLength(0);
+      fake.respond();
+      await Promise.resolve();
+      expect(fake.requests).toHaveLength(1);
+      expect(bridge.activeRunCount()).toBe(0);
+    } finally {
+      fake.uninstall();
+      bridge.teardown();
+    }
+  });
+
+  it("preserves a launch error when upstream reports started before refusing the call", () => {
+    const { mock, bridge } = makeBridgeHarness();
+    const fake = installFakeSubagents(mock.events, {
+      script: { mode: "stall" },
+    });
+    try {
+      mock.events.emit(CH.runRequest, makeRunRequest());
+      fake.emitRawResponse({
+        requestId: fake.requests[0]!.requestId,
+        isError: true,
+        errorText: "Rejected: a subagent call is already in progress.",
+        result: { details: { results: [] } },
+      });
+      expect(busOn(mock, CH.runCompleted)[0]).toMatchObject({
+        outcome: "failure",
+        executionError: "Rejected: a subagent call is already in progress.",
+      });
+    } finally {
+      fake.uninstall();
+      bridge.teardown();
+    }
+  });
+
+  it("preserves a child's missing structured output error instead of only reporting failure", () => {
+    const { mock, bridge } = makeBridgeHarness();
+    const fake = installFakeSubagents(mock.events, {
+      script: { mode: "stall" },
+    });
+    try {
+      mock.events.emit(CH.runRequest, makeRunRequest({ role: "planner" }));
+      const error =
+        "Missing structured_output call; this step has outputSchema and must finish by calling structured_output.";
+      fake.emitRawResponse({
+        requestId: fake.requests[0]!.requestId,
+        result: {
+          details: {
+            results: [
+              { exitCode: 1, error, finalOutput: "# Implementation Plan" },
+            ],
+          },
+        },
+      });
+      expect(busOn(mock, CH.runCompleted)[0]).toMatchObject({
+        outcome: "failure",
+        executionError: error,
+      });
+      expect(busOn(mock, CH.runCompleted)[0]).not.toHaveProperty("plan");
+    } finally {
+      fake.uninstall();
+      bridge.teardown();
+    }
+  });
+
+  it("does not launch queued work after teardown", async () => {
+    const { mock, bridge } = makeBridgeHarness();
+    const fake = installFakeSubagents(mock.events, {
+      script: { mode: "stall" },
+    });
+    try {
+      mock.events.emit(CH.runRequest, makeRunRequest());
+      mock.events.emit(
+        CH.runRequest,
+        makeRunRequest({ workflowRunId: "workgraph-run/queued" }),
+      );
+      fake.respond();
+      bridge.teardown();
+      await Promise.resolve();
+      expect(fake.requests).toHaveLength(1);
+    } finally {
+      fake.uninstall();
+      bridge.teardown();
+    }
+  });
+});
+
 describe("two executors: selection determinism", () => {
   function makeTwoExecutorHarness(): { mock: MockPi; cleanup: () => void } {
     const mock = makeMockPi();
@@ -878,6 +1035,30 @@ describe("activity payload validates against the Activity schema", () => {
 });
 
 describe("configured task context", () => {
+  it("passes Node helper guidance directly to every worker role", () => {
+    for (const role of [
+      "planner",
+      "implementer",
+      "reviewer",
+      "revision",
+      "finalizer",
+    ]) {
+      const task = buildSubagentTask(makeRunRequest({ role }));
+      expect(task).toContain(
+        "use Node.js for ad hoc JSON/JSONL, XML test-report summaries",
+      );
+      expect(task).toContain(
+        "Do not use Python, python3, pyenv, or mise for these helper scripts",
+      );
+      expect(task).toContain(
+        "Continue to use the repository's own build and test commands",
+      );
+      expect(task).toContain(
+        "Run reporting helpers separately from builds/tests",
+      );
+      expect(task).toContain("explicit 60-second bash timeout");
+    }
+  });
   it("passes the accepted plan to each downstream role without assuming a delivery system", () => {
     for (const role of ["implementer", "reviewer", "revision", "finalizer"]) {
       const task = buildSubagentTask(

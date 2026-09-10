@@ -589,6 +589,19 @@ Two semantics worth knowing:
   using_, never the one requested; the provider is split off only when the
   `provider/id` format is unambiguous.
 
+The adapter accepts up to four runs and queues their foreground calls, launching
+one at a time because pi-subagents permits only one foreground call per session.
+Queued executions remain cancellable. Executor launch failures are escalated
+with their original error; a failed review or finalizer does not become a
+generic structured-output parsing error.
+
+Every worker task includes Node.js guidance for ad hoc file processing and test
+report summaries. Reporting helpers run separately from builds/tests and request
+a 60-second shell timeout; repository build/test commands keep their own finite
+timeouts. This guidance is included in the child task itself, including planner,
+reviewer, and finalizer tasks, so it does not depend on inherited coordinator
+prompts. Changes apply to newly launched coordinator sessions.
+
 The bridge uses named upstream profiles and can route them by workflow class
 and role without hard-coding model IDs into the control plane:
 

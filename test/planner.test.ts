@@ -69,8 +69,16 @@ const CONFIG: WorkgraphConfig = {
 };
 
 /** Distinct provenance per tier — independent under every policy. */
-const PLAN_PROV = { harness: "fake", model: "plan-model", provider: "prov-plan" };
-const IMPL_PROV = { harness: "fake", model: "impl-model", provider: "prov-impl" };
+const PLAN_PROV = {
+  harness: "fake",
+  model: "plan-model",
+  provider: "prov-plan",
+};
+const IMPL_PROV = {
+  harness: "fake",
+  model: "impl-model",
+  provider: "prov-impl",
+};
 const REV_PROV = { harness: "fake", model: "rev-model", provider: "prov-rev" };
 
 const CLEAN_VERDICT = { findings: [] };
@@ -78,8 +86,14 @@ const CLEAN_VERDICT = { findings: [] };
 const PLAN: PlanT = {
   summary: "add retry backoff to the client",
   steps: [
-    { description: "add an exponential backoff helper", targets: ["src/retry.ts"] },
-    { description: "call it from the request path", rationale: "one call site" },
+    {
+      description: "add an exponential backoff helper",
+      targets: ["src/retry.ts"],
+    },
+    {
+      description: "call it from the request path",
+      rationale: "one call site",
+    },
   ],
   risks: ["the jitter strategy is unspecified"],
 };
@@ -152,7 +166,8 @@ async function auditCount(
 
 async function planCount(dir: string, id: string): Promise<number> {
   const comments = await listComments(dir, id);
-  return comments.filter((c) => c.text.startsWith("workgraph-plan plan ")).length;
+  return comments.filter((c) => c.text.startsWith("workgraph-plan plan "))
+    .length;
 }
 
 afterEach(() => {
@@ -169,9 +184,9 @@ describe("plan validation and rendering", () => {
     expect(() => parsePlan(undefined)).toThrow(PlanError);
     expect(() => parsePlan({})).toThrow(PlanError);
     expect(() => parsePlan({ steps: "nope" })).toThrow(PlanError);
-    expect(() => parsePlan({ steps: [{ rationale: "no description" }] })).toThrow(
-      PlanError,
-    );
+    expect(() =>
+      parsePlan({ steps: [{ rationale: "no description" }] }),
+    ).toThrow(PlanError);
     // A schema-valid but EMPTY plan is still invalid: an executor that
     // answered the planner role owes a plan, and an empty one is
     // indistinguishable from a planner that did nothing.
@@ -216,9 +231,9 @@ describe("plan validation and rendering", () => {
 
     // A planner's refined criteria are rendered as advisory context, never
     // as a replacement for the approved bar.
-    expect(renderPlan({ ...PLAN, acceptanceCriteria: "must retry twice" })).toContain(
-      "the approved criteria on the issue remain authoritative",
-    );
+    expect(
+      renderPlan({ ...PLAN, acceptanceCriteria: "must retry twice" }),
+    ).toContain("the approved criteria on the issue remain authoritative");
 
     // Over-long plans truncate rather than blow the executor's context.
     const massive: PlanT = {
@@ -491,6 +506,7 @@ describe("coordinator planner tier", () => {
       expect(await auditCount(graph.dir, id, "escalated")).toBe(1);
       expect(await planCount(graph.dir, id)).toBe(0);
       expect(heldLeases(graph.dir)).toHaveLength(0);
+      expect(coordinator.current()).toBeNull();
     } finally {
       fake.uninstall();
       await coordinator.teardown(ectx.ctx);
@@ -507,7 +523,12 @@ describe("coordinator planner tier", () => {
     const fake = installFakeExecutor(mock.events, {
       roles: ["planner", "implementer"],
       roleScripts: {
-        planner: { provenance: PLAN_PROV, outcome: "blocked", plan: PLAN },
+        planner: {
+          provenance: PLAN_PROV,
+          outcome: "blocked",
+          plan: PLAN,
+          evidence: ["The required generator repository is unavailable."],
+        },
         implementer: { provenance: IMPL_PROV },
       },
     });
@@ -520,6 +541,25 @@ describe("coordinator planner tier", () => {
       expect(graph.showIssue(id).status).toBe("blocked");
       expect(metadataOf(graph, id)[WORKGRAPH_PHASE_KEY]).toBe("escalated");
       expect(await auditCount(graph.dir, id, "escalated")).toBe(1);
+      const escalation = (await listComments(graph.dir, id)).find((comment) =>
+        comment.text.startsWith("workgraph-lease escalated "),
+      );
+      expect(escalation?.text).toContain(
+        "The required generator repository is unavailable.",
+      );
+      expect(coordinator.current()).toBeNull();
+
+      const nextId = graph.createIssue("next approved task");
+      approve(graph, nextId, { workflowClass: "oneshot", riskTier: "low" });
+      await settle(mock, ectx.ctx);
+      await mock.flushEvents();
+      expect(
+        fake.requests.map((request) => [request.issue.id, request.role]),
+      ).toEqual([
+        [id, "planner"],
+        [nextId, "implementer"],
+      ]);
+      expect(graph.showIssue(nextId).status).toBe("closed");
     } finally {
       fake.uninstall();
       await coordinator.teardown(ectx.ctx);

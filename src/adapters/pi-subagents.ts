@@ -343,7 +343,16 @@ export function buildSubagentTask(
       "Implement and validate the changes. Leave the result in this workspace for independent review and subsequent workflow stages.",
     );
   }
+  if (msg.outputSchema !== undefined) {
+    lines.push(
+      "",
+      "Completion contract for this workflow: finish by calling the structured_output tool with { value: <your result> }, where value matches the supplied outputSchema. A Markdown answer or a plan.md file alone does not submit a result. This workflow contract takes precedence over the agent profile's default output format. If validation fails, correct the value and call structured_output again.",
+    );
+  }
   lines.push(
+    "",
+    "Helper tooling: use Node.js for ad hoc JSON/JSONL, XML test-report summaries, manifests, transcripts, and file processing. Do not use Python, python3, pyenv, or mise for these helper scripts. Continue to use the repository's own build and test commands.",
+    "Run reporting helpers separately from builds/tests and give each helper an explicit 60-second bash timeout. Give builds/tests an appropriate finite timeout. If a helper times out, change the approach rather than repeating it unchanged; replace a stalled Python helper with Node.js.",
     "",
     "Do not close or release the issue yourself — the workgraph coordinator records your result and its judgment gate decides what it means.",
   );
@@ -454,6 +463,8 @@ export function registerPiSubagentsExecutor(
   /** Build the fenced `run:completed` from an upstream response. */
   function emitCompleted(run: BridgedRun, payload: UpstreamResponse): void {
     const first = firstResult(payload.result);
+    const childError =
+      typeof first?.error === "string" ? first.error : undefined;
     const outcome: RunOutcomeT =
       payload.isError !== true &&
       first?.exitCode === 0 &&
@@ -536,8 +547,13 @@ export function registerPiSubagentsExecutor(
       outcome,
       artifacts,
       evidence,
-      ...(!first
-        ? { executionError: payload.errorText || "upstream returned no completed child result" }
+      ...(!first || childError
+        ? {
+            executionError:
+              childError ||
+              payload.errorText ||
+              "upstream returned no completed child result",
+          }
         : {}),
       provenance: {
         harness: "pi-subagents",

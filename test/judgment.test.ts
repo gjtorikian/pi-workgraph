@@ -54,6 +54,8 @@ import {
   type VerdictT,
 } from "../src/types.ts";
 import { installFakeExecutor } from "./helpers/fake-executor.ts";
+import { registerPiSubagentsExecutor } from "../src/adapters/pi-subagents.ts";
+import { installFakeSubagents } from "./helpers/fake-subagents.ts";
 import {
   asExtensionAPI,
   makeEventContext,
@@ -851,6 +853,149 @@ describe("approved-only claiming", () => {
       expect(coordinator.current()?.phase).toBe("judging");
       await coordinator.teardown(ectx.ctx);
       expect(heldLeases(graph.dir)).toHaveLength(0);
+    } finally {
+      fake.uninstall();
+      await coordinator.teardown(ectx.ctx);
+      graph.cleanup();
+    }
+  }, 60_000);
+});
+
+describe("executor failure diagnostics", () => {
+  it("queues a second issue behind an active review and completes both workflows", async () => {
+    const { mock, coordinator, config } = makeHarness({
+      subagentsExecutor: { enabled: true },
+    });
+    const bridge = registerPiSubagentsExecutor(asExtensionAPI(mock), {
+      getConfig: () => config,
+      probeVersion: () => "0.34.8",
+    });
+    const graph = makeScratchGraph({ prefix: "serial", seed: 2 });
+    for (const id of graph.seededIds) approve(graph, id);
+    const fake = installFakeSubagents(mock.events, {
+      singleForeground: true,
+      script: [
+        { model: "provider/implementer" },
+        {
+          model: "provider/reviewer",
+          mode: "stall",
+          structuredOutput: CLEAN_VERDICT,
+        },
+        { model: "provider/implementer" },
+        { model: "provider/reviewer", structuredOutput: CLEAN_VERDICT },
+      ],
+    });
+    const ectx = makeEventContext(graph.dir);
+    try {
+      await settle(mock, ectx.ctx);
+      await expect
+        .poll(() => fake.requests.length, { timeout: 30_000 })
+        .toBe(2);
+      await settle(mock, ectx.ctx);
+      expect(bridge.activeRunCount()).toBe(2);
+      expect(fake.requests).toHaveLength(2);
+      fake.respond();
+      await mock.flushEvents();
+      for (const id of graph.seededIds) {
+        expect(graph.showIssue(id).status).toBe("closed");
+        expect(await auditCount(graph.dir, id, "escalated")).toBe(0);
+      }
+      expect(fake.requests.map((r) => r.params.agent)).toEqual([
+        "worker",
+        "reviewer",
+        "worker",
+        "reviewer",
+      ]);
+    } finally {
+      await coordinator.teardown(ectx.ctx);
+      fake.uninstall();
+      bridge.teardown();
+      graph.cleanup();
+    }
+  }, 90_000);
+
+  it.each(["implementer", "reviewer", "finalizer"] as const)(
+    "reports the %s executor error without masking it as missing structured output",
+    async (role) => {
+      const { mock, coordinator } = makeHarness({
+        finalization: { instructions: "Export verified work" },
+      });
+      const graph = makeScratchGraph({ prefix: "execerr" });
+      const id = graph.createIssue("preserve execution failures");
+      approve(graph, id);
+      const reason = "Rejected: a subagent call is already in progress.";
+      const fake = installFakeExecutor(mock.events, {
+        roles: ["implementer", "reviewer", "finalizer"],
+        roleScripts: {
+          implementer: { provenance: IMPL_PROV },
+          reviewer: { provenance: REV_PROV, verdict: CLEAN_VERDICT },
+          [role]: {
+            provenance: role === "reviewer" ? REV_PROV : IMPL_PROV,
+            outcome: "failure",
+            executionError: reason,
+          },
+        },
+      });
+      const ectx = makeEventContext(graph.dir);
+      try {
+        await settle(mock, ectx.ctx);
+        await mock.flushEvents();
+        expect(graph.showIssue(id).status).toBe("blocked");
+        expect(fake.requests.map((r) => r.role)).toEqual(
+          role === "implementer"
+            ? ["implementer"]
+            : role === "reviewer"
+              ? ["implementer", "reviewer"]
+              : ["implementer", "reviewer", "finalizer"],
+        );
+        const comments = await listComments(graph.dir, id);
+        const escalation = comments.find((c) =>
+          c.text.startsWith("workgraph-lease escalated "),
+        );
+        expect(escalation?.text).toContain(`${role} execution failed`);
+        expect(escalation?.text).toContain(reason);
+        expect(comments.some((c) => c.text.includes("verdict-invalid"))).toBe(
+          false,
+        );
+        expect(heldLeases(graph.dir)).toHaveLength(0);
+        expect(coordinator.current()).toBeNull();
+      } finally {
+        fake.uninstall();
+        await coordinator.teardown(ectx.ctx);
+        graph.cleanup();
+      }
+    },
+    60_000,
+  );
+
+  it("never accepts a failed review even when it includes a valid clean verdict", async () => {
+    const { mock, coordinator } = makeHarness();
+    const graph = makeScratchGraph({ prefix: "failrev" });
+    const id = graph.createIssue("require successful review execution");
+    approve(graph, id);
+    const fake = installFakeExecutor(mock.events, {
+      roles: ["implementer", "reviewer"],
+      roleScripts: {
+        implementer: { provenance: IMPL_PROV },
+        reviewer: {
+          provenance: REV_PROV,
+          outcome: "failure",
+          verdict: CLEAN_VERDICT,
+          evidence: ["review process exited with code 1"],
+        },
+      },
+    });
+    const ectx = makeEventContext(graph.dir);
+    try {
+      await settle(mock, ectx.ctx);
+      await mock.flushEvents();
+      expect(graph.showIssue(id).status).toBe("blocked");
+      expect(await verdictCount(graph.dir, id)).toBe(0);
+      const comments = await listComments(graph.dir, id);
+      expect(
+        comments.find((c) => c.text.startsWith("workgraph-lease escalated "))
+          ?.text,
+      ).toContain("review process exited with code 1");
     } finally {
       fake.uninstall();
       await coordinator.teardown(ectx.ctx);

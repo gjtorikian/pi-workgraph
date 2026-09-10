@@ -259,6 +259,7 @@ export interface CoordinatorRun {
    *  the revisor may still be mutating, so releasing without an ack would
    *  invite a concurrent publisher (spec-phase-4 key decision). */
   revisionInFlight?: boolean;
+  /** Includes reviews accepted into an executor queue but not yet launched. */
   reviewInFlight?: boolean;
   finalizationInFlight?: boolean;
   /** Evidence refs from the latest fenced completion (compaction). */
@@ -580,7 +581,11 @@ export function registerCoordinator(
     };
     if (state.active) bump(state.active.executorId);
     for (const run of state.judged) {
-      if (run.revisionInFlight || run.reviewInFlight || run.finalizationInFlight)
+      if (
+        run.revisionInFlight ||
+        run.reviewInFlight ||
+        run.finalizationInFlight
+      )
         bump(run.executorId);
     }
     return counts;
@@ -905,6 +910,13 @@ export function registerCoordinator(
         if (heldRuns().length === 0) stopHeartbeat();
       } else if (run.role === "planner") {
         startImplementation = await acceptPlan(run, msg);
+        // A rejected or invalid plan releases its durable claim, but it
+        // never enters judgment tracking. Clear the active slot as well,
+        // otherwise every later tick returns early and the queue stalls.
+        if (!startImplementation && state.active === run) {
+          state.active = null;
+          if (heldRuns().length === 0) stopHeartbeat();
+        }
       } else if (effectiveWorkflowClass(run.issue) === "oneshot") {
         await finishOneshot(run, msg);
       } else {
@@ -998,11 +1010,7 @@ export function registerCoordinator(
     msg: RunCompletedT,
   ): Promise<boolean> {
     if (msg.outcome !== "success") {
-      await escalateRun(
-        run,
-        "planning",
-        `planning run reported ${msg.outcome}`,
-      );
+      await escalateRun(run, "planning", completionFailure("planner", msg));
       return false;
     }
 
@@ -1574,7 +1582,9 @@ export function registerCoordinator(
         executorId: revisor.executorId,
         role: "revision",
         outcome: completion.outcome,
-        ...(completion.executionError ? { executionError: completion.executionError } : {}),
+        ...(completion.executionError
+          ? { executionError: completion.executionError }
+          : {}),
         artifacts: completion.artifacts,
         evidence: completion.evidence,
         provenance: completion.provenance,
@@ -1582,7 +1592,11 @@ export function registerCoordinator(
       run.actor.bdActor,
     );
     if (completion.executionError) {
-      await escalateRun(run, "revising", `revision execution failed: ${completion.executionError}`);
+      await escalateRun(
+        run,
+        "revising",
+        `revision execution failed: ${completion.executionError}`,
+      );
       return "aborted";
     }
     // revising → judging: any outcome is judged — the reviewer sees
@@ -1776,9 +1790,14 @@ export function registerCoordinator(
       return false;
     }
     if (completion.outcome !== "success" || completion.executionError) {
-      await escalateRun(run, "verifying", completionFailure("finalizer", completion), {
-        workgraph_finalization_status: "failure",
-      });
+      await escalateRun(
+        run,
+        "verifying",
+        completionFailure("finalizer", completion),
+        {
+          workgraph_finalization_status: "failure",
+        },
+      );
       return false;
     }
     let receipt;
@@ -1787,9 +1806,14 @@ export function registerCoordinator(
         (completion as RunCompletedT & { finalization?: unknown }).finalization,
       );
     } catch (error) {
-      await escalateRun(run, "verifying", `${String(error)}${completion.evidence.length ? `; executor evidence: ${completion.evidence.join("; ").slice(0, 1500)}` : ""}`, {
-        workgraph_finalization_status: "failure",
-      });
+      await escalateRun(
+        run,
+        "verifying",
+        `${String(error)}${completion.evidence.length ? `; executor evidence: ${completion.evidence.join("; ").slice(0, 1500)}` : ""}`,
+        {
+          workgraph_finalization_status: "failure",
+        },
+      );
       return false;
     }
     await recordLeaseEvent(
@@ -1840,7 +1864,11 @@ export function registerCoordinator(
     if (!box) return;
 
     if (implementation.executionError) {
-      await escalateRun(run, "judging", completionFailure("implementer", implementation));
+      await escalateRun(
+        run,
+        "judging",
+        completionFailure("implementer", implementation),
+      );
       return;
     }
 
@@ -1940,15 +1968,17 @@ export function registerCoordinator(
         timeoutMs: config.acceptTimeoutMs,
         onInvalid,
       });
-      if (result.kind === "accepted") run.executionId = result.message.executionId;
+      if (result.kind === "accepted")
+        run.executionId = result.message.executionId;
       if (box.closed) {
         publishCancel(run, "coordinator stopped during review acceptance");
         return;
       }
       if (result.kind !== "accepted") {
         if (result.kind === "timeout") {
-          const stopped = run.supportsCancellation &&
-            await cancelAndAwaitAck(run, config.acceptTimeoutMs);
+          const stopped =
+            run.supportsCancellation &&
+            (await cancelAndAwaitAck(run, config.acceptTimeoutMs));
           if (!stopped) {
             untrackLease(run.cwd, run.lease.issueId);
             dropJudgedRun(run);
@@ -1985,7 +2015,11 @@ export function registerCoordinator(
       }
 
       if (completion.outcome !== "success" || completion.executionError) {
-        await escalateRun(run, "judging", completionFailure("reviewer", completion));
+        await escalateRun(
+          run,
+          "judging",
+          completionFailure("reviewer", completion),
+        );
         return;
       }
 
@@ -2660,8 +2694,8 @@ export function registerCoordinator(
    *    in-session run (isolation "none" — its execution cannot outlive the
    *    session): voluntary release, exactly as before;
    *  - an isolated background execution that supports cancellation — the
-   *    active implementation run, or a supervised run whose REVISION
-   *    execution is in flight (`revisionInFlight`):
+   *    active implementation, review, revision, or finalizer execution,
+   *    including accepted work waiting in an executor queue:
    *    `run:cancel` → bounded `run:cancelled` wait → acked releases,
    *    unacked ABANDONS (heartbeat already stopped, lease left INTACT for
    *    the TTL sweep — an immediate release would invite a concurrent
@@ -2694,17 +2728,20 @@ export function registerCoordinator(
       if (!held) continue;
       // Cancel-first is scoped to runs with an IN-FLIGHT execution on an
       // ISOLATED executor: the active implementation run (accepted,
-      // uncompleted) and a supervised run whose REVISION execution is live
+      // uncompleted) and a supervised run whose downstream execution is live
       // (bound at its run:accepted — the executor may still be mutating,
       // so a blind release would invite a concurrent publisher). Parked
       // judgment runs have no live sub-execution to cancel; in-session
       // executions die with this session by definition.
       const inFlight =
-        (run.executionId !== undefined || run.finalizationInFlight === true || run.reviewInFlight === true) &&
+        (run.executionId !== undefined ||
+          run.finalizationInFlight === true ||
+          run.reviewInFlight === true) &&
         run.isolation !== "none" &&
         ((run === active && run.phase === "accepted") ||
           (run.phase === "revising" && run.revisionInFlight === true) ||
-          run.finalizationInFlight === true || run.reviewInFlight === true);
+          run.finalizationInFlight === true ||
+          run.reviewInFlight === true);
       if (inFlight) {
         const acked = run.supportsCancellation
           ? await cancelAndAwaitAck(run, config.acceptTimeoutMs)
