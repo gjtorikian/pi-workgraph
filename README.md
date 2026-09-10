@@ -640,6 +640,13 @@ read the audit comment trail.
 Executors may also publish `workgraph:v1:run:progress` for display-only
 updates. The Pi adapter includes the role, reported model, current tool note,
 and a bounded snapshot of visible worker output when upstream provides it.
+Acceptance does not imply that a worker has started. The serial Pi subagents
+adapter reports optional `executionState` (`queued` or `starting`) and
+`queuePosition` on acceptance. Progress events report `queued`, `starting`, or
+`working`; queued positions update as jobs leave the queue. These fields are
+display-only and do not change coordinator scheduling or lifecycle state. Older
+adapters may omit them, so observers must treat missing state as unknown.
+
 These updates are advisory; they are never acceptance evidence or lifecycle
 transitions. Observers own their transport, filtering, and presentation.
 
@@ -706,3 +713,12 @@ Interrupted verification/finalization is parked for operator recovery; it is
 never automatically repeated, since its external effects may already have happened.
 After an unacknowledged cancellation the lease is left to expire. Inspect the
 retained worktree and any external result before overriding or reapproving work.
+
+Dashboard issue controls can emit `workgraph:ui:issue-halted` after persisting
+a fresh lease epoch and `workgraph_halted=true`. The coordinator detaches only
+that issue and ignores it during dispatch; the subagent adapter rejects delayed
+requests from its old epoch. The dashboard then uses the normal cancellation
+protocol and waits for acknowledgement. Resuming clears the halt flag and
+claims a new workflow run. Optional `workspace.sourceWorkflowRunId`, derived
+from `workgraph_workspace_run_id`, reuses the retained checkout from an earlier
+run while keeping the new run identity and lease epoch for result fencing.

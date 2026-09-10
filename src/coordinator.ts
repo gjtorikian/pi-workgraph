@@ -70,6 +70,11 @@ import {
   selectExecutor,
 } from "./executor-registry.ts";
 import { FinalizationResult, parseFinalizationResult } from "./finalization.ts";
+import {
+  ISSUE_HALT_EVENT,
+  issueHaltNotice,
+  sourceWorkspace,
+} from "./issue-control.ts";
 import { identitySnapshot, localIdentityProvider } from "./identity.ts";
 import {
   acquireLease,
@@ -463,6 +468,28 @@ export function registerCoordinator(
     closeInbox(run.workflowRunId);
     if (heldRuns().length === 0) stopHeartbeat();
   }
+
+  const haltGenerations = new Map<string, number>();
+  pi.events.on(ISSUE_HALT_EVENT, (value) => {
+    const notice = issueHaltNotice(value);
+    if (!notice) return;
+    haltGenerations.set(
+      notice.issueId,
+      (haltGenerations.get(notice.issueId) ?? 0) + 1,
+    );
+    for (const run of heldRuns()) {
+      if (
+        run.issue.id !== notice.issueId ||
+        run.lease.epoch > notice.leaseEpoch
+      )
+        continue;
+      notice.workflowRunIds.push(run.workflowRunId);
+      if (state.active === run) state.active = null;
+      untrackLease(run.cwd, run.issue.id);
+      dropJudgedRun(run);
+    }
+    if (heldRuns().length === 0) stopHeartbeat();
+  });
 
   /**
    * Abandon a judged run whose durable state moved underneath it (override,
@@ -1179,6 +1206,7 @@ export function registerCoordinator(
       attempt: run.attempt,
       workspace: {
         repoPath: run.cwd,
+        ...sourceWorkspace(run.issue.metadata),
         baseRevision: "",
         requiresIsolation: false,
       },
@@ -1491,6 +1519,7 @@ export function registerCoordinator(
       attempt,
       workspace: {
         repoPath: run.cwd,
+        ...sourceWorkspace(run.issue.metadata),
         baseRevision: "",
         requiresIsolation: false,
       },
@@ -1710,6 +1739,7 @@ export function registerCoordinator(
       attempt: run.attempt,
       workspace: {
         repoPath: run.cwd,
+        ...sourceWorkspace(run.issue.metadata),
         baseRevision: "",
         requiresIsolation: false,
       },
@@ -1948,6 +1978,7 @@ export function registerCoordinator(
         attempt,
         workspace: {
           repoPath: run.cwd,
+          ...sourceWorkspace(run.issue.metadata),
           baseRevision: "",
           requiresIsolation: false,
         },
@@ -2321,6 +2352,11 @@ export function registerCoordinator(
     // respected, never claimed.
     const compat = config.compatLegacyIssues ?? false;
     const eligible = pool.filter((issue) => {
+      if (
+        issue.metadata?.workgraph_halted === true ||
+        issue.metadata?.workgraph_halted === "true"
+      )
+        return false;
       if (isLifecycleV1(issue)) return phaseOf(issue) === "ready";
       return compat && !legacyLiveLease(issue);
     });
@@ -2371,6 +2407,7 @@ export function registerCoordinator(
     // planner tier would claim a lease and then throw on the transition.
     // Compat mode stays byte-for-byte what it was.
     const candidate = eligible[0]!;
+    const haltGeneration = haltGenerations.get(candidate.id) ?? 0;
     const workflowClass = effectiveWorkflowClass(candidate);
     let role: "planner" | "implementer" =
       isLifecycleV1(candidate) && workflowClass === "planned"
@@ -2471,6 +2508,20 @@ export function registerCoordinator(
       throw e;
     }
     if (outcome.kind !== "acquired") return;
+    // A halt may arrive while bd is still acquiring a lease, before there
+    // is a tracked run for the synchronous control listener to detach.
+    if (
+      outcome.issue.metadata?.workgraph_halted === true ||
+      outcome.issue.metadata?.workgraph_halted === "true" ||
+      (haltGenerations.get(candidate.id) ?? 0) !== haltGeneration
+    ) {
+      try {
+        await releaseLease(ctx.cwd, outcome.lease, actor);
+      } catch (error) {
+        if (!(error instanceof FencingError)) throw error;
+      }
+      return;
+    }
 
     const run: CoordinatorRun = {
       cwd: ctx.cwd,
@@ -2526,6 +2577,8 @@ export function registerCoordinator(
       }
       return;
     }
+    // A human halt may have detached this run while the write was pending.
+    if (state.active !== run) return;
     // POST-COMMIT: the ready→planning/implementing claim transition resolved.
     emitActivity({
       kind: "claim",
@@ -2557,6 +2610,7 @@ export function registerCoordinator(
       attempt: 1,
       workspace: {
         repoPath: run.cwd,
+        ...sourceWorkspace(run.issue.metadata),
         baseRevision: "",
         requiresIsolation: false,
       },

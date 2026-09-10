@@ -1045,3 +1045,69 @@ describe("in-session integration", () => {
     }
   }, 120_000);
 });
+
+it("honors a human halt, ignores late completion, and dispatches the next issue", async () => {
+  const graph = makeScratchGraph({ prefix: "humanhalt", seed: 1 });
+  const id = graph.seededIds[0]!;
+  const { mock, coordinator } = makeHarness();
+  const fake = installFakeExecutor(mock.events, { behavior: "accept-stall" });
+  const ectx = makeEventContext(graph.dir);
+  try {
+    await settle(mock, ectx.ctx);
+    await mock.flushEvents();
+    const current = coordinator.current()!;
+    expect(current.issue.id).toBe(id);
+    const epoch = current.lease.epoch + 1;
+    graph.bd([
+      "update",
+      id,
+      "--status",
+      "open",
+      "--assignee",
+      "",
+      "--set-metadata",
+      `lease_epoch=${epoch}`,
+      "--unset-metadata",
+      "lease_holder",
+      "--unset-metadata",
+      "lease_expires_at",
+      "--set-metadata",
+      "workgraph_halted=true",
+      "--set-metadata",
+      "workgraph_phase=draft",
+    ]);
+    const notice = {
+      issueId: id,
+      leaseEpoch: epoch,
+      workflowRunIds: [] as string[],
+    };
+    mock.events.emit("workgraph:ui:issue-halted", notice);
+    expect(notice.workflowRunIds).toContain(current.workflowRunId);
+    expect(coordinator.current()).toBeNull();
+    expect(heldLeases(graph.dir)).toHaveLength(0);
+    fake.complete();
+    await mock.flushEvents();
+    expect(metadataOf(graph, id).workgraph_phase).toBe("draft");
+    // Even a stale lifecycle write cannot make a halted issue dispatchable.
+    graph.bd(["update", id, "--set-metadata", "workgraph_phase=ready"]);
+    const next = graph.createIssue("Unrelated next task");
+    graph.bd([
+      "update",
+      next,
+      "--set-metadata",
+      "workgraph_workspace_run_id=run/pr-original",
+    ]);
+    await settle(mock, ectx.ctx);
+    await mock.flushEvents();
+    expect(coordinator.current()?.issue.id).toBe(next);
+    const requests = mock.busEvents
+      .filter((e) => e.channel === CH.runRequest)
+      .map((e) => e.data as RunRequestT);
+    expect(requests).toHaveLength(2);
+    expect(requests[1]!.workspace.sourceWorkflowRunId).toBe("run/pr-original");
+  } finally {
+    fake.uninstall();
+    await coordinator.teardown(ectx.ctx);
+    graph.cleanup();
+  }
+}, 120_000);

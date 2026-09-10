@@ -168,6 +168,8 @@ export const RunRequest = Type.Object({
     requiresIsolation: Type.Boolean(),
     /** Source checkout; an adapter can retain one worktree for this workflow. */
     repoPath: Type.Optional(Type.String()),
+    /** Retained workspace from a previous run of this issue (human follow-up). */
+    sourceWorkflowRunId: Type.Optional(Type.String({ minLength: 1 })),
   }),
   outputSchema: Type.Optional(Type.Unknown()),
   /** Prior judgment findings — used from phase 3. */
@@ -194,6 +196,11 @@ export const RunAccepted = Type.Object({
   issueId: Type.String(),
   leaseEpoch: Type.Number(),
   executorId: Type.String(),
+  /** Advisory executor state. Acceptance alone does not mean work started. */
+  executionState: Type.Optional(
+    Type.Union([Type.Literal("queued"), Type.Literal("starting")]),
+  ),
+  queuePosition: Type.Optional(Type.Integer({ minimum: 1 })),
 });
 export type RunAcceptedT = Static<typeof RunAccepted>;
 
@@ -222,6 +229,14 @@ export const RunProgress = Type.Object({
   role: Type.Optional(ExecutorRole),
   model: Type.Optional(Type.String()),
   output: Type.Optional(Type.Array(Type.String())),
+  executionState: Type.Optional(
+    Type.Union([
+      Type.Literal("queued"),
+      Type.Literal("starting"),
+      Type.Literal("working"),
+    ]),
+  ),
+  queuePosition: Type.Optional(Type.Integer({ minimum: 1 })),
 });
 export type RunProgressT = Static<typeof RunProgress>;
 

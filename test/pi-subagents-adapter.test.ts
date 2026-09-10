@@ -755,11 +755,44 @@ describe("serial foreground execution", () => {
       }
       expect(fake.requests).toHaveLength(1);
       expect(busOn(mock, CH.runAccepted)).toHaveLength(3);
+      expect(busOn(mock, CH.runAccepted)).toEqual([
+        expect.objectContaining({
+          workflowRunId: "workgraph-run/implementer",
+          executionState: "starting",
+        }),
+        expect.objectContaining({
+          workflowRunId: "workgraph-run/reviewer",
+          executionState: "queued",
+          queuePosition: 1,
+        }),
+        expect.objectContaining({
+          workflowRunId: "workgraph-run/revision",
+          executionState: "queued",
+          queuePosition: 2,
+        }),
+      ]);
       expect(busOn(mock, CH.runCompleted)).toHaveLength(0);
       for (let i = 0; i < 3; i++) {
         fake.respond();
         await Promise.resolve();
         expect(fake.requests).toHaveLength(Math.min(i + 2, 3));
+        if (i === 0) {
+          expect(busOn(mock, CH.runProgress)).toContainEqual(
+            expect.objectContaining({
+              workflowRunId: "workgraph-run/reviewer",
+              executionState: "starting",
+            }),
+          );
+          expect(
+            busOn(mock, CH.runProgress)
+              .filter(
+                (event) =>
+                  (event as { workflowRunId: string }).workflowRunId ===
+                  "workgraph-run/revision",
+              )
+              .at(-1),
+          ).toMatchObject({ executionState: "queued", queuePosition: 1 });
+        }
       }
       expect(fake.requests.map((r) => r.params.agent)).toEqual([
         "worker",
@@ -1257,3 +1290,172 @@ it.each([{ exitCode: 1 }, { exitCode: 0, interrupted: true }])(
     }
   },
 );
+
+describe("explicit human halt", () => {
+  it("cancels only the selected queued issue and rejects delayed work from its old epoch", async () => {
+    const { mock, bridge } = makeBridgeHarness();
+    const fake = installFakeSubagents(mock.events, {
+      singleForeground: true,
+      script: { mode: "stall" },
+    });
+    const request = (id: string, epoch = 3) =>
+      makeRunRequest({
+        issue: { id, title: id },
+        workflowRunId: `run/${id}/${epoch}`,
+        leaseEpoch: epoch,
+      });
+    try {
+      for (const id of ["working", "halt-me", "next"])
+        mock.events.emit(CH.runRequest, request(id));
+      const notice = {
+        issueId: "halt-me",
+        leaseEpoch: 4,
+        workflowRunIds: [] as string[],
+      };
+      mock.events.emit("workgraph:ui:issue-halted", notice);
+      expect(notice.workflowRunIds).toEqual(["run/halt-me/3"]);
+      for (const workflowRunId of notice.workflowRunIds)
+        mock.events.emit(CH.runCancel, {
+          ...newEnvelope(),
+          workflowRunId,
+          issueId: notice.issueId,
+        });
+      expect(fake.cancels).toEqual([]); // Queued work never reaches the child runtime.
+      expect(busOn(mock, CH.runCancelled)).toContainEqual(
+        expect.objectContaining({ issueId: "halt-me" }),
+      );
+      expect(bridge.activeRunCount()).toBe(2);
+      mock.events.emit(CH.runRequest, request("halt-me"));
+      expect(busOn(mock, CH.runRejected)).toContainEqual(
+        expect.objectContaining({
+          issueId: "halt-me",
+          reason: "Issue halted by the user",
+        }),
+      );
+      fake.respond();
+      await mock.flushEvents();
+      expect(fake.requests).toHaveLength(2);
+      expect(fake.requests[1]!.params.task).toContain("next");
+      // A later explicit resume/follow-up has a fresh epoch and can run.
+      mock.events.emit(CH.runRequest, request("halt-me", 5));
+      fake.respond();
+      await mock.flushEvents();
+      expect(fake.requests).toHaveLength(3);
+      expect(fake.requests[2]!.params.task).toContain("halt-me");
+    } finally {
+      fake.uninstall();
+      bridge.teardown();
+    }
+  });
+  it("stops the selected running child and lets an unrelated queued issue continue", async () => {
+    const { mock, bridge } = makeBridgeHarness();
+    const fake = installFakeSubagents(mock.events, {
+      singleForeground: true,
+      script: { mode: "stall" },
+    });
+    try {
+      mock.events.emit(CH.runRequest, makeRunRequest());
+      mock.events.emit(
+        CH.runRequest,
+        makeRunRequest({
+          issue: { id: "other", title: "Other task" },
+          workflowRunId: "run/other",
+        }),
+      );
+      const notice = {
+        issueId: "wg-7",
+        leaseEpoch: 4,
+        workflowRunIds: [] as string[],
+      };
+      mock.events.emit("workgraph:ui:issue-halted", notice);
+      for (const workflowRunId of notice.workflowRunIds)
+        mock.events.emit(CH.runCancel, {
+          ...newEnvelope(),
+          workflowRunId,
+          issueId: notice.issueId,
+        });
+      await mock.flushEvents();
+      expect(fake.cancels).toEqual([fake.requests[0]!.requestId]);
+      expect(fake.requests).toHaveLength(2);
+      expect(bridge.activeRunCount()).toBe(1);
+      expect(busOn(mock, CH.runCancelled)).toContainEqual(
+        expect.objectContaining({ issueId: "wg-7" }),
+      );
+      expect(busOn(mock, CH.runCompleted)).toHaveLength(0);
+    } finally {
+      fake.uninstall();
+      bridge.teardown();
+    }
+  });
+});
+
+it("continues a follow-up in the original PR worktree with new run fencing for every role", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "workgraph-follow-up-"));
+  const git = (...args: string[]) =>
+    execFileSync("git", args, { cwd: dir, encoding: "utf8" }).trim();
+  git("init", "-q");
+  git(
+    "-c",
+    "user.name=Test",
+    "-c",
+    "user.email=test@example.com",
+    "commit",
+    "--allow-empty",
+    "-qm",
+    "seed",
+  );
+  const { mock, bridge } = makeBridgeHarness({
+    finalization: { instructions: "Deliver existing PR" },
+  });
+  const fake = installFakeSubagents(mock.events);
+  try {
+    mock.events.emit(
+      CH.runRequest,
+      makeRunRequest({
+        workflowRunId: "run/original",
+        workspace: { repoPath: dir, baseRevision: "", requiresIsolation: true },
+      }),
+    );
+    await mock.flushEvents();
+    const checkout = fake.requests[0]!.params.cwd as string;
+    writeFileSync(
+      join(checkout, "existing-change.txt"),
+      "preserve this PR implementation",
+    );
+    for (const role of ["implementer", "reviewer", "revision", "finalizer"]) {
+      mock.events.emit(
+        CH.runRequest,
+        makeRunRequest({
+          role,
+          workflowRunId: "run/follow-up",
+          leaseEpoch: 5,
+          workspace: {
+            repoPath: dir,
+            baseRevision: "",
+            requiresIsolation: true,
+            sourceWorkflowRunId: "run/original",
+          },
+        }),
+      );
+      await mock.flushEvents();
+    }
+    expect(fake.requests).toHaveLength(5);
+    expect(fake.requests.every((r) => r.params.cwd === checkout)).toBe(true);
+    expect(
+      readFileSync(join(checkout, "existing-change.txt"), "utf8"),
+    ).toContain("preserve");
+    expect(busOn(mock, CH.runAccepted).slice(1)).toEqual(
+      Array.from({ length: 4 }, () =>
+        expect.objectContaining({
+          workflowRunId: "run/follow-up",
+          leaseEpoch: 5,
+        }),
+      ),
+    );
+    expect(git("status", "--porcelain")).toBe("");
+  } finally {
+    fake.uninstall();
+    bridge.teardown();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

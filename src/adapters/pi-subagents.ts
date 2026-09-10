@@ -61,6 +61,7 @@ import {
   type RunRequestT,
 } from "../protocol.ts";
 import { DEFAULT_WORKFLOW_CLASS, type WorkflowClassT } from "../types.ts";
+import { ISSUE_HALT_EVENT, issueHaltNotice } from "../issue-control.ts";
 import { workflowWorkspace, type WorkflowWorkspace } from "./workspace.ts";
 
 export const PI_SUBAGENTS_EXECUTOR_ID = "pi-subagents";
@@ -409,6 +410,24 @@ export function registerPiSubagentsExecutor(
   /** Live bridged runs by upstream requestId. */
   const runs = new Map<string, BridgedRun>();
   const unsubs: (() => void)[] = [];
+  const haltedEpochs = new Map<string, number>();
+  unsubs.push(
+    pi.events.on(ISSUE_HALT_EVENT, (value) => {
+      const notice = issueHaltNotice(value);
+      if (!notice) return;
+      haltedEpochs.set(
+        notice.issueId,
+        Math.max(haltedEpochs.get(notice.issueId) ?? 0, notice.leaseEpoch),
+      );
+      for (const run of runs.values()) {
+        if (
+          run.issueId === notice.issueId &&
+          run.leaseEpoch <= notice.leaseEpoch
+        )
+          notice.workflowRunIds.push(run.workflowRunId);
+      }
+    }),
+  );
 
   function accept(run: BridgedRun): void {
     if (run.accepted) return;
@@ -421,17 +440,59 @@ export function registerPiSubagentsExecutor(
       issueId: run.issueId,
       leaseEpoch: run.leaseEpoch,
       executorId: PI_SUBAGENTS_EXECUTOR_ID,
+      executionState: run.submitted ? "starting" : "queued",
+      ...(!run.submitted
+        ? {
+            queuePosition:
+              [...runs.values()]
+                .filter((entry) => !entry.submitted)
+                .indexOf(run) + 1,
+          }
+        : {}),
     });
+  }
+
+  function reportState(
+    run: BridgedRun,
+    executionState: "queued" | "starting",
+    queuePosition?: number,
+  ): void {
+    pi.events.emit(CH.runProgress, {
+      ...newEnvelope(nowFn),
+      workflowRunId: run.workflowRunId,
+      executionId: run.executionId,
+      issueId: run.issueId,
+      leaseEpoch: run.leaseEpoch,
+      role: run.role,
+      executionState,
+      ...(queuePosition ? { queuePosition } : {}),
+      note:
+        executionState === "queued"
+          ? "Waiting for an executor slot"
+          : "Executor launching worker",
+    });
+  }
+
+  function reportQueue(): void {
+    let position = 0;
+    for (const run of runs.values()) {
+      if (!run.submitted) reportState(run, "queued", ++position);
+    }
   }
 
   // pi-subagents rejects overlapping foreground calls, even though its slash
   // bridge emits started before checking that lock. Own queued requests so
   // they can be accepted within the protocol deadline and cancelled locally.
   function launchNext(): void {
-    if ([...runs.values()].some((run) => run.submitted)) return;
+    if ([...runs.values()].some((run) => run.submitted)) {
+      reportQueue();
+      return;
+    }
     const run = runs.values().next().value as BridgedRun | undefined;
     if (!run) return;
     run.submitted = true;
+    if (run.accepted) reportState(run, "starting");
+    reportQueue();
     pi.events.emit(UPSTREAM_EVENTS.request, {
       requestId: run.requestId,
       params: run.params,
@@ -623,6 +684,11 @@ export function registerPiSubagentsExecutor(
         });
       };
 
+      if (msg.leaseEpoch <= (haltedEpochs.get(msg.issue.id) ?? -1)) {
+        reject("Issue halted by the user");
+        return;
+      }
+
       const mapping = ROLE_MAP[msg.role];
       if (msg.role === "finalizer" && !deps.getConfig().finalization) {
         reject("finalization is disabled");
@@ -652,7 +718,7 @@ export function registerPiSubagentsExecutor(
             throw new Error("workflow request is missing its repository path");
           workspace = workflowWorkspace(
             msg.workspace.repoPath,
-            msg.workflowRunId,
+            msg.workspace.sourceWorkflowRunId ?? msg.workflowRunId,
             msg.issue.id,
             msg.role === "implementer",
           );
@@ -712,7 +778,10 @@ export function registerPiSubagentsExecutor(
       runs.set(run.requestId, run);
       // A queued acceptance reserves an execution owned by this adapter;
       // it does not claim that an upstream child has already started.
-      if (runs.size > 1) accept(run);
+      if (runs.size > 1) {
+        accept(run);
+        reportQueue();
+      }
       launchNext();
     }),
   );
@@ -776,6 +845,7 @@ export function registerPiSubagentsExecutor(
         issueId: run.issueId,
         leaseEpoch: run.leaseEpoch,
         note,
+        executionState: "working",
         role: run.role,
         ...(model ? { model } : {}),
         ...(output?.length ? { output } : {}),
