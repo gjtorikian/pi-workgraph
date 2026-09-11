@@ -64,17 +64,14 @@ export function workflowWorkspace(
       throw new Error(
         "workflow has no implementation worktree to review or publish",
       );
-    if (git(root, "status", "--porcelain")) {
-      throw new Error(
-        "workgraph requires a clean source checkout before creating an implementation branch",
-      );
-    }
     const label =
       issueId.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 60) || "issue";
     workspace = {
       repoPath: root,
       path: checkout,
       branch: `workgraph/${label}-${key.slice(0, 8)}`,
+      // Start from committed history; the source index and working files stay
+      // in their original checkout and are never copied into this worktree.
       baseRevision: git(root, "rev-parse", "HEAD"),
     };
     mkdirSync(dir, { recursive: true });

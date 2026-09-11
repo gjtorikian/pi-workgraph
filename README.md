@@ -703,8 +703,10 @@ The Pi subagents adapter accepts per-role `options` alongside `routes` in
 an explicit model), and `skills` names. Thinking is encoded using Pi's model
 suffix. Explicit skills are passed via Pi's native skill selection. With
 finalization enabled, the adapter creates one retained Git worktree per workflow
-and shares it across implementation, review, revision, and finalization. It
-requires a clean source checkout and never removes the workflow branch or worktree.
+and shares it across implementation, review, revision, and finalization. New
+worktrees start from the source checkout's current commit; staged, unstaged, and
+untracked changes stay in the source checkout. The adapter never removes the
+workflow branch or worktree.
 Accepted plans are included in every downstream task. Pi executor children retain
 workgraph tools but do not start additional coordinators or recovery sweeps.
 
