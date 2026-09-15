@@ -19,9 +19,6 @@ const THINKING_LEVELS = [
 ] as const;
 type ThinkingLevels = (typeof THINKING_LEVELS)[number];
 
-
-//export type ThinkingLevels = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-
 export type SubagentsRoleRoutes = Partial<
   Record<
     | "planner"
