@@ -8,7 +8,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { PolicyOverrides } from "./policy.ts";
 import type { WorkflowClassT } from "./types.ts";
 
-export const THINKING_LEVELS = [
+const THINKING_LEVELS = [
   "off",
   "minimal",
   "low",
@@ -17,7 +17,7 @@ export const THINKING_LEVELS = [
   "xhigh",
   "max",
 ] as const;
-export type ThinkingLevels = (typeof THINKING_LEVELS)[number];
+type ThinkingLevels = (typeof THINKING_LEVELS)[number];
 
 
 //export type ThinkingLevels = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
