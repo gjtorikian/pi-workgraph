@@ -8,6 +8,20 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { PolicyOverrides } from "./policy.ts";
 import type { WorkflowClassT } from "./types.ts";
 
+export const THINKING_LEVELS = [
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const;
+export type ThinkingLevels = (typeof THINKING_LEVELS)[number];
+
+
+//export type ThinkingLevels = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
 export type SubagentsRoleRoutes = Partial<
   Record<
     | "planner"
@@ -107,6 +121,10 @@ export interface WorkgraphConfig {
    * passes the version gate.
    */
   subagentsExecutor?: SubagentsExecutorConfig;
+  /**
+   * Opt-in: set the reasoning level for compaction
+   */
+  reasoningLevel?: ThinkingLevels
 }
 
 export const DEFAULT_LEASE_TTL_MS = 300_000;
@@ -174,6 +192,11 @@ const FLAGS = [
     name: "workgraph-finalization",
     description:
       "Optional post-verification task as JSON with instructions and timeoutMs (env WORKGRAPH_FINALIZATION)",
+  },
+  {
+    name: "workgraph-compaction-reasoning-level",
+    description:
+      "Optional reasoning level for compaction (env WORKGRAPH_COMPACTION_REASONING_LEVEL)",
   },
 ] as const;
 
@@ -277,6 +300,17 @@ function subagentsValue(
     );
     return undefined;
   }
+}
+
+function reasoningValue(
+  pi: ExtensionAPI,
+  flag: string,
+  envVar: string,
+): ThinkingLevels | undefined {
+  const raw = stringValue(pi, flag, envVar);
+  if (raw === undefined) return undefined;
+  const lowered = raw.toLowerCase();
+  return THINKING_LEVELS.find(v=>v===lowered)
 }
 
 function parseSubagentsRoutes(
@@ -474,6 +508,11 @@ export function resolveConfig(pi: ExtensionAPI): WorkgraphConfig {
       pi,
       "workgraph-subagents-executor",
       "WORKGRAPH_SUBAGENTS_EXECUTOR",
+    ),
+    reasoningLevel: reasoningValue(
+      pi,
+      "workgraph-compaction-reasoning-level",
+      "WORKGRAPH_COMPACTION_REASONING_LEVEL",
     ),
   };
 }
