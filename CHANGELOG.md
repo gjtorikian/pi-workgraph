@@ -1,3 +1,19 @@
+## [0.4.0](https://github.com/gjtorikian/pi-workgraph/compare/v0.3.1...v0.4.0) (2026-09-15)
+
+### Features
+
+* **workflow:** Support human run supervision ([48bfbaf](https://github.com/gjtorikian/pi-workgraph/commit/48bfbaf924058474e45ab1447d2b503ed5ae0a16))
+* Add caller-defined finalization stage ([d9bb5c0](https://github.com/gjtorikian/pi-workgraph/commit/d9bb5c07921904d618f7ad9f8863c20c6404b767))
+* **policy:** Require only model independence by default ([955d015](https://github.com/gjtorikian/pi-workgraph/commit/955d0150597957aa6b0ad5f680c3f3c15b488e41))
+
+### Bug Fixes
+
+* **workflow:** Pause for human decisions ([1a72a67](https://github.com/gjtorikian/pi-workgraph/commit/1a72a6742a4c0055daf8a3fc45d97ba3cd399dd8))
+* **workspace:** Allow worktrees from dirty sources ([1e2f3cd](https://github.com/gjtorikian/pi-workgraph/commit/1e2f3cd2b88e4eee35d9a716de3a79a7e1855477))
+* **workflow:** Recover from failed worker steps ([64a8de0](https://github.com/gjtorikian/pi-workgraph/commit/64a8de0d15c693d6d4cc2e5aa812eeda17067512))
+* **subagents:** Wait for the child and honor its exit status ([8b9d97d](https://github.com/gjtorikian/pi-workgraph/commit/8b9d97d3d1ece11528b20b18f63815a4fd4e6a51))
+
+
 ## [0.3.1](https://github.com/gjtorikian/pi-workgraph/compare/v0.3.0...v0.3.1) (2026-09-02)
 
 ### Bug Fixes
