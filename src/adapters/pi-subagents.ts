@@ -63,6 +63,7 @@ import {
 import { DEFAULT_WORKFLOW_CLASS, type WorkflowClassT } from "../types.ts";
 import { ISSUE_HALT_EVENT, issueHaltNotice } from "../issue-control.ts";
 import { workflowWorkspace, type WorkflowWorkspace } from "./workspace.ts";
+import { supervisorQuestion } from "./subagent-decision.ts";
 
 export const PI_SUBAGENTS_EXECUTOR_ID = "pi-subagents";
 export const PI_SUBAGENTS_ADAPTER_VERSION = "0.1.0";
@@ -93,6 +94,8 @@ export const UPSTREAM_EVENTS = {
    * which is why the bridge answers unknown-run cancels itself.
    */
   cancel: "subagent:slash:cancel",
+  /** Detached child process has exited (verified against pi-subagents 0.41). */
+  foregroundComplete: "subagent:foreground-complete",
 } as const;
 
 /**
@@ -223,6 +226,7 @@ export function defaultProbeVersion(): string | undefined {
  *  slash events carry no executionId, so the bridge mints one and keeps the
  *  correlation for update/response/cancel routing. */
 interface BridgedRun {
+  detached?: { runId?: string; question: string };
   workspace?: WorkflowWorkspace;
   requestId: string;
   workflowRunId: string;
@@ -535,7 +539,10 @@ export function registerPiSubagentsExecutor(
         ? "success"
         : "failure";
     const evidence: string[] = [];
-    if (!first) evidence.push("upstream returned no completed child result");
+    if (run.detached)
+      evidence.push(`Needs your decision: ${run.detached.question}`);
+    else if (!first)
+      evidence.push("upstream returned no completed child result");
     else if (outcome !== "success") {
       evidence.push(
         `upstream child did not complete successfully (exitCode: ${String(first.exitCode)})`,
@@ -605,7 +612,10 @@ export function registerPiSubagentsExecutor(
       executionId: run.executionId,
       issueId: run.issueId,
       leaseEpoch: run.leaseEpoch,
-      outcome,
+      outcome: run.detached ? "blocked" : outcome,
+      ...(run.detached
+        ? { decisionQuestion: run.detached.question, workerPending: true }
+        : {}),
       artifacts,
       evidence,
       ...(!first || childError
@@ -759,8 +769,11 @@ export function registerPiSubagentsExecutor(
           task: buildSubagentTask(
             msg as RunRequestT & { artifacts?: string[] },
           ),
-          worktree: workspace ? false : mapping.worktree,
-          ...(workspace ? { cwd: workspace.path } : {}),
+          // Workgraph owns this checkout. Modern upstream runtimes reject
+          // the legacy worktree option even when its value is false.
+          ...(workspace
+            ? { cwd: workspace.path }
+            : { worktree: mapping.worktree }),
           ...(model ? { model } : {}),
           ...(roleOptions?.skills ? { skill: roleOptions.skills } : {}),
           ...(msg.role === "finalizer"
@@ -861,6 +874,21 @@ export function registerPiSubagentsExecutor(
       if (typeof payload.requestId !== "string") return;
       const run = runs.get(payload.requestId);
       if (!run || !run.submitted) return; // not an upstream execution
+      const first = firstResult(payload.result);
+      if (first?.detached === true || first?.exitCode === -2) {
+        if (run.detached) return; // repeated handoff receipt
+        const runId = (payload.result as { details?: { runId?: unknown } })
+          ?.details?.runId;
+        run.detached = {
+          ...(typeof runId === "string" && runId ? { runId } : {}),
+          question: supervisorQuestion(first.artifactPaths),
+        };
+        // A handoff is a request for input, never a reviewable failure. Keep
+        // ownership and the executor slot until the CHILD confirms exit.
+        if (run.cancelPending) cancelDetached(run);
+        else emitCompleted(run, payload as UpstreamResponse);
+        return;
+      }
       const details = (
         payload.result as
           { details?: { asyncId?: unknown; results?: unknown[] } } | undefined
@@ -877,6 +905,7 @@ export function registerPiSubagentsExecutor(
         );
         return;
       }
+      if (run.detached && typeof first?.exitCode !== "number") return;
       runs.delete(run.requestId);
       // Finish emitting this result before starting the next upstream call.
       queueMicrotask(launchNext);
@@ -943,7 +972,7 @@ export function registerPiSubagentsExecutor(
         emitCancelled(run);
         return;
       }
-      emitCompleted(run, response);
+      if (!run.detached) emitCompleted(run, response);
     }),
   );
 
@@ -965,7 +994,9 @@ export function registerPiSubagentsExecutor(
           return;
         }
         run.cancelPending = true;
-        pi.events.emit(UPSTREAM_EVENTS.cancel, { requestId: run.requestId });
+        if (run.detached) cancelDetached(run);
+        else
+          pi.events.emit(UPSTREAM_EVENTS.cancel, { requestId: run.requestId });
         return; // the ack follows upstream's post-cancel response
       }
       // Unknown/finished run: upstream parks unknown requestIds in
@@ -979,6 +1010,43 @@ export function registerPiSubagentsExecutor(
           ? { executionId: msg.executionId }
           : {}),
       });
+    }),
+  );
+
+  function cancelDetached(run: BridgedRun): void {
+    if (!run.detached?.runId) return; // No target, no invented acknowledgment.
+    // The original slash controller has gone away after detaching. Target
+    // the retained child, and ignore the management receipt: it is not exit.
+    pi.events.emit(UPSTREAM_EVENTS.request, {
+      requestId: newEnvelope(nowFn).messageId,
+      params: { action: "interrupt", id: run.detached.runId },
+    });
+  }
+  unsubs.push(
+    pi.events.on(UPSTREAM_EVENTS.foregroundComplete, (data) => {
+      if (!data || typeof data !== "object") return;
+      const event = data as {
+        runId?: unknown;
+        taskIndex?: unknown;
+        state?: unknown;
+        source?: unknown;
+      };
+      if (
+        event.source !== "foreground" ||
+        event.taskIndex !== 0 ||
+        !["complete", "completed", "failed", "paused", "stopped"].includes(
+          String(event.state),
+        )
+      )
+        return;
+      for (const run of runs.values()) {
+        if (!run.detached?.runId || run.detached.runId !== event.runId)
+          continue;
+        runs.delete(run.requestId);
+        if (run.cancelPending) emitCancelled(run);
+        queueMicrotask(launchNext);
+        break;
+      }
     }),
   );
 

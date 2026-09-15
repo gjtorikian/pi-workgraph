@@ -207,6 +207,7 @@ export type LeaseEvent =
   | "revision-requested"
   /** Judgment (phase 3): escalated (fingerprint repeat, bounds, no reviewer). */
   | "escalated"
+  | "decision-needed"
   /** Judgment (phase 3): verdict passed the gate — issue accepted and closed. */
   | "judgment-closed"
   | "finalization-completed"

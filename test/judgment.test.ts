@@ -968,6 +968,93 @@ describe("executor failure diagnostics", () => {
     60_000,
   );
 
+  it.each(["ack", "ignore"] as const)(
+    "parks a detached decision request without review and records cancellation %s",
+    async (cancel) => {
+      const { mock, coordinator } = makeHarness();
+      const graph = makeScratchGraph({ prefix: "decision" });
+      const id = graph.createIssue("choose password compatibility policy");
+      approve(graph, id);
+      const fake = installFakeExecutor(mock.events, {
+        roles: ["implementer", "reviewer"],
+        supportsCancellation: true,
+        cancel,
+        roleScripts: {
+          implementer: {
+            outcome: "blocked",
+            decisionQuestion: "Allow a breaking change?",
+            workerPending: true,
+          },
+        },
+      });
+      const ectx = makeEventContext(graph.dir);
+      try {
+        await settle(mock, ectx.ctx);
+        await mock.flushEvents();
+        expect(graph.showIssue(id).status).toBe("blocked");
+        const metadata = metadataOf(graph, id);
+        expect(metadata.workgraph_decision_pending).toBe(true);
+        expect(metadata.workgraph_decision_question).toBe(
+          "Allow a breaking change?",
+        );
+        expect(metadata.workgraph_halt_unconfirmed).toBe(cancel === "ignore");
+        expect(metadata.workgraph_workspace_run_id).toBe(
+          fake.requests[0]!.workflowRunId,
+        );
+        expect(fake.requests.map((r) => r.role)).toEqual(["implementer"]);
+        expect(await auditCount(graph.dir, id, "decision-needed")).toBe(1);
+        expect(await auditCount(graph.dir, id, "revision-requested")).toBe(0);
+        expect(heldLeases(graph.dir)).toHaveLength(0);
+        expect(coordinator.current()).toBeNull();
+        await settle(mock, ectx.ctx);
+        expect(fake.requests).toHaveLength(1);
+      } finally {
+        fake.uninstall();
+        await coordinator.teardown(ectx.ctx);
+        graph.cleanup();
+      }
+    },
+    60_000,
+  );
+
+  it("stops the revision loop when a revisor requests a human decision", async () => {
+    const { mock, coordinator } = makeHarness();
+    const graph = makeScratchGraph({ prefix: "revdecision" });
+    const id = graph.createIssue("revision needs a policy choice");
+    approve(graph, id);
+    const fake = installFakeExecutor(mock.events, {
+      roles: ["implementer", "reviewer", "revision"],
+      roleScripts: {
+        implementer: { provenance: IMPL_PROV },
+        reviewer: {
+          provenance: REV_PROV,
+          verdict: blockingVerdict("compatibility"),
+        },
+        revision: {
+          outcome: "blocked",
+          decisionQuestion: "Keep the legacy API?",
+        },
+      },
+    });
+    const ectx = makeEventContext(graph.dir);
+    try {
+      await settle(mock, ectx.ctx);
+      await mock.flushEvents();
+      expect(fake.requests.map((r) => r.role)).toEqual([
+        "implementer",
+        "reviewer",
+        "revision",
+      ]);
+      expect(metadataOf(graph, id).workgraph_decision_pending).toBe(true);
+      expect(await auditCount(graph.dir, id, "decision-needed")).toBe(1);
+      expect(graph.showIssue(id).status).toBe("blocked");
+    } finally {
+      fake.uninstall();
+      await coordinator.teardown(ectx.ctx);
+      graph.cleanup();
+    }
+  }, 60_000);
+
   it("never accepts a failed review even when it includes a valid clean verdict", async () => {
     const { mock, coordinator } = makeHarness();
     const graph = makeScratchGraph({ prefix: "failrev" });

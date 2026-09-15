@@ -1184,9 +1184,9 @@ it("keeps every downstream role in the implementation worktree", async () => {
     const paths = upstream.requests.map((r) => r.params.cwd);
     expect(paths[0]).toEqual(expect.stringContaining("checkout"));
     expect(new Set(paths).size).toBe(1);
-    expect(upstream.requests.every((r) => r.params.worktree === false)).toBe(
-      true,
-    );
+    expect(
+      upstream.requests.every((r) => r.params.worktree === undefined),
+    ).toBe(true);
     expect(busOn(mock, CH.runCompleted).at(-1)).toHaveProperty(
       "finalization",
       receipt,
@@ -1290,6 +1290,94 @@ it.each([{ exitCode: 1 }, { exitCode: 0, interrupted: true }])(
     }
   },
 );
+
+it("keeps detached children owned until exit and never mistakes an interrupt receipt for cancellation", async () => {
+  const { mock, bridge } = makeBridgeHarness();
+  const fake = installFakeSubagents(mock.events, { script: { mode: "stall" } });
+  try {
+    const request = makeRunRequest();
+    mock.events.emit(CH.runRequest, request);
+    const receipt = {
+      requestId: fake.requests[0]!.requestId,
+      result: {
+        details: {
+          runId: "child-1",
+          results: [{ detached: true, exitCode: -2 }],
+        },
+      },
+    };
+    fake.emitRawResponse(receipt);
+    fake.emitRawResponse(receipt);
+    const completed = busOn(mock, CH.runCompleted) as RunCompletedT[];
+    expect(completed).toHaveLength(1);
+    expect(completed[0]).toMatchObject({
+      outcome: "blocked",
+      workerPending: true,
+    });
+    expect(completed[0]?.decisionQuestion).toContain("supervisor decision");
+    expect(bridge.activeRunCount()).toBe(1);
+    mock.events.emit(CH.runCancel, {
+      ...newEnvelope(),
+      workflowRunId: request.workflowRunId,
+      issueId: request.issue.id,
+      executionId: completed[0]!.executionId,
+      reason: "decision",
+    });
+    expect(fake.requests[1]?.params).toEqual({
+      action: "interrupt",
+      id: "child-1",
+    });
+    fake.emitRawResponse({
+      requestId: fake.requests[1]!.requestId,
+      result: { details: { results: [] } },
+    });
+    expect(busOn(mock, CH.runCancelled)).toHaveLength(0);
+    mock.events.emit(UPSTREAM_EVENTS.foregroundComplete, {
+      runId: "other",
+      taskIndex: 0,
+      state: "stopped",
+      source: "foreground",
+    });
+    expect(bridge.activeRunCount()).toBe(1);
+    mock.events.emit(UPSTREAM_EVENTS.foregroundComplete, {
+      runId: "child-1",
+      taskIndex: 0,
+      state: "stopped",
+      source: "foreground",
+    });
+    expect(busOn(mock, CH.runCancelled)).toHaveLength(1);
+    expect(bridge.activeRunCount()).toBe(0);
+    expect(busOn(mock, CH.runCompleted)).toHaveLength(1);
+  } finally {
+    fake.uninstall();
+    bridge.teardown();
+  }
+});
+
+it("cannot acknowledge a detached child without an upstream run ID", () => {
+  const { mock, bridge } = makeBridgeHarness();
+  const fake = installFakeSubagents(mock.events, { script: { mode: "stall" } });
+  try {
+    const request = makeRunRequest();
+    mock.events.emit(CH.runRequest, request);
+    fake.emitRawResponse({
+      requestId: fake.requests[0]!.requestId,
+      result: { details: { results: [{ detached: true, exitCode: -2 }] } },
+    });
+    mock.events.emit(CH.runCancel, {
+      ...newEnvelope(),
+      workflowRunId: request.workflowRunId,
+      issueId: request.issue.id,
+      reason: "stop",
+    });
+    expect(busOn(mock, CH.runCancelled)).toHaveLength(0);
+    expect(fake.cancels).toHaveLength(0);
+    expect(bridge.activeRunCount()).toBe(1);
+  } finally {
+    fake.uninstall();
+    bridge.teardown();
+  }
+});
 
 describe("explicit human halt", () => {
   it("cancels only the selected queued issue and rejects delayed work from its old epoch", async () => {

@@ -578,7 +578,18 @@ extension answers discovery with no subagents offer and holds zero bus
 subscriptions (a double gate — index.ts never calls the register function,
 and the register function re-checks config itself).
 
-Two semantics worth knowing:
+Bridge semantics:
+
+- **Supervisor decisions pause the workflow.** A detached child produces an
+  explicit blocked decision request, not a failed implementation to judge.
+  The coordinator saves the question, parks the issue in Escalated, and keeps
+  the revision limit unchanged. The dashboard displays the question and accepts
+  an answer before resuming the original task in its retained checkout.
+  Detached children are interrupted by run ID; an interrupt receipt alone is
+  not confirmation that the child stopped. Without a confirmed exit, resuming
+  remains blocked. This lifecycle uses the pi-subagents foreground completion
+  event verified against 0.41; older or incompatible runtimes may require a
+  manual worker stop before recovery.
 
 - **Self-acceptance is never judgment.** A pi-subagents run can finalize
   with a parent-controlled self-review (`acceptance` ledger). The bridge

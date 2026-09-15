@@ -253,6 +253,12 @@ export const RunCompleted = Type.Object({
   outcome: RunOutcome,
   /** Executor failed before producing a child result; no artifact to judge. */
   executionError: Type.Optional(Type.String()),
+  /** Explicit human input request; bypass judgment and revision budgets. */
+  decisionQuestion: Type.Optional(
+    Type.String({ minLength: 1, maxLength: 20000 }),
+  ),
+  /** A detached child still exists. Cancellation must be confirmed before resuming. */
+  workerPending: Type.Optional(Type.Boolean()),
   /** Changed files / patch refs. */
   artifacts: Type.Array(Type.String()),
   evidence: Type.Array(Type.String()),

@@ -398,6 +398,13 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
       const actor = defaultLeaseActor();
       const cur = await show(ctx.cwd, params.id);
       const phase = phaseOf(cur);
+      if (
+        cur.metadata?.workgraph_decision_pending === true ||
+        cur.metadata?.workgraph_decision_pending === "true"
+      )
+        throw new Error(
+          "This issue needs a human decision. Answer its decision request in the board before resuming it.",
+        );
       if (phase !== undefined && phase !== "draft" && phase !== "escalated") {
         throw new Error(
           `Cannot approve ${params.id}: approval moves draft, legacy, or escalated issues ` +

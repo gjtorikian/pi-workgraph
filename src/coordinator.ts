@@ -647,6 +647,7 @@ export function registerCoordinator(
   function cancelAndAwaitAck(
     run: CoordinatorRun,
     timeoutMs: number,
+    reason = "coordinator shutdown",
   ): Promise<boolean> {
     return new Promise((resolve) => {
       let done = false;
@@ -678,7 +679,7 @@ export function registerCoordinator(
       }
 
       timer = setTimeout(() => finish(false), timeoutMs);
-      publishCancel(run, "coordinator shutdown");
+      publishCancel(run, reason);
     });
   }
 
@@ -927,7 +928,15 @@ export function registerCoordinator(
       // judgment gate. The durable part runs inside the `completing` latch
       // (so a duplicate completion cannot double-transition); the DISPATCH
       // deliberately does not — see the tail of this function.
-      if (msg.executionError) {
+      if (msg.decisionQuestion) {
+        await requestDecision(
+          run,
+          run.role === "planner" ? "planning" : "implementing",
+          msg,
+        );
+        if (state.active === run) state.active = null;
+        if (heldRuns().length === 0) stopHeartbeat();
+      } else if (msg.executionError) {
         await escalateRun(
           run,
           run.role === "planner" ? "planning" : "implementing",
@@ -1332,19 +1341,61 @@ export function registerCoordinator(
     return false;
   }
 
-  /**
-   * Escalate a run out of the gate: phase → `escalated` (CAS-guarded, any
-   * active phase — a coordinator-owned recovery edge like override and
-   * lease loss), audited with the reason and an immutable actor snapshot,
-   * lease released, and bd status → `blocked` so the issue leaves the ready
-   * pool. Recoverable via re-approve.
-   */
+  /** Park an explicit question without sending unfinished work for review. */
+  async function requestDecision(
+    run: CoordinatorRun,
+    phase: "planning" | "implementing" | "judging" | "revising" | "verifying",
+    completion: RunCompletedT,
+  ): Promise<void> {
+    const stopped =
+      !completion.workerPending ||
+      (run.supportsCancellation &&
+        (await cancelAndAwaitAck(
+          run,
+          deps.getConfig().acceptTimeoutMs,
+          "waiting for a human decision",
+        )));
+    // Cancellation can overlap a human halt or a reclaimed lease.
+    if (!(await fencedForJudgment(run, completion))) {
+      untrackLease(run.cwd, run.lease.issueId);
+      dropJudgedRun(run);
+      return;
+    }
+    const saved = await escalateRun(
+      run,
+      phase,
+      `Needs your decision: ${completion.decisionQuestion}`,
+      {
+        workgraph_decision_pending: "true",
+        workgraph_decision_id: completion.executionId,
+        workgraph_decision_question: completion.decisionQuestion!,
+        workgraph_decision_requested_at: new Date(nowFn()).toISOString(),
+        workgraph_workspace_run_id: run.workflowRunId,
+        workgraph_halt_unconfirmed: stopped ? "false" : "true",
+      },
+    );
+    if (!saved) return;
+    await recordLeaseEvent(
+      run.cwd,
+      "decision-needed",
+      run.lease.issueId,
+      {
+        workflowRunId: run.workflowRunId,
+        decisionId: completion.executionId,
+        question: completion.decisionQuestion,
+        workerStopped: stopped,
+      },
+      run.actor.bdActor,
+    );
+  }
+
+  /** Escalate with a guarded phase write, audit, lease release, and blocked status. */
   async function escalateRun(
     run: CoordinatorRun,
     expect: "planning" | "implementing" | "judging" | "revising" | "verifying",
     reason: string,
     fields: Record<string, string> = {},
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
       await escalate(run.cwd, run.lease.issueId, expect, {
         fields,
@@ -1354,7 +1405,7 @@ export function registerCoordinator(
       if (e instanceof LifecycleError) {
         logSkipOnce(e.message);
         await abandonJudgedRun(run);
-        return;
+        return false;
       }
       throw e;
     }
@@ -1386,7 +1437,7 @@ export function registerCoordinator(
     } catch (e) {
       if (!(e instanceof FencingError)) throw e;
       dropJudgedRun(run); // reclaimed mid-escalation: no longer ours to block
-      return;
+      return false;
     }
     await update(
       run.cwd,
@@ -1395,6 +1446,7 @@ export function registerCoordinator(
       run.actor.bdActor,
     );
     dropJudgedRun(run);
+    return true;
   }
 
   /**
@@ -1620,6 +1672,10 @@ export function registerCoordinator(
       },
       run.actor.bdActor,
     );
+    if (completion.decisionQuestion) {
+      await requestDecision(run, "revising", completion);
+      return "aborted";
+    }
     if (completion.executionError) {
       await escalateRun(
         run,
@@ -1817,6 +1873,10 @@ export function registerCoordinator(
     if (!(await fencedForJudgment(run, completion)) || box.closed) {
       untrackLease(run.cwd, run.lease.issueId);
       dropJudgedRun(run);
+      return false;
+    }
+    if (completion.decisionQuestion) {
+      await requestDecision(run, "verifying", completion);
       return false;
     }
     if (completion.outcome !== "success" || completion.executionError) {
@@ -2045,6 +2105,10 @@ export function registerCoordinator(
         return;
       }
 
+      if (completion.decisionQuestion) {
+        await requestDecision(run, "judging", completion);
+        return;
+      }
       if (completion.outcome !== "success" || completion.executionError) {
         await escalateRun(
           run,
@@ -2354,7 +2418,9 @@ export function registerCoordinator(
     const eligible = pool.filter((issue) => {
       if (
         issue.metadata?.workgraph_halted === true ||
-        issue.metadata?.workgraph_halted === "true"
+        issue.metadata?.workgraph_halted === "true" ||
+        issue.metadata?.workgraph_decision_pending === true ||
+        issue.metadata?.workgraph_decision_pending === "true"
       )
         return false;
       if (isLifecycleV1(issue)) return phaseOf(issue) === "ready";
@@ -2513,6 +2579,8 @@ export function registerCoordinator(
     if (
       outcome.issue.metadata?.workgraph_halted === true ||
       outcome.issue.metadata?.workgraph_halted === "true" ||
+      outcome.issue.metadata?.workgraph_decision_pending === true ||
+      outcome.issue.metadata?.workgraph_decision_pending === "true" ||
       (haltGenerations.get(candidate.id) ?? 0) !== haltGeneration
     ) {
       try {

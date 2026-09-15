@@ -46,6 +46,8 @@ export interface RoleScript {
   behavior?: FakeBehavior;
   outcome?: RunOutcomeT;
   executionError?: string;
+  decisionQuestion?: string;
+  workerPending?: boolean;
   evidence?: string[];
   /** Attached verbatim as the completion's extra `verdict` field (phase-3
    *  verdict transport: non-strict schemas tolerate it). */
@@ -185,6 +187,12 @@ export function installFakeExecutor(
       ],
       ...(script.executionError
         ? { executionError: script.executionError }
+        : {}),
+      ...(script.decisionQuestion
+        ? {
+            decisionQuestion: script.decisionQuestion,
+            workerPending: script.workerPending,
+          }
         : {}),
       provenance: overrides.provenance ??
         script.provenance ??
