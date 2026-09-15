@@ -16,6 +16,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { compact } from "@earendil-works/pi-coding-agent";
 import { heldLeases } from "./lease.ts";
+import { resolveConfig } from "./config.ts";
 
 /** The in-flight work the summary must retain. */
 export interface CurrentWork {
@@ -97,7 +98,7 @@ export function registerCompactionTakeover(
       const lease = heldLeases(cwd)[0];
       return lease ? { issueId: lease.issueId } : null;
     });
-
+  const config = resolveConfig(pi)
   pi.on("session_before_compact", async (event, ctx) => {
     try {
       const current = getCurrent(ctx.cwd);
@@ -117,7 +118,7 @@ export function registerCompactionTakeover(
         sendableHeaders(auth.headers),
         instructions,
         event.signal,
-        ctx.thinkingLevel,
+        config.reasoningLevel || ctx.thinkingLevel,
         undefined,
         auth.env,
       );
