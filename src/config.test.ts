@@ -27,4 +27,13 @@ describe("subagents routing config", () => {
       },
     });
   });
+  it("parses reasoning", () => {
+    const mock = makeMockPi();
+    mock.setFlag(
+      "workgraph-compaction-reasoning-level",
+      "low"
+    );
+
+    expect(resolveConfig(asExtensionAPI(mock)).reasoningLevel).toEqual("low");
+  });
 });
