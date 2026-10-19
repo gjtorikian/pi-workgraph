@@ -15,7 +15,7 @@ the world instead of *reading* it.
 
 ## The design
 
-One designated **sentinel issue** in the bd graph stands for the shared
+One designated **sentinel issue** in the work graph stands for the shared
 ref space. Whoever rewrites history claims it; a `pre-push` hook in every
 clone reads the lease and refuses pushes while it is live and held by
 someone else. The hook is a pure Convention-Version 1 **detector**: it
@@ -29,7 +29,7 @@ writes them.
 | live lease, holder is `$WORKGRAPH_WORKER_ID`| allowed (your own restack window)   |
 | live lease, anyone else                     | **blocked**, with holder + expiry   |
 | lease expired                               | allowed (expired = reclaimable)     |
-| unparseable expiry / bd unreachable         | **blocked** (fail closed)           |
+| unparseable expiry / store unreachable         | **blocked** (fail closed)           |
 
 A crashed restacker never wedges the repo: the lease TTL (default 5 min,
 renewed by heartbeat while the holder is alive) expires and pushes flow
@@ -41,7 +41,7 @@ Once per graph — create the sentinel (leave it **unapproved**: the
 coordinator never dispatches legacy issues, so it will never be "worked"):
 
 ```bash
-bd create "sentinel: git ref space (push guard)"
+# in a Pi session: workgraph_create { title: "sentinel: git ref space (push guard)" }
 ```
 
 Once per clone (worktrees share it):
@@ -51,12 +51,11 @@ node scripts/git-push-guard.mjs install --issue <sentinel-id>
 ```
 
 This copies the guard to the repo's hook path and sets
-`git config workgraph.stackIssue <sentinel-id>`. In bd repos — where
-`core.hooksPath` is `.beads/hooks` and bd manages its own `pre-push` —
-the existing hook is preserved as `pre-push.pre-workgraph` and chained:
-the guard runs first, and on allow executes the original with the same
-arguments and stdin, exiting with its status. (A bd upgrade that
-regenerates its hooks can overwrite the guard; re-run install.)
+`git config workgraph.stackIssue <sentinel-id>`. An existing `pre-push`
+hook is preserved as `pre-push.pre-workgraph` and chained: the guard runs
+first, and on allow executes the original with the same arguments and
+stdin, exiting with its status. (A hook manager that regenerates its hooks
+can overwrite the guard; re-run install.)
 
 ## The restack flow
 

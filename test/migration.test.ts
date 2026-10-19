@@ -15,7 +15,7 @@
  * Run via `npm run test:migration`.
  */
 import { describe, expect, it } from "vitest";
-import { bindExec, getExecLog, resetExecLog } from "../src/bd.ts";
+import { getOpLog, resetOpLog } from "../src/store.ts";
 import type { WorkgraphConfig } from "../src/config.ts";
 import {
   registerCoordinator,
@@ -73,7 +73,6 @@ interface Harness {
 
 function makeHarness(overrides: Partial<WorkgraphConfig> = {}): Harness {
   const mock = makeMockPi();
-  bindExec((command, args, options) => mock.exec(command, args, options));
   const config: WorkgraphConfig = { ...CONFIG, ...overrides };
   setWorkerIdOverride(WORKER);
   const warnings: string[] = [];
@@ -110,7 +109,6 @@ function withoutWorkgraphKeys(
 /** A tools-only mock (approve-path tests drive the real tool handler). */
 function makeToolsMock(): MockPi {
   const mock = makeMockPi();
-  bindExec((command, args, options) => mock.exec(command, args, options));
   registerWorkgraphTools(asExtensionAPI(mock));
   mock.setFlag("workgraph-worker-id", WORKER);
   setWorkerIdOverride(WORKER);
@@ -144,7 +142,7 @@ describe("legacy visibility and compat dispatch", () => {
     });
     const ectx = makeEventContext(graph.dir);
     try {
-      resetExecLog();
+      resetOpLog();
       await settle(mock, ectx.ctx);
       await settle(mock, ectx.ctx);
       await mock.flushEvents();
@@ -154,7 +152,7 @@ describe("legacy visibility and compat dispatch", () => {
       const shown = graph.showIssue(graph.seededIds[0]!);
       expect(shown.status).toBe("open");
       expect(lifecycleVersionOf(shown)).toBeUndefined();
-      expect(getExecLog().some((e) => e.args.includes("--claim"))).toBe(false);
+      expect(getOpLog().some((e) => (e.op === "claim" || e.op === "claimNext"))).toBe(false);
       expect(warnings).toHaveLength(0);
     } finally {
       fake.uninstall();
@@ -202,7 +200,7 @@ describe("legacy visibility and compat dispatch", () => {
     // no claim), so the second tick retraverses the same warn point.
     const ectx = makeEventContext(graph.dir);
     try {
-      resetExecLog();
+      resetOpLog();
       await settle(mock, ectx.ctx);
       await settle(mock, ectx.ctx);
       await mock.flushEvents();
@@ -216,7 +214,7 @@ describe("legacy visibility and compat dispatch", () => {
       expect(compatWarnings[0]).toContain("initializes lifecycle metadata");
       expect(coordinator.current()).toBeNull();
       expect(graph.showIssue(graph.seededIds[0]!).status).toBe("open");
-      expect(getExecLog().some((e) => e.args.includes("--claim"))).toBe(false);
+      expect(getOpLog().some((e) => (e.op === "claim" || e.op === "claimNext"))).toBe(false);
     } finally {
       await coordinator.teardown(ectx.ctx);
       graph.cleanup();
@@ -229,7 +227,7 @@ describe("legacy visibility and compat dispatch", () => {
     const id = graph.createIssue("legacy task");
     // Pre-existing metadata a legacy graph might carry: a foreign tooling key
     // and a released-lease epoch (epoch survives release — Convention §2.7).
-    graph.bd([
+    graph.op([
       "update",
       id,
       "--set-metadata",
@@ -251,7 +249,7 @@ describe("legacy visibility and compat dispatch", () => {
     });
     const ectx = makeEventContext(graph.dir);
     try {
-      resetExecLog();
+      resetOpLog();
       await settle(mock, ectx.ctx);
       await mock.flushEvents();
 
@@ -288,7 +286,7 @@ describe("legacy initialization via workgraph_approve", () => {
     const mock = makeToolsMock();
     try {
       const id = graph.createIssue("legacy with history");
-      graph.bd([
+      graph.op([
         "update",
         id,
         "--set-metadata",
@@ -363,7 +361,7 @@ describe("existing leases on legacy issues", () => {
    *  `in_progress` and invisible to the ready scan (tested separately). */
   function seedOpenLeasedLegacy(graph: ScratchGraph, expiresAt: string): string {
     const id = graph.createIssue("legacy leased artifact");
-    graph.bd([
+    graph.op([
       "update",
       id,
       "--set-metadata",
@@ -389,7 +387,7 @@ describe("existing leases on legacy issues", () => {
     });
     const ectx = makeEventContext(graph.dir);
     try {
-      resetExecLog();
+      resetOpLog();
       await settle(mock, ectx.ctx);
       await mock.flushEvents();
 
@@ -400,7 +398,7 @@ describe("existing leases on legacy issues", () => {
       // The foreign lease is untouched: holder and epoch retain their values.
       expect(leaseHolderOf(shown)).toBe("v01-worker");
       expect(leaseEpochOf(shown)).toBe(1);
-      expect(getExecLog().some((e) => e.args.includes("--claim"))).toBe(false);
+      expect(getOpLog().some((e) => (e.op === "claim" || e.op === "claimNext"))).toBe(false);
     } finally {
       fake.uninstall();
       await coordinator.teardown(ectx.ctx);
@@ -419,7 +417,7 @@ describe("existing leases on legacy issues", () => {
     });
     const ectx = makeEventContext(graph.dir);
     try {
-      resetExecLog();
+      resetOpLog();
       await settle(mock, ectx.ctx);
       await mock.flushEvents();
 
@@ -427,7 +425,7 @@ describe("existing leases on legacy issues", () => {
       const shown = graph.showIssue(id);
       expect(shown.status).toBe("open");
       expect(leaseHolderOf(shown)).toBe("v01-worker");
-      expect(getExecLog().some((e) => e.args.includes("--claim"))).toBe(false);
+      expect(getOpLog().some((e) => (e.op === "claim" || e.op === "claimNext"))).toBe(false);
     } finally {
       fake.uninstall();
       await coordinator.teardown(ectx.ctx);
@@ -439,8 +437,8 @@ describe("existing leases on legacy issues", () => {
     resetLeasesForTest();
     const graph = makeScratchGraph({ prefix: "migip" });
     const id = graph.createIssue("legacy in-flight work");
-    graph.bd(["update", id, "--claim", "--actor", "v01-worker"]);
-    graph.bd([
+    graph.op(["update", id, "--claim", "--actor", "v01-worker"]);
+    graph.op([
       "update",
       id,
       "--set-metadata",
@@ -459,7 +457,7 @@ describe("existing leases on legacy issues", () => {
     });
     const ectx = makeEventContext(graph.dir);
     try {
-      resetExecLog();
+      resetOpLog();
       await settle(mock, ectx.ctx);
       await mock.flushEvents();
 
@@ -468,7 +466,7 @@ describe("existing leases on legacy issues", () => {
       expect(shown.status).toBe("in_progress");
       expect(leaseHolderOf(shown)).toBe("v01-worker");
       expect(lifecycleVersionOf(shown)).toBeUndefined();
-      expect(getExecLog().some((e) => e.args.includes("--claim"))).toBe(false);
+      expect(getOpLog().some((e) => (e.op === "claim" || e.op === "claimNext"))).toBe(false);
     } finally {
       fake.uninstall();
       await coordinator.teardown(ectx.ctx);
@@ -489,14 +487,14 @@ describe("existing leases on legacy issues", () => {
     });
     const ectx = makeEventContext(graph.dir);
     try {
-      resetExecLog();
+      resetOpLog();
       await settle(mock, ectx.ctx);
       await settle(mock, ectx.ctx);
       await mock.flushEvents();
 
       expect(coordinator.current()).toBeNull();
       expect(graph.showIssue(id).status).toBe("open");
-      expect(getExecLog().some((e) => e.args.includes("--claim"))).toBe(false);
+      expect(getOpLog().some((e) => (e.op === "claim" || e.op === "claimNext"))).toBe(false);
       const leaseWarnings = warnings.filter((w) =>
         w.includes("unparseable lease_expires_at"),
       );
@@ -520,7 +518,7 @@ describe("existing leases on legacy issues", () => {
     });
     const ectx = makeEventContext(graph.dir);
     try {
-      resetExecLog();
+      resetOpLog();
       await settle(mock, ectx.ctx);
       await mock.flushEvents();
 

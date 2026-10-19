@@ -2,10 +2,13 @@
 /**
  * PI_WORKGRAPH_PUSH_GUARD — a git pre-push hook that turns "heads up, I'm
  * restacking — don't push" from an advisory broadcast into verified state,
- * using the pi-workgraph Lease Convention (Convention-Version 1) as a pure
- * DETECTOR: it reads the three lease metadata keys and never writes them.
+ * using the pi-workgraph Lease Convention (Convention-Version 2) as a pure
+ * DETECTOR: it reads the three lease metadata keys straight out of the
+ * workspace database (`.workgraph/workgraph.db` in the repo, or the central
+ * `~/.pi/agent/workgraph/<repo-key>/workgraph.db`; read-only) and never
+ * writes them.
  *
- * How it works: one designated "sentinel" bd issue stands for the shared
+ * How it works: one designated "sentinel" workgraph issue stands for the shared
  * git ref space (the stack). Whoever performs a history rewrite claims the
  * sentinel (`workgraph_claim` stamps holder/epoch/expiry and heartbeats);
  * this hook blocks every `git push` in any clone while that lease is live
@@ -14,7 +17,7 @@
  *
  * Decision table (convention §3/§4 semantics, fail-closed):
  *   no sentinel configured            -> allow (hook is inert)
- *   bd unreachable / issue missing    -> BLOCK (configured guard must not guess)
+ *   store unreachable / issue missing -> BLOCK (configured guard must not guess)
  *   no lease_expires_at on the issue  -> allow (never leased, or released)
  *   unparseable lease_expires_at      -> BLOCK (treated as leased, like the
  *                                        extension's own sweep)
@@ -29,11 +32,10 @@
  * Install (per clone; worktrees share it):
  *   node scripts/git-push-guard.mjs install --issue <sentinel-issue-id>
  *
- * CHAINING: bd repos set `core.hooksPath = .beads/hooks` and manage their
- * own pre-push there. Install preserves any existing hook as
- * `pre-push.pre-workgraph`; the guard runs first (a block never reaches
- * bd's hook) and on allow executes the preserved hook with the same
- * arguments and stdin, exiting with its status. A bd upgrade that
+ * CHAINING: install preserves any existing pre-push hook as
+ * `pre-push.pre-workgraph`; the guard runs first (a block never reaches the
+ * chained hook) and on allow executes the preserved hook with the same
+ * arguments and stdin, exiting with its status. A hook manager that
  * regenerates its hooks can overwrite the guard — re-run install.
  */
 import { execFileSync, spawnSync } from "node:child_process";
@@ -42,9 +44,14 @@ import {
   copyFileSync,
   existsSync,
   readFileSync,
+  realpathSync,
   renameSync,
+  statSync,
 } from "node:fs";
-import { join } from "node:path";
+import { createHash } from "node:crypto";
+import { homedir } from "node:os";
+import { basename, dirname, join, resolve, sep } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 
 const MARKER = "PI_WORKGRAPH_PUSH_GUARD";
@@ -55,6 +62,103 @@ function tryRun(cmd, args) {
     return execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * Locate the workspace (nearest ancestor of cwd holding
+ * `.workgraph/workgraph.db`) and read the sentinel's metadata, read-only.
+ * Returns undefined when the workspace or the issue cannot be found.
+ */
+/** Mirror of src/store.ts resolveRepoRoot: a worktree resolves to its main checkout. */
+function resolveRepoRoot(start) {
+  let current = resolve(start);
+  for (;;) {
+    const dotGit = join(current, ".git");
+    if (existsSync(dotGit)) {
+      try {
+        if (statSync(dotGit).isDirectory()) return current;
+        const match = /^gitdir:\s*(.+)$/m.exec(readFileSync(dotGit, "utf8"));
+        if (match) {
+          const gitDir = resolve(current, match[1].trim());
+          const marker = `${sep}.git${sep}worktrees${sep}`;
+          const at = gitDir.indexOf(marker);
+          if (at !== -1) return gitDir.slice(0, at);
+        }
+      } catch {
+        /* treat as the root */
+      }
+      return current;
+    }
+    const parent = dirname(current);
+    if (parent === current) return resolve(start);
+    current = parent;
+  }
+}
+
+/** Mirror of src/store.ts centralKey. */
+function centralKey(root) {
+  const name = basename(root).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "repo";
+  let canonical = resolve(root);
+  try {
+    canonical = realpathSync(canonical);
+  } catch {
+    /* hash the resolved path */
+  }
+  return `${name}-${createHash("sha256").update(canonical).digest("hex").slice(0, 12)}`;
+}
+
+/** The `workgraph.store` setting (project over global), if any. */
+function storeSetting(cwd) {
+  const agentDir = process.env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".pi", "agent");
+  for (const file of [join(cwd, ".pi", "settings.json"), join(agentDir, "settings.json")]) {
+    try {
+      const value = JSON.parse(readFileSync(file, "utf8"))?.workgraph?.store;
+      if (typeof value === "string" && value.trim()) return { store: value.trim(), agentDir };
+    } catch {
+      /* missing or unreadable: keep looking */
+    }
+  }
+  return { store: "repo", agentDir };
+}
+
+/** The database for the repository around cwd: in-repo first, then central. */
+function databasePath() {
+  const cwd = resolve(process.cwd());
+  let dir = cwd;
+  for (;;) {
+    const candidate = join(dir, ".workgraph", "workgraph.db");
+    if (existsSync(candidate)) return candidate;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  const { store, agentDir } = storeSetting(cwd);
+  const centralDir =
+    store === "repo" || store === "central"
+      ? join(agentDir, "workgraph")
+      : resolve(store.replace(/^~(?=$|\/)/, homedir()));
+  const central = join(centralDir, centralKey(resolveRepoRoot(cwd)), "workgraph.db");
+  return existsSync(central) ? central : undefined;
+}
+
+function readSentinelMetadata(issueId) {
+  const file = databasePath();
+  if (!file) return undefined;
+  let db;
+  try {
+    db = new DatabaseSync(file, { readOnly: true });
+    const row = db.prepare("SELECT metadata FROM issues WHERE id = ?").get(issueId);
+    if (!row) return undefined;
+    return JSON.parse(String(row.metadata ?? "{}"));
+  } catch {
+    return undefined;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      /* already closed */
+    }
   }
 }
 
@@ -80,7 +184,7 @@ function install(argv) {
     if (existsSync(chained)) {
       fail([
         `both ${target} and ${chained} exist and the former is not this guard.`,
-        "A hook manager (bd?) likely regenerated pre-push after a previous",
+        "A hook manager likely regenerated pre-push after a previous",
         "install. Resolve manually: keep ONE original at pre-push, delete the",
         "stale pre-push.pre-workgraph, then re-run install.",
       ]);
@@ -98,7 +202,7 @@ function install(argv) {
 
 /**
  * After the guard allows, hand control to the preserved pre-existing hook
- * (bd's managed pre-push in bd repos) with the same argv and inherited
+ * with the same argv and inherited
  * stdio — the guard never consumed stdin, so the ref-update lines git
  * feeds pre-push arrive intact.
  */
@@ -115,17 +219,15 @@ function guard() {
     tryRun("git", ["config", "--get", "workgraph.stackIssue"])?.trim();
   if (!issueId) return; // unconfigured -> inert
 
-  const shown = tryRun("bd", ["show", issueId, "--json"]);
-  const issue = shown === undefined ? undefined : JSON.parse(shown)[0];
-  if (!issue || issue.error) {
+  const meta = readSentinelMetadata(issueId);
+  if (meta === undefined) {
     fail([
-      `cannot verify sentinel issue ${issueId} (bd unreachable or issue missing).`,
+      `cannot verify sentinel issue ${issueId} (workspace unreachable or issue missing).`,
       "A configured guard does not guess: fix the sentinel or unset",
       "`git config workgraph.stackIssue` to disable. (Humans: git push --no-verify)",
     ]);
   }
 
-  const meta = issue.metadata ?? {};
   const expiresRaw = meta.lease_expires_at;
   if (expiresRaw === undefined || expiresRaw === "") return; // never leased / released
 
@@ -133,7 +235,7 @@ function guard() {
   if (Number.isNaN(expires)) {
     fail([
       `sentinel ${issueId} carries an unparseable lease_expires_at (${expiresRaw});`,
-      "treating it as leased (fail closed). Inspect it: bd show " + issueId,
+      "treating it as leased (fail closed). Inspect it: workgraph_status " + issueId,
     ]);
   }
   if (expires <= Date.now()) return; // expired = reclaimable, do not block
@@ -147,7 +249,7 @@ function guard() {
     `push blocked: the ref space is leased for a history rewrite.`,
     `sentinel: ${issueId}  holder: ${holder}`,
     `lease expires: ${new Date(expires).toISOString()} (~${seconds}s; renewed while the holder heartbeats)`,
-    "Wait and retry — do NOT assume the rewrite finished. Check: bd show " + issueId,
+    "Wait and retry — do NOT assume the rewrite finished. Check: workgraph_status " + issueId,
     "(Humans overriding deliberately: git push --no-verify)",
   ]);
 }

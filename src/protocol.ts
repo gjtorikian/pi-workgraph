@@ -183,6 +183,11 @@ export const RunRequest = Type.Object({
    * executor needs is the prompt-ready rendering.
    */
   plan: Type.Optional(Type.String()),
+  /**
+   * Human feedback from a rejected plan, attached to the NEXT planner run of
+   * the same issue (planner role only). Optional and v1-safe.
+   */
+  feedback: Type.Optional(Type.String()),
 });
 export type RunRequestT = Static<typeof RunRequest>;
 
@@ -242,7 +247,7 @@ export type RunProgressT = Static<typeof RunProgress>;
 
 /**
  * adapter → core: structured result, artifacts, evidence, provenance —
- * plus the full fencing triple the coordinator re-validates against Beads.
+ * plus the full fencing triple the coordinator re-validates against the store.
  */
 export const RunCompleted = Type.Object({
   ...envelopeProps,
@@ -334,7 +339,7 @@ export type RunStatusT = Static<typeof RunStatus>;
 
 /**
  * core → observers: canonical lifecycle changes for UI/presence (phase 5).
- * Emitted strictly POST-COMMIT (after the corresponding bd write resolved)
+ * Emitted strictly POST-COMMIT (after the corresponding store writes resolved)
  * from the coordinator's transition/escalation/close choke points; nothing
  * in-core subscribes. The optional fields are v1-safe additions for
  * presence/kanban overlays:

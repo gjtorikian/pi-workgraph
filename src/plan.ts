@@ -29,7 +29,7 @@
  * planner that could rewrite its own bar would defeat the judgment gate.
  */
 import { Value } from "typebox/value";
-import { addComment } from "./bd.ts";
+import { addComment, listComments } from "./store.ts";
 import type { PlanStepT, PlanT } from "./types.ts";
 import { Plan } from "./types.ts";
 
@@ -195,6 +195,7 @@ export async function recordPlan(
   const payload = {
     ...details,
     summary: planSummary(plan),
+    ...(plan.summary !== undefined ? { description: truncate(plan.summary, MAX_STEP_CHARS) } : {}),
     steps: capped.slice(0, MAX_STEPS),
     ...(folded > 0 ? { foldedSteps: folded } : {}),
     ...(plan.acceptanceCriteria !== undefined
@@ -216,4 +217,34 @@ export async function recordPlan(
     // Loud, but non-blocking — the lifecycle proceeds without the trail.
     console.error(`[pi-workgraph] PLAN WRITE FAILED (${issueId}): ${msg}`);
   }
+}
+
+/**
+ * The most recently recorded plan for an issue, rebuilt from the comment
+ * trail — what `workgraph_approve_plan` shows a human and what the claim
+ * path attaches to the implementation run once the plan is approved.
+ * Undefined when no parseable plan comment exists.
+ */
+export async function latestPlan(cwd: string, issueId: string): Promise<PlanT | undefined> {
+  const comments = await listComments(cwd, issueId);
+  const marker = `${PLAN_PREFIX} plan `;
+  for (let i = comments.length - 1; i >= 0; i--) {
+    const text = comments[i]!.text;
+    if (!text.startsWith(marker)) continue;
+    try {
+      const payload = JSON.parse(text.slice(marker.length)) as Record<string, unknown>;
+      const plan: PlanT = {
+        steps: Array.isArray(payload.steps) ? (payload.steps as PlanStepT[]) : [],
+        ...(typeof payload.description === "string" ? { summary: payload.description } : {}),
+        ...(typeof payload.acceptanceCriteria === "string"
+          ? { acceptanceCriteria: payload.acceptanceCriteria }
+          : {}),
+        ...(Array.isArray(payload.risks) ? { risks: payload.risks as string[] } : {}),
+      };
+      return Value.Check(Plan, plan) && plan.steps.length > 0 ? plan : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
 }

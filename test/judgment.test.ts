@@ -15,7 +15,7 @@
  * Run via `npm run test:judgment`.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { bindExec, listComments, getExecLog, resetExecLog } from "../src/bd.ts";
+import { listComments, getOpLog, resetOpLog } from "../src/store.ts";
 import type { WorkgraphConfig } from "../src/config.ts";
 import {
   registerCoordinator,
@@ -109,7 +109,6 @@ interface Harness {
 
 function makeHarness(overrides: Partial<WorkgraphConfig> = {}): Harness {
   const mock = makeMockPi();
-  bindExec((command, args, options) => mock.exec(command, args, options));
   const config: WorkgraphConfig = { ...CONFIG, ...overrides };
   setWorkerIdOverride(WORKER);
   const coordinator = registerCoordinator(asExtensionAPI(mock), {
@@ -155,7 +154,7 @@ function approve(
   ];
   if (opts.acceptance) args.push("--acceptance", opts.acceptance);
   args.push("--actor", "approver");
-  graph.bd(args);
+  graph.op(args);
 }
 
 async function auditCount(
@@ -186,7 +185,6 @@ afterEach(() => {
 describe("lifecycle transitions", () => {
   it("walks every legal edge, stamping lifecycle v1 lazily at the entry edges", async () => {
     const mock = makeMockPi();
-    bindExec((command, args, options) => mock.exec(command, args, options));
     const graph = makeScratchGraph({ prefix: "lcwalk" });
     try {
       // Legacy entry: <none> → ready stamps v1 (workgraph_approve's edge).
@@ -217,7 +215,7 @@ describe("lifecycle transitions", () => {
 
       // Companion fields ride the SAME write as the phase.
       const second = graph.createIssue("draft entry");
-      graph.bd(["update", second, "--set-metadata", "workgraph_phase=draft"]);
+      graph.op(["update", second, "--set-metadata", "workgraph_phase=draft"]);
       await transition(graph.dir, second, "draft", "ready", {
         fields: { workgraph_risk_tier: "high" },
       });
@@ -232,11 +230,10 @@ describe("lifecycle transitions", () => {
 
   it("throws LifecycleError on every illegal edge", async () => {
     const mock = makeMockPi();
-    bindExec((command, args, options) => mock.exec(command, args, options));
     const graph = makeScratchGraph({ prefix: "lcbad" });
     try {
       const id = graph.createIssue("illegal edges");
-      graph.bd([
+      graph.op([
         "update",
         id,
         "--set-metadata",
@@ -249,12 +246,12 @@ describe("lifecycle transitions", () => {
         transition(graph.dir, id, "implementing", "accepted"),
       ).rejects.toThrow(LifecycleError);
       // judging → accepted skips verification.
-      graph.bd(["update", id, "--set-metadata", "workgraph_phase=judging"]);
+      graph.op(["update", id, "--set-metadata", "workgraph_phase=judging"]);
       await expect(
         transition(graph.dir, id, "judging", "accepted"),
       ).rejects.toThrow(LifecycleError);
       // accepted is terminal as a phase (close is a status change).
-      graph.bd(["update", id, "--set-metadata", "workgraph_phase=accepted"]);
+      graph.op(["update", id, "--set-metadata", "workgraph_phase=accepted"]);
       await expect(
         transition(graph.dir, id, "accepted", "ready"),
       ).rejects.toThrow(LifecycleError);
@@ -273,11 +270,10 @@ describe("lifecycle transitions", () => {
 
   it("loses the compare-and-set race: a stale expect throws and writes nothing", async () => {
     const mock = makeMockPi();
-    bindExec((command, args, options) => mock.exec(command, args, options));
     const graph = makeScratchGraph({ prefix: "lccas" });
     try {
       const id = graph.createIssue("raced transition");
-      graph.bd([
+      graph.op([
         "update",
         id,
         "--set-metadata",
@@ -298,11 +294,10 @@ describe("lifecycle transitions", () => {
 
   it("escalate() is guarded to active phases with the same CAS discipline", async () => {
     const mock = makeMockPi();
-    bindExec((command, args, options) => mock.exec(command, args, options));
     const graph = makeScratchGraph({ prefix: "lcesc" });
     try {
       const id = graph.createIssue("escalation");
-      graph.bd([
+      graph.op([
         "update",
         id,
         "--set-metadata",
@@ -795,7 +790,7 @@ describe("approved-only claiming", () => {
     });
     const ectx = makeEventContext(graph.dir);
     try {
-      resetExecLog();
+      resetOpLog();
       await settle(mock, ectx.ctx);
       await mock.flushEvents();
 
@@ -804,9 +799,9 @@ describe("approved-only claiming", () => {
       const shown = graph.showIssue(graph.seededIds[0]!);
       expect(shown.status).toBe("open");
       expect(shown.assignee ?? "").toBe("");
-      const log = getExecLog();
-      expect(log.some((e) => e.args.includes("--claim"))).toBe(false);
-      expect(log.some((e) => e.args[0] === "ready")).toBe(true);
+      const log = getOpLog();
+      expect(log.some((e) => (e.op === "claim" || e.op === "claimNext"))).toBe(false);
+      expect(log.some((e) => e.op === "ready")).toBe(true);
     } finally {
       fake.uninstall();
       await coordinator.teardown(ectx.ctx);
@@ -828,7 +823,7 @@ describe("approved-only claiming", () => {
     });
     const ectx = makeEventContext(graph.dir);
     try {
-      resetExecLog();
+      resetOpLog();
       await settle(mock, ectx.ctx);
       await mock.flushEvents();
 
@@ -841,12 +836,12 @@ describe("approved-only claiming", () => {
       expect(graph.showIssue(graph.seededIds[0]!).status).toBe("open");
 
       // Claim-by-id: atomic `update <id> --claim`, zero bare assignee writes.
-      const log = getExecLog();
-      const claims = log.filter((e) => e.args.includes("--claim"));
+      const log = getOpLog();
+      const claims = log.filter((e) => (e.op === "claim" || e.op === "claimNext"));
       expect(claims).toHaveLength(1);
-      expect(claims[0]!.args[0]).toBe("update");
-      expect(claims[0]!.args[1]).toBe(approved);
-      expect(log.some((e) => e.args.includes("--assignee"))).toBe(false);
+      expect(claims[0]!.op).toBe("claim");
+      expect(claims[0]!.issueId).toBe(approved);
+      expect(log.some((e) => e.op === "overwriteAssignee")).toBe(false);
 
       // Parked in judging with the lease heartbeat-held until shutdown.
       expect(heldLeases(graph.dir)).toHaveLength(1);

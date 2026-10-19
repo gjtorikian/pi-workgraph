@@ -1,7 +1,7 @@
 {
   "name": "pi-workgraph",
   "version": "0.3.1",
-  "description": "Pi extension exposing the beads (bd) work graph as typed tools for coordinated agent workers",
+  "description": "Pi extension: a durable work graph (built-in SQLite, nothing to install) with leases, a plan-approval gate, model tiers, and pluggable executors for coordinated agent workers",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -13,7 +13,7 @@
     "url": "https://github.com/gjtorikian/pi-workgraph/issues"
   },
   "engines": {
-    "node": ">= 22"
+    "node": ">= 22.13"
   },
   "pi": {
     "extensions": [
@@ -38,8 +38,7 @@
     "pi",
     "pi-extension",
     "pi-package",
-    "beads",
-    "bd",
+    "sqlite",
     "workgraph",
     "work-graph",
     "lease",

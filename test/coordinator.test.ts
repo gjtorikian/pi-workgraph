@@ -19,7 +19,7 @@ import {
   IN_SESSION_EXECUTOR_ID,
   type InSessionController,
 } from "../src/adapters/in-session.ts";
-import { bindExec, getExecLog, listComments, resetExecLog } from "../src/bd.ts";
+import { getOpLog, listComments, resetOpLog } from "../src/store.ts";
 import type { WorkgraphConfig } from "../src/config.ts";
 import {
   registerCoordinator,
@@ -106,7 +106,6 @@ interface Harness {
 
 function makeHarness(overrides: Partial<WorkgraphConfig> = {}): Harness {
   const mock = makeMockPi();
-  bindExec((command, args, options) => mock.exec(command, args, options));
   const config: WorkgraphConfig = { ...CONFIG, ...overrides };
   setWorkerIdOverride(WORKER);
   const coordinator = registerCoordinator(asExtensionAPI(mock), {
@@ -362,7 +361,7 @@ describe("coordinator: no executor, no claim", () => {
     const { mock, coordinator } = makeHarness();
     const ectx = makeEventContext(graph.dir);
     try {
-      resetExecLog();
+      resetOpLog();
       await settle(mock, ectx.ctx);
       await mock.flushEvents();
 
@@ -373,9 +372,9 @@ describe("coordinator: no executor, no claim", () => {
       expect(shown.assignee ?? "").toBe("");
       // The discriminating assertion: the tick probed the pool but NEVER
       // reached bd's claim path.
-      const log = getExecLog();
-      expect(log.some((e) => e.args.includes("--claim"))).toBe(false);
-      expect(log.some((e) => e.args[0] === "ready")).toBe(true);
+      const log = getOpLog();
+      expect(log.some((e) => (e.op === "claim" || e.op === "claimNext"))).toBe(false);
+      expect(log.some((e) => e.op === "ready")).toBe(true);
     } finally {
       await coordinator.teardown(ectx.ctx);
       graph.cleanup();
@@ -390,14 +389,14 @@ describe("coordinator: no executor, no claim", () => {
     const fake = installFakeExecutor(mock.events, { executorId: "exec-other" });
     const ectx = makeEventContext(graph.dir);
     try {
-      resetExecLog();
+      resetOpLog();
       await settle(mock, ectx.ctx);
       await mock.flushEvents();
 
       expect(coordinator.current()).toBeNull();
       expect(heldLeases(graph.dir)).toHaveLength(0);
       expect(graph.showIssue(graph.seededIds[0]!).status).toBe("open");
-      expect(getExecLog().some((e) => e.args.includes("--claim"))).toBe(false);
+      expect(getOpLog().some((e) => (e.op === "claim" || e.op === "claimNext"))).toBe(false);
     } finally {
       fake.uninstall();
       await coordinator.teardown(ectx.ctx);
@@ -418,7 +417,7 @@ describe("coordinator: drain through the fake executor", () => {
     const fake = installFakeExecutor(mock.events, { behavior: "accept-complete" });
     const ectx = makeEventContext(graph.dir);
     try {
-      resetExecLog();
+      resetOpLog();
       for (let round = 0; round < 5; round++) {
         await settle(mock, ectx.ctx);
         await mock.flushEvents();
@@ -454,13 +453,13 @@ describe("coordinator: drain through the fake executor", () => {
       // claim went through bd's atomic claim-by-id (`update <id> --claim` —
       // phase 3's approved-only filter needs metadata `ready --claim`
       // cannot see); zero bare assignee writes.
-      const log = getExecLog();
-      const claims = log.filter((entry) => entry.args.includes("--claim"));
+      const log = getOpLog();
+      const claims = log.filter((entry) => (entry.op === "claim" || entry.op === "claimNext"));
       expect(claims).toHaveLength(5);
       for (const claim of claims) {
-        expect(claim.args[0]).toBe("update");
+        expect(claim.op).toBe("claim");
       }
-      expect(log.some((entry) => entry.args.includes("--assignee"))).toBe(false);
+      expect(log.some((entry) => entry.op === "overwriteAssignee")).toBe(false);
 
       // Shutdown releases the parked leases (in-session semantics).
       await coordinator.teardown(ectx.ctx);
@@ -606,7 +605,7 @@ describe("coordinator: fenced and idempotent completion", () => {
 
       // Forced takeover while the executor "works": epoch bump + holder
       // overwrite, exactly what a sweep reclaim does to an expired lease.
-      graph.bd([
+      graph.op([
         "update",
         id,
         "--assignee",
@@ -658,7 +657,7 @@ describe("coordinator: activity events", () => {
     const id = graph.seededIds[0]!;
     // Approve (workgraph_approve's writes): the activity trail covers the
     // approved-only path end to end.
-    graph.bd([
+    graph.op([
       "update",
       id,
       "--set-metadata",
@@ -736,7 +735,7 @@ describe("coordinator: activity events", () => {
       const heldEpoch = leaseEpochOf(graph.showIssue(id));
 
       // Forced takeover while the executor "works" (the sweep-reclaim shape).
-      graph.bd([
+      graph.op([
         "update",
         id,
         "--assignee",
@@ -811,7 +810,7 @@ describe("in-session adapter (standalone)", () => {
       inReplyTo: discover.messageId,
       executorId: IN_SESSION_EXECUTOR_ID,
       isolation: "none",
-      roles: ["implementer"],
+      roles: ["planner", "implementer"],
       supportsCancellation: true,
     });
 
@@ -955,7 +954,6 @@ describe("in-session integration", () => {
     resetLeasesForTest();
     const graph = makeScratchGraph({ prefix: "coordis", seed: 2 });
     const mock = makeMockPi();
-    bindExec((command, args, options) => mock.exec(command, args, options));
     setWorkerIdOverride(WORKER);
     const config: WorkgraphConfig = { ...CONFIG, compatInSessionExecutor: true };
     // Registration order matters and mirrors index.ts: the ADAPTER first,
@@ -967,7 +965,7 @@ describe("in-session integration", () => {
     });
     const ectx = makeEventContext(graph.dir);
     try {
-      resetExecLog();
+      resetOpLog();
       // Each issue takes two settles: claim+wake, then settle→completion.
       for (let round = 0; round < 4; round++) {
         await settle(mock, ectx.ctx);
@@ -993,10 +991,10 @@ describe("in-session integration", () => {
 
       // Claims still go through bd's atomic claim path, exclusively —
       // claim-by-id since phase 3 (`update <id> --claim`).
-      const claims = getExecLog().filter((e) => e.args.includes("--claim"));
+      const claims = getOpLog().filter((e) => (e.op === "claim" || e.op === "claimNext"));
       expect(claims).toHaveLength(2);
       for (const claim of claims) {
-        expect(claim.args[0]).toBe("update");
+        expect(claim.op).toBe("claim");
       }
     } finally {
       await coordinator.teardown(ectx.ctx);
@@ -1013,7 +1011,6 @@ describe("in-session integration", () => {
     resetLeasesForTest();
     const graph = makeScratchGraph({ prefix: "coordtd", seed: 1 });
     const mock = makeMockPi();
-    bindExec((command, args, options) => mock.exec(command, args, options));
     setWorkerIdOverride(WORKER);
     const config: WorkgraphConfig = { ...CONFIG, compatInSessionExecutor: true };
     registerInSessionExecutor(asExtensionAPI(mock), { getConfig: () => config });
@@ -1058,7 +1055,7 @@ it("honors a human halt, ignores late completion, and dispatches the next issue"
     const current = coordinator.current()!;
     expect(current.issue.id).toBe(id);
     const epoch = current.lease.epoch + 1;
-    graph.bd([
+    graph.op([
       "update",
       id,
       "--status",
@@ -1089,9 +1086,9 @@ it("honors a human halt, ignores late completion, and dispatches the next issue"
     await mock.flushEvents();
     expect(metadataOf(graph, id).workgraph_phase).toBe("draft");
     // Even a stale lifecycle write cannot make a halted issue dispatchable.
-    graph.bd(["update", id, "--set-metadata", "workgraph_phase=ready"]);
+    graph.op(["update", id, "--set-metadata", "workgraph_phase=ready"]);
     const next = graph.createIssue("Unrelated next task");
-    graph.bd([
+    graph.op([
       "update",
       next,
       "--set-metadata",

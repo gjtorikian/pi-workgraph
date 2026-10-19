@@ -7,6 +7,14 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { PolicyOverrides } from "./policy.ts";
 import type { WorkflowClassT } from "./types.ts";
+import {
+  parseExecutorPins,
+  settingsExecutors,
+  settingsPlanApproval,
+  settingsStore,
+  settingsSubagentsExecutor,
+} from "./settings.ts";
+import { parseTiersValue, type TierConfig } from "./tiers.ts";
 
 export type SubagentsRoleRoutes = Partial<
   Record<
@@ -77,6 +85,19 @@ export interface WorkgraphConfig {
   compatInSessionExecutor: boolean;
   /** Explicit executor selection; wins over filters, errors when absent. */
   executorId?: string;
+  /**
+   * Per-role executor pins (`{ planner: "in-session", implementer:
+   * "pi-subagents" }`): the named executor must offer that role or the
+   * selection errors with no claim, exactly like `executorId`, which they
+   * override role by role. From the flag/env, else Pi settings.
+   */
+  executorByRole?: Record<string, string>;
+  /**
+   * Where databases live: `repo` (default: `.workgraph/` in the checkout),
+   * `central` (`~/.pi/agent/workgraph/<repo-key>/`), or an absolute
+   * directory. Applied to the store at session_start.
+   */
+  store?: string;
   /** Optional worker identity override; wins over the derived id. */
   workerIdOverride?: string;
   /**
@@ -107,6 +128,17 @@ export interface WorkgraphConfig {
    * passes the version gate.
    */
   subagentsExecutor?: SubagentsExecutorConfig;
+  /**
+   * Whether a recorded plan waits for a human (`required`, the default) or
+   * flows straight into implementation (`auto`). Applies to `planned` work.
+   */
+  planApproval?: "required" | "auto";
+  /**
+   * Role → model routing consulted by executor adapters (a JSON table; the
+   * usual home is Pi settings). Resolved against the model registry at
+   * session start; see src/tiers.ts.
+   */
+  tiers?: TierConfig;
 }
 
 export const DEFAULT_LEASE_TTL_MS = 300_000;
@@ -174,6 +206,26 @@ const FLAGS = [
     name: "workgraph-finalization",
     description:
       "Optional post-verification task as JSON with instructions and timeoutMs (env WORKGRAPH_FINALIZATION)",
+  },
+  {
+    name: "workgraph-plan-approval",
+    description:
+      "Plan gate for planned work: required (default — a human approves each plan with workgraph_approve_plan) or auto (env WORKGRAPH_PLAN_APPROVAL)",
+  },
+  {
+    name: "workgraph-executors",
+    description:
+      'Per-role executor pins as JSON, e.g. {"planner":"in-session","implementer":"pi-subagents"} (headless override of Pi settings; env WORKGRAPH_EXECUTORS)',
+  },
+  {
+    name: "workgraph-store",
+    description:
+      "Where workgraph databases live: repo (default, .workgraph/ in the checkout), central (~/.pi/agent/workgraph), or an absolute directory (headless override of Pi settings; env WORKGRAPH_STORE)",
+  },
+  {
+    name: "workgraph-tiers",
+    description:
+      'Role → model routing for executors (headless override of Pi settings), JSON like {"planner":"anthropic/claude-opus-*","implementer":{"model":"anthropic/claude-sonnet-*","thinking":"low"}} (env WORKGRAPH_TIERS)',
   },
 ] as const;
 
@@ -245,7 +297,7 @@ function subagentsValue(
   flag: string,
   envVar: string,
 ): SubagentsExecutorConfig | undefined {
-  const raw = stringValue(pi, flag, envVar);
+  const raw = stringValue(pi, flag, envVar) ?? settingsSubagentsExecutor();
   if (raw === undefined) return undefined;
   const lowered = raw.toLowerCase();
   // Boolean-ish shorthand: enable with the default version range.
@@ -475,5 +527,39 @@ export function resolveConfig(pi: ExtensionAPI): WorkgraphConfig {
       "workgraph-subagents-executor",
       "WORKGRAPH_SUBAGENTS_EXECUTOR",
     ),
+    planApproval: planApprovalValue(pi),
+    tiers: tiersValue(pi),
+    executorByRole: executorsValue(pi),
+    store: stringValue(pi, "workgraph-store", "WORKGRAPH_STORE") ?? settingsStore(),
   };
+}
+
+function planApprovalValue(pi: ExtensionAPI): WorkgraphConfig["planApproval"] {
+  const raw = stringValue(pi, "workgraph-plan-approval", "WORKGRAPH_PLAN_APPROVAL");
+  if (raw === undefined) return settingsPlanApproval() ?? "required";
+  const lowered = raw.toLowerCase();
+  if (lowered === "auto" || lowered === "off" || lowered === "false") return "auto";
+  if (lowered === "required" || lowered === "true" || lowered === "on") return "required";
+  console.error(
+    `[pi-workgraph] ignoring workgraph-plan-approval value "${raw}" (expected required or auto)`,
+  );
+  return "required";
+}
+
+function tiersValue(pi: ExtensionAPI): TierConfig | undefined {
+  const raw = stringValue(pi, "workgraph-tiers", "WORKGRAPH_TIERS");
+  return raw === undefined ? undefined : parseTiersValue(raw);
+}
+
+function executorsValue(pi: ExtensionAPI): Record<string, string> | undefined {
+  const raw = stringValue(pi, "workgraph-executors", "WORKGRAPH_EXECUTORS");
+  if (raw === undefined) return settingsExecutors();
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    return parseExecutorPins(parsed as Record<string, unknown>);
+  } catch {
+    console.error("[pi-workgraph] ignoring unparseable workgraph-executors/WORKGRAPH_EXECUTORS value (not JSON)");
+    return undefined;
+  }
 }

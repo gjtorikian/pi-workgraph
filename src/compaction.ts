@@ -60,7 +60,7 @@ export function buildCompactionInstructions(
     ? `${current.issueId} ("${current.title}")`
     : current.issueId;
   parts.push(
-    "This session is an agent worker driving a beads work-graph issue. The summary MUST retain:",
+    "This session is an agent worker driving a workgraph issue. The summary MUST retain:",
     `- The in-flight issue: ${issueLabel} — keep its id and title verbatim.`,
   );
   // Run references (phase 4): the workflow-run id and phase are what

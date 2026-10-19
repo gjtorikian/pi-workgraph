@@ -1,20 +1,20 @@
 # pi-workgraph
 
-A [Pi](https://github.com/earendil-works/pi) extension that turns the
-[beads](https://github.com/gastownhall/beads) (`bd`) work graph into a
-durable, harness-neutral work **control plane**: typed tools for agents,
-expiring leases with fencing, an approval-gated lifecycle with an
-independent judgment gate, and a coordinator that delegates execution to
-pluggable executor adapters over versioned protocol envelopes.
+A [Pi](https://github.com/earendil-works/pi) extension that gives agents a
+durable, harness-neutral work **control plane**: a dependency-aware work
+graph in a per-repository SQLite database (Node's built-in `node:sqlite` —
+nothing to install, nothing to check in), typed tools for agents, expiring
+leases with fencing, an approval-gated lifecycle with a **human plan gate**
+and an independent judgment gate, **model tiers** that route each role to
+the right model, and a coordinator that delegates execution to pluggable
+executor adapters over versioned protocol envelopes.
 
-bd gives agents a dependency-aware work graph with race-safe atomic claims,
-but a claim never expires: a session that crashes or gets SIGKILL'd mid-task
-leaves its issue assigned forever, invisible to every other worker.
-pi-workgraph adds a TTL + fencing lease layer on top of bd's primitives, a
-durable, per-issue lifecycle (one-shot, reviewed, or planned) stored in
-namespaced issue metadata, a coordinator that discovers executors and
-supervises runs end to end, and per-turn context injection so the graph
-survives conversation compaction.
+The shape of a run: **a strong model plans, you approve the plan, a fast
+model builds, an independent model reviews** — which model plays which
+role is a table you declare once in your Pi settings.
+Which executor performs each step — the chat session itself, a
+pi-subagents worker in its own worktree, or your own adapter — is swappable
+without touching the control plane.
 
 ## The three roles
 
@@ -24,12 +24,12 @@ sessions, harnesses, and machines. Everything else is delegated:
 ```text
 ┌───────────────────────────┐    workgraph:v1:* envelopes    ┌───────────────────────────┐
 │ WORK AUTHORITY            │ ─────────────────────────────► │ EXECUTION                 │
-│ pi-workgraph + beads      │   discover / offer / request   │ executor adapters:        │
-│ issues & dependencies,    │ ◄───────────────────────────── │ · in-session (compat,     │
-│ atomic claims, expiring   │    accept / complete / status  │   default)                │
+│ pi-workgraph + its store  │   discover / offer / request   │ executor adapters:        │
+│ issues & dependencies,    │ ◄───────────────────────────── │ · in-session (plans and   │
+│ atomic claims, expiring   │    accept / complete / status  │   implements in the chat) │
 │ leases + fencing, the     │                                │ · pi-subagents bridge     │
-│ approval → judgment       │                                │   (opt-in)                │
-│ lifecycle, audit trail    │                                │ · your adapter            │
+│ plan gate, the approval → │                                │   (opt-in, worktrees)     │
+│ judgment lifecycle, audit │                                │ · your adapter            │
 └───────────┬───────────────┘                                └───────────────────────────┘
             │ post-commit activity events + audit comments
             ▼
@@ -42,14 +42,15 @@ sessions, harnesses, and machines. Everything else is delegated:
 └───────────────────────────┘
 ```
 
-- **Work authority** — this package plus bd: what the work is, who may
-  touch it, and what state it is in. The core never executes model work
-  itself.
+- **Work authority** — this package and its store: what the work is, who
+  may touch it, and what state it is in. The core never executes model
+  work itself and never routes models; it selects executors by role.
 - **Execution** — adapters that answer discovery and run planning,
   implementation, review, revision, and verification requests. The
   in-session adapter (the local "wake this agent" behavior exposed through
-  the executor protocol) ships enabled;
-  the [pi-subagents bridge](#6-optional-executor-the-pi-subagents-bridge)
+  the executor protocol) ships enabled and offers the planner and
+  implementer roles; the
+  [pi-subagents bridge](#6-optional-executor-the-pi-subagents-bridge)
   ships disabled.
 - **Communication** — observers of the audit trail and
   `workgraph:v1:activity` events, and remote transports via the
@@ -59,8 +60,8 @@ sessions, harnesses, and machines. Everything else is delegated:
 ## Requirements
 
 - [Pi](https://github.com/earendil-works/pi) ≥ 0.83
-- [beads](https://github.com/gastownhall/beads) (`bd`) ≥ 1.1.2 on your `PATH`
-- Node ≥ 22 (Pi loads the TypeScript source directly; no build step)
+- Node ≥ 22.13 (the store is `node:sqlite`; Pi loads the TypeScript source
+  directly — no build step, no native dependency)
 
 ## Install
 
@@ -71,40 +72,44 @@ pi install npm:pi-workgraph
 ## Quickstart
 
 ```bash
-# 1. Initialize a work graph in your project
-bd init
-
-# 2. Seed one issue
-bd create "implement retry backoff"
-
-# 3. Start Pi
 pi
 ```
 
-A freshly created issue is **not yet approved** — the coordinator only
-dispatches approved work. Approve it (ask the agent, or do it yourself in a
-Pi session):
-
 ```text
-> approve bdx-001 with acceptance criteria "retries back off exponentially,
-  covered by tests"
+> set up workgraph for this feature: retry backoff on the API client, with
+  exponential backoff covered by tests
 ```
 
-The agent calls `workgraph_approve`, which records the acceptance criteria,
-stamps an independent workflow class and risk tier, and moves the issue to
-phase `ready`. On the next idle tick the coordinator discovers an executor
-(the in-session compatibility executor, unless you disabled it), claims the
-issue under a workflow-run lease, and delegates the selected workflow.
-`reviewed` is the default: an independent reviewer checks the acceptance
-criteria, bounded revision rounds fix findings, and only policy-approved
-judgment closes the issue.
-
-Choose workflow depth at approval time:
+No flags, no model names in the prompt: the roster comes from your Pi
+settings (see [Model tiers](#model-tiers)). The agent calls `workgraph_init`
+(creates `.workgraph/workgraph.db` with its own `.gitignore`) and `workgraph_create`
+with `approve: true` and `workflowClass: "planned"`, which stamps lifecycle
+metadata, a risk tier, and the workflow class, and puts the issue in phase
+`ready`. On the next
+idle tick the coordinator discovers an executor that offers the planner
+role, claims the issue under a workflow-run lease, and asks for a plan.
 
 ```text
-> approve bdx-001 as oneshot, risk low, with acceptance criteria "..."
-> approve bdx-002 as reviewed, risk medium, with acceptance criteria "..."
-> approve bdx-003 as planned, risk high, with acceptance criteria "..."
+> show the plan for bdx-001          → workgraph_status renders the steps
+> approve the plan                   → workgraph_approve_plan
+> reject it: add jitter and tests    → workgraph_approve_plan (reject)
+```
+
+A recorded plan parks the issue in phase **`plan_review`** with its lease
+released; every turn's context lists "Plans awaiting your review". Approve
+it and the next tick claims the issue for an **implementer** with the plan
+attached (a different executor if one offers the role — that is where
+subagents come in). Reject it with feedback and the next tick plans again,
+feedback attached. After implementation an independent reviewer checks the
+acceptance criteria, bounded revision rounds fix findings, and only
+policy-approved judgment closes the issue.
+
+Choose workflow depth at creation (or approval) time:
+
+```text
+> create "..." as oneshot, risk low, with acceptance criteria "..."
+> create "..." as reviewed, risk medium, with acceptance criteria "..."
+> create "..." as planned, risk high, with acceptance criteria "..."
 ```
 
 `workflowClass` and `riskTier` are separate axes. Workflow class selects
@@ -123,23 +128,185 @@ else:
 pi --workgraph-dispatch=false
 ```
 
+## Plan, approve, build
+
+`planned` work runs through the human gate by default
+(`--workgraph-plan-approval required`):
+
+```text
+ready ──claim (planner)──► planning ──plan recorded──► plan_review
+                                                          │ lease released
+          workgraph_approve_plan approve ◄────────────────┤
+          ready (plan approved) ──claim (implementer, plan attached)──► implementing → judging → …
+          workgraph_approve_plan reject + feedback ◄──────┘
+          ready ──claim (planner, feedback attached)──► planning → plan_review …
+```
+
+- The planner is whichever executor offers the role. In-session, the
+  planning turn reads the repository and submits its plan through the
+  `workgraph_submit_plan` tool (a turn that ends without one is a failure
+  and escalates — never a silent unplanned implementation). The
+  pi-subagents bridge plans in a child with structured output.
+- The plan is **evidence, not authority**: the full plan lives in the
+  `workgraph-plan` comment trail, the compact summary in
+  `workgraph_plan_summary`, and the implementer receives the rendered
+  steps. A planner's refined acceptance criteria never overwrite the
+  approved ones.
+- Approval is a metadata flag (`workgraph_plan_approved`) the claim path
+  honors; re-approving an escalated issue clears it, so escalated planned
+  work plans afresh. Rejection stores `workgraph_plan_feedback`, which the
+  next planner request carries and the next recorded plan consumes.
+- `--workgraph-plan-approval auto` restores the straight-through planner →
+  implementer flow.
+
+## Model tiers
+
+One table routes roles to models, for every executor at once. Declare it
+once in Pi's settings and it applies to every session, no flags and no
+prompting:
+
+```jsonc
+// ~/.pi/agent/settings.json (every repository) or .pi/settings.json (one repository)
+{
+  "workgraph": {
+    "tiers": {
+      "planner":     { "model": "anthropic/claude-opus-*",   "thinking": "high" },
+      "implementer": { "model": "anthropic/claude-sonnet-*", "thinking": "medium" },
+      "reviewer":    { "model": "anthropic/claude-opus-*",   "thinking": "high" },
+      "revision":    { "model": "anthropic/claude-sonnet-*", "thinking": "medium" },
+      "scout":       { "model": "anthropic/claude-haiku-*",  "thinking": "low" }
+    },
+    "planApproval": "required"
+  }
+}
+```
+
+There are no built-in presets: the table is yours. A bare `"provider/id"`
+string is allowed, but an unset `thinking` is not "off" — it **inherits**:
+in session, the current thinking level (your global default, if you set
+one); in pi-subagents, the launched profile's default. Set it explicitly
+for any role you care about.
+Roles: `planner`, `implementer`, `reviewer`, `revision`, `verifier`,
+`finalizer`, and `scout` (reserved for the read-only research helper; it
+can be named now and is dispatched once that role lands).
+
+From inside a session, `workgraph_tiers` sets or shows the table for the
+current repository (stored in its workspace), and `/workgraph tiers
+[json|off]` is the slash form. Precedence, most explicit first:
+
+1. `--workgraph-tiers` flag or `WORKGRAPH_TIERS` env (headless/CI overrides)
+2. `.pi/settings.json` in the repository
+3. what `workgraph_tiers` stored in the repository's workspace
+4. `~/.pi/agent/settings.json`
+
+`planApproval` follows the same files (flag/env > project > global).
+
+## Where the store lives
+
+By default each repository keeps its graph in `.workgraph/workgraph.db`
+inside the checkout — found by walking up from the session's cwd like git
+finds `.git`, and gitignored by its own `.gitignore`. If you would rather
+have nothing in the checkout at all:
+
+```jsonc
+{ "workgraph": { "store": "central" } }      // ~/.pi/agent/workgraph/<repo-key>/workgraph.db
+{ "workgraph": { "store": "~/work-graphs" } } // the same layout under a directory you choose
+```
+
+`<repo-key>` is the checkout's basename plus a short hash of its absolute
+path (a `repo` file beside the database names it). The key is the **main**
+checkout: a git worktree resolves through its `.git` file, so pi-subagents
+workers see the graph of the session that dispatched them. An existing
+in-repo `.workgraph/` always wins, so switching the setting never strands a
+graph; it decides where new workspaces are created and where to look when
+the repository has none. `--workgraph-store` / `WORKGRAPH_STORE` is the
+headless override.
+
+## Who runs what
+
+Roles go to executors the same way: declare it once, next to the tiers.
+Without pins, every role goes to the highest-priority executor that offers
+it — and the pi-subagents bridge offers the planner role, so with the
+bridge enabled planning would leave your session. Pin it:
+
+```jsonc
+{
+  "workgraph": {
+    "executors": {
+      "planner": "in-session",          // plan in the chat, with you watching
+      "implementer": "pi-subagents",    // build in a worktree
+      "reviewer": "pi-subagents",       // independent review in a fresh child
+      "revision": "pi-subagents"
+    },
+    "subagentsExecutor": true          // enable the bridge here too — no flag needed
+  }
+}
+```
+
+A pinned executor that does not offer the role means **no claim** (same
+fail-closed rule as `--workgraph-executor-id`, which these override role by
+role). Executor ids: `in-session` and `pi-subagents`; your own adapter's
+`executorId` works the same way. `--workgraph-executors` /
+`WORKGRAPH_EXECUTORS` is the headless override (JSON).
+
+Note the in-session executor offers `planner` and `implementer` only: with
+nothing else online, `reviewed` and `planned` work reaches judgment and
+escalates for lack of an independent reviewer. Enable the bridge (the
+`subagentsExecutor` setting above, or `--workgraph-subagents-executor=true`)
+for the full chain.
+
+The flag form:
+
+```bash
+pi --workgraph-tiers '{"planner":{"model":"anthropic/claude-opus-*","thinking":"high"},
+                      "implementer":"anthropic/claude-sonnet-*",
+                      "reviewer":"anthropic/claude-opus-*"}'   # env WORKGRAPH_TIERS
+```
+
+Specs are `provider/id` strings with `*` globs, resolved against the session's model
+registry at `session_start`; among several matches the newest wins (highest
+version numbers in the id, shorter id on a tie). A spec that matches no
+available model is reported once and that role runs untiered.
+
+Adapters consume the table:
+
+- **in-session** switches the session model (and thinking level) for the
+  duration of a tiered run and restores the previous settings afterwards —
+  the plan-with-Opus, build-with-Sonnet flip inside one session. Completion
+  provenance reports the model the turn actually ran on.
+- **pi-subagents** passes the tier as the per-role launch model; an
+  explicit per-role `options` entry still wins.
+
+The core still does no routing: the judgment gate's
+`requireAuthorIndependence` checks the *reported* provenance — keep the
+reviewer on a different model than the implementer for medium/high-risk
+work, or judgment cannot pass.
+
 ## Tools
 
-Nine typed tools, all schema-validated and race-safe. Agents are instructed
-to use these instead of composing `bd` calls from bash — bare `--assignee`
-writes are how leases get corrupted.
+Thirteen typed tools, all schema-validated and race-safe. Agents are
+instructed to use these instead of touching the store from bash — bare
+assignee writes are how leases get corrupted.
 
-| Tool                  | What it does                                                                                          |
-| --------------------- | ----------------------------------------------------------------------------------------------------- |
-| `workgraph_ready`     | List approved claimable issues (dependency-unblocked, unassigned); `legacy: true` lists unapproved    |
-| `workgraph_claim`     | Atomically claim an issue by id, or the next ready one; stamps a lease                                |
-| `workgraph_release`   | Voluntarily hand a claimed issue back to the pool (fenced; clears assignee, reopens)                  |
-| `workgraph_close`     | Close an issue (fenced; lifecycle-v1 work must be phase `accepted` — the judgment gate's output)      |
-| `workgraph_split`     | Split an issue into child issues; the parent is blocked until every child closes                      |
-| `workgraph_heartbeat` | Renew the leases this worker holds (verifies the fencing epoch, pushes `lease_expires_at` forward)    |
-| `workgraph_approve`   | Approve a draft/legacy/escalated issue: acceptance criteria, workflow class, risk tier, phase `ready` |
-| `workgraph_override`  | Explicit human override: force-close or force-release, bypassing guards — always audited              |
-| `workgraph_status`    | One issue's full control-plane state: phase, lease, attempt, verdict, acceptance criteria             |
+| Tool                     | What it does                                                                                                 |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `workgraph_init`         | Create the workspace (`.workgraph/workgraph.db`, gitignored); idempotent                                     |
+| `workgraph_create`       | Create an issue — optionally approved, with acceptance criteria, risk tier, workflow class, and dependencies |
+| `workgraph_ready`        | List approved claimable issues (dependency-unblocked, unassigned); `legacy: true` lists unapproved           |
+| `workgraph_claim`        | Atomically claim an issue by id, or the next ready one; stamps a lease                                       |
+| `workgraph_release`      | Voluntarily hand a claimed issue back to the pool (fenced; clears assignee, reopens)                         |
+| `workgraph_close`        | Close an issue (fenced; lifecycle-v1 work must be phase `accepted` — the judgment gate's output)             |
+| `workgraph_split`        | Split an issue into child issues; the parent is blocked until every child closes                             |
+| `workgraph_heartbeat`    | Renew the leases this worker holds (verifies the fencing epoch, pushes `lease_expires_at` forward)           |
+| `workgraph_approve`      | Approve a draft/legacy/escalated issue: acceptance criteria, workflow class, risk tier, phase `ready`        |
+| `workgraph_approve_plan` | Approve a recorded plan (implement it next) or reject it with feedback (plan again)                          |
+| `workgraph_tiers`        | Set or show per-role model tiers for this repository (a role → model table, or clear)                        |
+| `workgraph_override`     | Explicit human override: force-close or force-release, bypassing guards — always audited                     |
+| `workgraph_status`       | One issue's full control-plane state: phase, plan, lease, attempt, verdict, acceptance criteria              |
+
+The in-session executor adds `workgraph_submit_plan`, valid only during a
+planning turn. `/workgraph init [prefix]` and `/workgraph tiers` are the
+slash-command forms of the two operator actions.
 
 ## Configuration
 
@@ -147,37 +314,54 @@ Resolution order per value: CLI flag > environment variable > default.
 
 | Flag                                     | Environment variable                   | Default                         | Purpose                                                                                                                                 |
 | ---------------------------------------- | -------------------------------------- | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `--workgraph-plan-approval`              | `WORKGRAPH_PLAN_APPROVAL`              | `required`                      | Plan gate for `planned` work: `required` (a human approves each plan) or `auto`                                                         |
+| `--workgraph-tiers`                      | `WORKGRAPH_TIERS`                      | what `workgraph_tiers` stored   | Headless override of the settings-file role → model table, as JSON (see [Model tiers](#model-tiers))                                 |
+| `--workgraph-executors`                  | `WORKGRAPH_EXECUTORS`                  | settings `executors`            | Per-role executor pins as JSON (see [Who runs what](#who-runs-what))                                                                     |
+| `--workgraph-store`                      | `WORKGRAPH_STORE`                      | settings `store`, else `repo`   | Where databases live: `repo`, `central`, or an absolute directory (see [Where the store lives](#where-the-store-lives))               |
 | `--workgraph-lease-ttl-ms`               | `WORKGRAPH_LEASE_TTL_MS`               | `300000` (5 min)                | Lease time-to-live; expired leases are reclaimable                                                                                      |
 | `--workgraph-heartbeat-ms`               | `WORKGRAPH_HEARTBEAT_MS`               | `60000` (60 s)                  | How often held leases are renewed                                                                                                       |
 | `--workgraph-poll-ms`                    | `WORKGRAPH_POLL_MS`                    | `30000` (30 s)                  | Coordinator poll interval (floored at 5 s in production wiring)                                                                         |
 | `--workgraph-sweep-interval-ms`          | `WORKGRAPH_SWEEP_INTERVAL_MS`          | the poll interval               | Expiry-sweep cadence (reclaims expired leases back to ready)                                                                            |
 | `--workgraph-discovery-timeout-ms`       | `WORKGRAPH_DISCOVERY_TIMEOUT_MS`       | `2000` (2 s)                    | Executor-discovery collection window                                                                                                    |
 | `--workgraph-accept-timeout-ms`          | `WORKGRAPH_ACCEPT_TIMEOUT_MS`          | `10000` (10 s)                  | Run-request accept/reject deadline                                                                                                      |
-| `--workgraph-compat-in-session-executor` | `WORKGRAPH_COMPAT_IN_SESSION_EXECUTOR` | `true`                          | Register the in-session compatibility executor                                                                                          |
+| `--workgraph-compat-in-session-executor` | `WORKGRAPH_COMPAT_IN_SESSION_EXECUTOR` | `true`                          | Register the in-session executor (planner + implementer in the chat session)                                                            |
 | `--workgraph-executor-id`                | `WORKGRAPH_EXECUTOR_ID`                | —                               | Pin executor selection to one executorId (errors when it's absent)                                                                      |
 | `--workgraph-compat-legacy-issues`       | `WORKGRAPH_COMPAT_LEGACY_ISSUES`       | `false`                         | Opt-in: auto-dispatch issues without lifecycle metadata (warned once)                                                                   |
 | `--workgraph-policy`                     | `WORKGRAPH_POLICY`                     | low advisory, med/high blocking | Per-risk-tier judgment-gate policy overrides (JSON)                                                                                     |
-| `--workgraph-subagents-executor`         | `WORKGRAPH_SUBAGENTS_EXECUTOR`         | disabled                        | Opt-in: the experimental pi-subagents bridge                                                                                            |
+| `--workgraph-subagents-executor`         | `WORKGRAPH_SUBAGENTS_EXECUTOR`         | settings `subagentsExecutor`    | Opt-in: the experimental pi-subagents bridge (`true` or its JSON block)                                                                 |
+| `--workgraph-finalization`               | `WORKGRAPH_FINALIZATION`               | —                               | Optional post-verification task (JSON with `instructions`, `timeoutMs`)                                                                 |
 | `--workgraph-worker-id`                  | `WORKGRAPH_WORKER_ID`                  | `{user}@{host}/{short-session}` | Worker identity used for claims, audit records, and fencing checks                                                                      |
 | `--workgraph-dispatch`                   | —                                      | `true`                          | Kill switch: `false` keeps tools + context injection, no autonomy (the flag name predates the coordinator; it disables the coordinator) |
 
 ## How it works
 
+- **The store** — `src/store.ts`: one SQLite file per repository (WAL
+  mode, busy timeout), at `.workgraph/workgraph.db` in the checkout or under
+  a central directory (see [Where the store lives](#where-the-store-lives)),
+  found by walking up from the session's cwd so worktrees share their
+  repository's graph.
+  Issues, dependencies, and comments are tables; lifecycle and lease state
+  is a per-key-merged JSON metadata column. Cross-process safety is
+  SQLite's own locking: a claim is one conditional `UPDATE`, claim-next runs
+  under `BEGIN IMMEDIATE`. Nothing in `.workgraph/` is meant to be
+  committed — the directory ships its own `.gitignore`. There is no
+  background process and no CLI to install.
 - **Coordinator** — the protocol-based dispatch loop, using a scheduling
   shell built from a poll timer plus Pi's `agent_settled` idle edge and one
-  reentrancy-guarded tick). Each tick: fetch the ready pool (readiness is
+  reentrancy-guarded tick. Each tick: fetch the ready pool (readiness is
   judged by array length, never exit codes), filter to approved lifecycle
-  work, **discover executors first** (no executor → no claim), claim by id
-  under a fresh `workgraph-run/` lease, persist intent, and delegate over
-  the protocol. Completions are fenced (issue id + workflow-run id + lease
-  epoch) and drive the judgment gate: independent review, policy
+  work (plans parked in `plan_review` are never claimable), **discover
+  executors first** (no executor → no claim), claim by id under a fresh
+  `workgraph-run/` lease, persist intent, and delegate over the protocol.
+  Completions are fenced (issue id + workflow-run id + lease epoch) and
+  drive the plan gate and the judgment gate: independent review, policy
   application, bounded revisions, fingerprint-based escalation, and a
   policy-approved close. On restart, persisted runs are reconciled —
   re-adopted, completed, or abandoned to the reclaim path.
 - **Context injection** — every turn, `before_agent_start` appends a fenced
   `<workgraph>` section to the system prompt: current claim with lease
-  countdown, ready count (top 5 rendered, the rest folded into the count,
-  ≤ 30 lines total), and the collision-free claiming rules. Per-turn
+  countdown, ready count (top 5 rendered, the rest folded into the count),
+  plans awaiting review, and the collision-free claiming rules. Per-turn
   re-injection is the compaction-survival workhorse: even when a summary
   drops graph state, the next turn re-adds it fresh. Graph state is cached
   for 10 s per workspace.
@@ -187,24 +371,26 @@ Resolution order per value: CLI flag > environment variable > default.
   failure path — it falls back to Pi's default compaction.
 - **Status bar** — current claim, lifecycle phase, executor, and lease
   countdown in the footer, TUI only; headless sessions never touch the UI.
-- **Audit trail** — every lease transition is recorded as an issue comment
-  (bd's own interaction log records nothing for `--claim` or metadata
-  writes), and every verdict as a `workgraph-verdict` comment. See
-  [Audit events](#5-audit-events) below.
+- **Audit trail** — every lease transition is recorded as an issue comment,
+  every plan as a `workgraph-plan` comment, and every verdict as a
+  `workgraph-verdict` comment. See [Audit events](#5-audit-events) below.
 
-All bd invocations are serialized through one internal queue and every tool
-declares sequential execution — bd's embedded Dolt panics on concurrent
-in-process access. Cross-process concurrency is bd's own locking, and is
-exactly what the race suites exercise.
+Every tool declares sequential execution so lease reads and writes from one
+session never interleave; cross-process concurrency is the store's locking,
+and is exactly what the race suites exercise.
 
 ## The Lease Convention
 
-**Convention-Version: 1**
+**Convention-Version: 2**
 
 This section is the interop contract. It is versioned independently of the
 package: protocol changes bump the `Convention-Version` line above, not just
-the npm semver. A third-party tool (any harness, not just Pi) can respect or
-detect pi-workgraph leases by implementing what follows. Every stated
+the npm semver. Version 2 moved the home of the state from the beads (`bd`)
+database to this package's own SQLite store; the key names, value shapes,
+and invariants are unchanged. A third-party tool (any harness, not just
+Pi) can respect or detect pi-workgraph leases by reading
+`.workgraph/workgraph.db` (read-only; `scripts/git-push-guard.mjs` is a
+worked example) and implementing what follows. Every stated
 invariant is tied to a test in this repository via an HTML comment in this
 document's source.
 
@@ -217,7 +403,7 @@ Lease state lives in three issue-metadata keys. These key names are
 | ------------------ | ------- | -------------------------------------------------------------------- |
 | `lease_holder`     | string  | Worker identity of the current holder                                |
 | `lease_epoch`      | integer | Fencing token — monotonic per issue, **never resets**                |
-| `lease_expires_at` | string  | Lease expiry, RFC3339 UTC at **second** precision (bd's granularity) |
+| `lease_expires_at` | string  | Lease expiry, RFC3339 UTC at **second** precision                    |
 
 `lease_holder` values are **opaque strings** — compare them for equality,
 never parse meaning out of them. Two shapes appear today: the initiating
@@ -227,44 +413,42 @@ whose lifetime is the run's, not the initiating session's) for coordinator
 claims. This is a semantics note about the _values_, not a key change —
 the keys above stay frozen.
 
-A leased issue as returned by `bd show <id> --json` (real output, abridged;
-note that `bd show --json` returns an array):
+A leased issue as returned by the store's `show` (abridged; the `metadata`
+column is the JSON object shown):
 
 ```json
-[
-  {
-    "id": "bdx-0qz",
-    "title": "implement retry backoff",
-    "status": "in_progress",
-    "priority": 2,
-    "issue_type": "task",
-    "assignee": "garen@sandbox/1f3a9c2e",
-    "updated_at": "2026-08-06T13:16:02Z",
-    "metadata": {
-      "lease_epoch": 3,
-      "lease_holder": "garen@sandbox/1f3a9c2e",
-      "lease_expires_at": "2026-08-06T13:21:01Z"
-    }
+{
+  "id": "wg-0qz",
+  "title": "implement retry backoff",
+  "status": "in_progress",
+  "priority": 2,
+  "issue_type": "task",
+  "assignee": "garen@sandbox/1f3a9c2e",
+  "updated_at": "2026-08-06T13:16:02.418Z",
+  "metadata": {
+    "lease_epoch": "3",
+    "lease_holder": "garen@sandbox/1f3a9c2e",
+    "lease_expires_at": "2026-08-06T13:21:01Z"
   }
-]
+}
 ```
 
-Readers must normalize: bd stores numeric-looking metadata values as JSON
-numbers, but writers stamp them as strings — treat `lease_epoch` as an
-integer however it round-trips, and treat a missing/garbled epoch as `0`
-(a never-leased issue).
+Readers must normalize: metadata values round-trip exactly as written, and
+writers stamp the epoch as a string — treat `lease_epoch` as an integer
+however it round-trips (`Number(...)`), and treat a missing/garbled epoch
+as `0` (a never-leased issue).
 
 ### 2. Invariants
 
-bd has **no compare-and-swap**, so the fencing token is what makes the
-protocol safe. These invariants are load-bearing:
+Metadata merges are **last-writer-wins per key**, so the fencing token is
+what makes the protocol safe. These invariants are load-bearing:
 
 <!-- Tested: test/race.test.ts — "8 concurrent claims -> exactly 1 winner, final assignee matches" -->
 
-1. **bd's atomic `--claim` is the mutex.** Acquisition piggybacks on
-`bd update <id> --claim` (or `bd ready --claim` for claim-next), which bd
-serializes across processes: N concurrent claims produce exactly one
-winner.
+1. **The store's atomic claim is the mutex.** Acquisition is one
+conditional `UPDATE` (`claim`, or `claimNext` under `BEGIN IMMEDIATE`),
+which SQLite serializes across processes: N concurrent claims produce
+exactly one winner.
 <!-- Tested: src/lease.test.ts — "stamps the lease trio on first acquire: epoch 1, holder, RFC3339 expiry" -->
 2. **Acquisition is claim, then stamp, then verify.** After the atomic
 claim, the holder writes all three lease keys in one metadata update
@@ -273,7 +457,7 @@ holder and epoch landed. Same-key metadata races are last-writer-wins, so
 post-write verification — not pretended atomicity — closes the window.
 A holder that fails verification walks away (`lost-acquisition-race`).
 <!-- Tested: src/lease.test.ts — "re-acquire by the same worker is a renewal — the epoch does NOT double-increment" -->
-3. **Same-holder re-acquire is a renewal.** bd's claim is idempotent per
+3. **Same-holder re-acquire is a renewal.** The claim is idempotent per
 actor; re-acquiring an issue you already hold must not double-increment
 the epoch.
 <!-- Tested: test/fencing.test.ts — "a SIGSTOP'd holder that wakes after reclaim aborts its write; the issue stays with the reclaimer" -->
@@ -286,12 +470,12 @@ under the new holder.
 <!-- Tested: src/lease.test.ts — "extends the expiry at the same epoch" -->
 5. **Heartbeat = fenced expiry push.** Renewal verifies the epoch, then
 rewrites `lease_expires_at` to `now + TTL` at the same epoch. Because
-every metadata write bumps bd's `updated_at`, a live worker's issue
+every metadata write bumps `updated_at`, a live worker's issue
 always looks fresh to the staleness sweep.
 <!-- Tested: test/reclaim.test.ts — "SIGKILL'd worker's lease is reclaimed within TTL + poll + tolerance, with audit" -->
 6. **Reclaim = epoch + 1, assignee overwrite, verify.** Takeover of an
 expired lease writes the epoch bump and the assignee overwrite in ONE
-`bd update`, so there is no window where the assignee moved but the epoch
+statement, so there is no window where the assignee moved but the epoch
 did not. Reclaimers race on last-writer-wins metadata; post-write
 verification elects exactly one winner — the loser walks away.
 <!-- Tested: src/lease.test.ts — "clears assignee + holder/expiry, reopens, audits — and the epoch survives" -->
@@ -308,9 +492,9 @@ issue and never resets across release/re-acquire cycles.
 
 Expiry detection is dual-condition **by design** (the clock-skew guard):
 
-```bash
-# Stage 1 — server-side staleness filter (bd's clock):
-bd list --status in_progress --updated-before <now - TTL> --json -n 0
+```text
+Stage 1 — store-side staleness filter (the store's clock):
+  listInProgressUpdatedBefore(cwd, <now - TTL>)   — status in_progress AND updated_at < cutoff
 ```
 
 then, client-side for each result:
@@ -322,14 +506,13 @@ Stage 2 — Date.parse(metadata.lease_expires_at) < now  (the holder's clock)
 Why both: a heartbeating worker bumps `updated_at` on every renewal, so live
 workers never appear in stage 1; and stage 2 confirms against the expiry the
 holder actually wrote. A skewed clock must beat BOTH conditions before work
-is stolen mid-flight. Because bd compares timestamps at second precision,
-round the stage-1 cutoff UP to the next second so flooring doesn't hide a
-just-expired lease.
+is stolen mid-flight. The cutoff is rounded UP to the next second (lease expiries are stamped at
+second precision) so flooring doesn't hide a just-expired lease.
 
 <!-- Tested: src/lease.test.ts — "legacy no-lease claims are flagged expire-detected once, never reclaimed" -->
 
-Stale `in_progress` issues with **no** lease metadata (claimed by a human's
-manual `bd update --claim`, or by a tool that predates leases) are flagged
+Stale `in_progress` issues with **no** lease metadata (claimed by a human or by a
+tool that predates leases) are flagged
 with an `expire-detected` audit record but **never auto-reclaimed** —
 stealing a human's claim is worse than a stalled issue.
 
@@ -353,16 +536,15 @@ stealing a human's claim is worse than a stalled issue.
 
 ### 5. Audit events
 
-bd records nothing in its own interaction log for `--claim` or
-`--set-metadata` writes, so every lease transition self-emits an audit
-record as an issue comment:
+The store keeps no interaction log of its own, so every lease transition
+self-emits an audit record as an issue comment:
 
 ```
 workgraph-lease <kind> <JSON details>
 ```
 
-Read the trail back with `bd comments <id> --json` and grep for the
-`workgraph-lease` prefix. The seven kinds:
+Read the trail back with `listComments` (or `workgraph_status`) and grep
+for the `workgraph-lease` prefix. The seven lease kinds:
 
 | Kind                    | Emitted when                                                                       |
 | ----------------------- | ---------------------------------------------------------------------------------- |
@@ -374,6 +556,10 @@ Read the trail back with `bd comments <id> --json` and grep for the
 | `lost-acquisition-race` | A claim's lease stamp was overwritten before verification                          |
 | `fencing-loss`          | A holder's heartbeat discovered its lease was reclaimed                            |
 
+The coordinator and tools add lifecycle kinds under the same prefix —
+among them `approve`, `plan-review` (a plan was parked for a human),
+`plan-approved`, `plan-rejected`, `revision-requested`, `escalated`, and
+`judgment-closed`.
 Audit writes never block lease operations: the protocol stays correct
 without the trail, and a broken audit surface must not take claiming down
 with it.
@@ -399,14 +585,14 @@ tests as their delivering phases shipped).
 
 ### 1. Durable lifecycle metadata
 
-Beads' native statuses stay simple (`open`, `in_progress`, `blocked`,
+The store's native statuses stay simple (`open`, `in_progress`, `blocked`,
 `closed`); lifecycle phase is workgraph semantics, stored in namespaced
 issue metadata:
 
 | Key                             | Meaning                                                                                                      |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `workgraph_lifecycle_version`   | Lifecycle schema version, initially `1`                                                                      |
-| `workgraph_phase`               | `draft`, `ready`, `planning`, `implementing`, `judging`, `revising`, `verifying`, `accepted`, or `escalated` |
+| `workgraph_phase`               | `draft`, `ready`, `planning`, `plan_review`, `implementing`, `judging`, `revising`, `verifying`, `accepted`, or `escalated` |
 | `workgraph_workflow_run_id`     | Stable ID covering planning, implementation, and all judgment/revision attempts for one claim                |
 | `workgraph_executor_id`         | Selected executor adapter                                                                                    |
 | `workgraph_attempt`             | Current implementation/revision attempt number                                                               |
@@ -418,13 +604,18 @@ issue metadata:
 | `workgraph_failure_fingerprint` | Hash used to detect a repeated failed attempt                                                                |
 | `workgraph_plan_summary`        | Compact plan summary; the full plan lives in the `workgraph-plan` comment trail                              |
 | `workgraph_planner_provenance`  | Compact JSON describing the planner's effective harness, provider, and model                                 |
+| `workgraph_plan_approved`       | `true` once a human approved the recorded plan; the next claim implements it (cleared on re-approve)        |
+| `workgraph_plan_feedback`       | Feedback from a rejected plan, carried on the next planner request and consumed by the next recorded plan   |
 
 ### 2. State transitions
 
 ```text
 draft --approve--> ready --claim (planned)--> planning
 draft --approve--> ready --claim (reviewed/oneshot)--> implementing
-planning --plan accepted--> implementing
+planning --plan recorded (plan approval required, the default)--> plan_review (lease released)
+plan_review --workgraph_approve_plan approve--> ready --claim--> implementing (plan attached)
+plan_review --workgraph_approve_plan reject--> ready --claim--> planning (feedback attached)
+planning --plan accepted (plan approval auto)--> implementing
 planning --failed/invalid plan--> escalated
 implementing --oneshot success--> verifying --> accepted --> closed
 implementing --oneshot failure/blocked--> ready (promoted to reviewed)
@@ -453,7 +644,7 @@ close.
 
 Every state-changing result is fenced: a completion, verdict, cancellation,
 or promotion is ignored unless its issue ID, workflow run ID, and lease
-epoch still match Beads. The coordinator never releases an issue unless
+epoch still match the store. The coordinator never releases an issue unless
 this process holds its tracked lease.
 
 ### 3. Protocol channels
@@ -501,10 +692,12 @@ claimed, under either setting.
 ### 5. The planner tier
 
 An issue approved with workflow class `planned` is claimed into `planning`
-when eligible planner and implementer executors are both available. The
-accepted plan is then attached to the implementation
-run (and to every revision of it) as the optional `plan` field on
-`run:request`.
+when eligible planner and implementer executors are both available. By
+default the recorded plan then parks in `plan_review` for a human (see
+[Plan, approve, build](#plan-approve-build)); once approved, the next claim
+goes to an implementer with the plan attached as the optional `plan` field
+on `run:request` (and on every revision of it). A rejected plan's feedback
+rides the next planner request as the optional `feedback` field.
 
 Planning is selected per issue, not globally from executor availability.
 `reviewed` and `oneshot` work go straight to implementation even when a
@@ -537,12 +730,12 @@ triple. A crashed planner is not re-adopted on restart — there is no partial
 work to protect — it is abandoned, and the TTL sweep resets `planning` →
 `ready` for a clean re-plan.
 
-Model tiering (an economy model one-shots, a judgment-heavy model plans, a
-capable one implements, and an independent model reviews) is a property of
-the **executor adapter**, not of this package:
-the coordinator selects by role and validates reported provenance, and
-deliberately does no model routing (see `src/policy.ts`). An adapter that
-maps role → model gets tiering; the judgment gate's
+Model tiering (a judgment-heavy model plans, a fast one implements, and an
+independent model reviews) is configured once with
+[`--workgraph-tiers`](#model-tiers) and consumed by the **executor
+adapters**, never by the core: the coordinator selects by role and
+validates reported provenance, and deliberately does no model routing (see
+`src/policy.ts`). An adapter that maps role → model gets tiering; the judgment gate's
 `requireAuthorIndependence` then enforces that the reviewer differs from the
 author on every required provenance axis (model by default for
 medium/high risk).
@@ -678,18 +871,19 @@ The cross-process suites (`test/race.test.ts`, `test/fencing.test.ts`,
 `test/reclaim.test.ts`) spawn real worker child processes on the TypeScript
 entrypoint via Node's native type stripping — running the test suite needs
 **Node ≥ 22.18** (consumers of the package don't: Pi's loader transpiles the
-source itself). `bd` must be on your `PATH`. Timers are compressed (2 s
-TTLs), so the whole suite runs in a couple of minutes.
+source itself). Timers are compressed (2 s TTLs), so the whole suite runs
+in about half a minute.
 
 ## Credits
 
-- pi-beads — the human TUI for browsing and editing a beads graph; keep it
-  installed alongside.
-- pi-beads-extension — prior art for bd context injection in Pi; its
-  patterns (and bugs) shaped this package's exec and injection rules.
+- [beads](https://github.com/gastownhall/beads) — the work graph this
+  package was first built on (through 0.3.x); its atomic claim and
+  dependency-aware ready query shaped the store's contract.
+- pi-beads-extension — prior art for work-graph context injection in Pi;
+  its patterns (and bugs) shaped this package's injection rules.
 - [@mancioshell/pi-board-agent](https://www.npmjs.com/package/@mancioshell/pi-board-agent)
   — the lockfile-before-claim idea that inspired the lease design.
-- [beads](https://github.com/gastownhall/beads) — the work graph itself.
+- The "opusplan" Claude Code tip — the plan-approve-build shape.
 
 ## License
 

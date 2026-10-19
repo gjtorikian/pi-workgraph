@@ -5,13 +5,12 @@
  * assembly and never-block-compaction edges (the `compact()` call itself is
  * mocked; a live-model compaction is the Phase 4 manual smoke item).
  */
-import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { compact } from "@earendil-works/pi-coding-agent";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { bindExec, getExecLog, resetExecLog } from "./bd.ts";
+import { getOpLog, initWorkspace, resetOpLog } from "./store.ts";
 import {
   buildCompactionInstructions,
   registerCompactionTakeover,
@@ -55,13 +54,12 @@ function makeGraph(seed: number): ScratchGraph {
 
 function makeInjectionHarness(): MockPi {
   const mock = makeMockPi();
-  bindExec((command, args, options) => mock.exec(command, args, options));
   registerContextInjection(asExtensionAPI(mock), { now: () => nowMs });
   return mock;
 }
 
 function readyExecCount(): number {
-  return getExecLog().filter((entry) => entry.args[0] === "ready").length;
+  return getOpLog().filter((entry) => entry.op === "ready").length;
 }
 
 beforeAll(() => {
@@ -76,7 +74,7 @@ afterAll(() => {
 afterEach(() => {
   resetContextCacheForTest();
   resetLeasesForTest();
-  resetExecLog();
+  resetOpLog();
   nowMs = Date.now();
 });
 
@@ -183,9 +181,9 @@ describe("cache TTL", () => {
       const first = await cachedGraphState(dir, { now: () => nowMs });
       expect(first.initialized).toBe(false);
 
-      // `bd init` lands mid-session; the next probe past the TTL picks it
+      // `workgraph_init` lands mid-session; the next probe past the TTL picks it
       // up (ensureWorkspace caches successes but never failures).
-      execFileSync("bd", ["init", "--prefix", "late"], { cwd: dir });
+      await initWorkspace(dir, { prefix: "late" });
       nowMs += CONTEXT_CACHE_TTL_MS + 1;
       const second = await cachedGraphState(dir, { now: () => nowMs });
       expect(second.initialized).toBe(true);
@@ -232,6 +230,7 @@ describe("renderWorkgraphSection", () => {
         initialized: true,
         readyCount: 120,
         readyTop: issues,
+        planReview: [],
         fetchedAt: nowMs,
       },
       [{ cwd: "/x", issueId: "big-held", epoch: 3, expiresAt: new Date(nowMs + 60_000).toISOString(), actor: defaultLeaseActor() }],

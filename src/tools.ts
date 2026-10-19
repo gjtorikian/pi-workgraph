@@ -1,8 +1,8 @@
 /**
- * The nine workgraph tools. Thin handlers over the src/bd.ts wrappers:
+ * The workgraph tools. Thin handlers over the src/store.ts wrappers:
  * errors are THROWN (never returned as content), output is truncated with
  * pi's truncateTail, and every tool declares `executionMode: "sequential"`
- * because bd's embedded Dolt panics on concurrent in-process access.
+ * so lease reads and writes never interleave within one session.
  *
  * Phase 3 re-cuts the surface (plan §8): `workgraph_approve` moves
  * draft/legacy work into the approved ready pool with acceptance criteria,
@@ -27,14 +27,15 @@ import { recordLeaseEvent } from "./audit.ts";
 import {
   addDependency,
   close,
-  createChild,
+  createIssue,
   ensureWorkspace,
+  initWorkspace,
   ready,
   release,
   setMetadata,
   show,
   update,
-} from "./bd.ts";
+} from "./store.ts";
 import { resolveConfig, type WorkgraphConfig } from "./config.ts";
 import {
   defaultLeaseActor,
@@ -60,27 +61,46 @@ import {
   isLifecycleV1,
   lastVerdictOf,
   phaseOf,
+  planApprovedOf,
   reapprove,
   riskTierOf,
   transition,
   workflowClassOf,
   workflowRunIdOf,
 } from "./lifecycle.ts";
+import { latestPlan, renderPlan } from "./plan.ts";
 import { DEFAULT_RISK_TIER } from "./policy.ts";
-import type { BeadsIssue } from "./types.ts";
+import { resolveConfig as resolveFlags } from "./config.ts";
+import { effectiveTiers } from "./settings.ts";
+import {
+  describeTiers,
+  parseTiersValue,
+  resolveTiers,
+  setResolvedTiers,
+  storeTiers,
+  type TierConfig,
+} from "./tiers.ts";
+import type { WorkIssue, WorkflowClassT } from "./types.ts";
 import {
   ApproveParams,
+  ApprovePlanParams,
   ClaimParams,
   CloseParams,
+  CreateParams,
   HeartbeatParams,
+  InitParams,
   OverrideParams,
   ReadyParams,
   ReleaseParams,
   SplitParams,
   StatusParams,
+  TiersParams,
   DEFAULT_WORKFLOW_CLASS,
   WORKGRAPH_EXECUTOR_ID_KEY,
   WORKGRAPH_PHASE_KEY,
+  WORKGRAPH_PLAN_APPROVED_KEY,
+  WORKGRAPH_PLAN_FEEDBACK_KEY,
+  WORKGRAPH_PLAN_SUMMARY_KEY,
   WORKGRAPH_RISK_TIER_KEY,
   WORKGRAPH_WORKFLOW_CLASS_KEY,
 } from "./types.ts";
@@ -96,12 +116,12 @@ function textResult<TDetails>(
   return { content: [{ type: "text", text: truncated.content }], details };
 }
 
-function renderIssue(issue: BeadsIssue): string {
+function renderIssue(issue: WorkIssue): string {
   const assignee = issue.assignee ? ` @${issue.assignee}` : "";
   return `${issue.id} [P${issue.priority}] (${issue.status})${assignee} ${issue.title}`;
 }
 
-function renderIssueList(issues: BeadsIssue[]): string {
+function renderIssueList(issues: WorkIssue[]): string {
   if (issues.length === 0) return "No ready issues.";
   return issues.map(renderIssue).join("\n");
 }
@@ -110,7 +130,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
   /**
    * Per-call prologue: resolve identity config lazily (flags are not
    * readable at load), record the session id for workerId(), and verify the
-   * bd binary + workspace before touching the graph.
+   * store + workspace before touching the graph.
    */
   async function prepare(ctx: ExtensionContext): Promise<WorkgraphConfig> {
     const config = resolveConfig(pi);
@@ -128,7 +148,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
       "Pass legacy: true to list legacy issues (no lifecycle version) awaiting workgraph_approve instead.",
     promptSnippet: "List claimable work-graph issues",
     promptGuidelines: [
-      "Use workgraph_ready to find work; never parse bd output from bash.",
+      "Use workgraph_ready to find work; never read or edit the store from bash.",
     ],
     parameters: ReadyParams,
     executionMode: "sequential",
@@ -136,7 +156,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
       await prepare(ctx);
       const limit = params.limit ?? 10;
       // Fetch unlimited and filter client-side (`-n 0`): lifecycle phase is
-      // metadata, which bd's ready query cannot filter on.
+      // metadata, which the store's ready query cannot filter on.
       const pool = await ready(ctx.cwd, 0);
       const issues = (
         params.legacy
@@ -216,7 +236,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
       const lease = getHeldLease(ctx.cwd, params.id);
       if (!lease) {
         // No unfenced fallback: an untracked release used to fall through to
-        // a bare `bd update --assignee "" --status open` with no holder or
+        // a bare assignee-clearing write with no holder or
         // epoch check — exactly how one worker released another's claim.
         throw new Error(
           `Cannot release ${params.id}: this session holds no tracked lease on it, ` +
@@ -322,11 +342,11 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
 
       // Create children first, deps second; on partial failure report exactly
       // what exists so no orphan is silently left behind.
-      const created: BeadsIssue[] = [];
+      const created: WorkIssue[] = [];
       for (const child of params.children) {
         try {
           created.push(
-            await createChild(
+            await createIssue(
               ctx.cwd,
               {
                 title: child.title,
@@ -383,7 +403,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     name: "workgraph_approve",
     label: "Approve work",
     description:
-      "Approve a draft or legacy issue for dispatch: records acceptance criteria (bd's native field), " +
+      "Approve a draft or legacy issue for dispatch: records acceptance criteria, " +
       "stamps lifecycle v1 with a risk tier and workflow class, and transitions the issue to phase ready. " +
       "Also re-approves escalated work (back to ready, reopened). " +
       "The coordinator only dispatches approved ready work.",
@@ -412,12 +432,10 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
             `workgraph_override (action: release), which resets it to draft for re-approval.`,
         );
       }
-      const riskTier = params.riskTier ?? DEFAULT_RISK_TIER;
-      const requestedWorkflowClass =
-        params.workflowClass ??
-        (phase === "escalated"
-          ? workflowClassOf(cur)
-          : DEFAULT_WORKFLOW_CLASS);
+      // Explicit params win; a draft created with a class/tier (workgraph_create)
+      // or an escalated issue keeps what it had; else the conservative defaults.
+      const riskTier = params.riskTier ?? riskTierOf(cur) ?? DEFAULT_RISK_TIER;
+      const requestedWorkflowClass = params.workflowClass ?? workflowClassOf(cur);
       // One-shot intentionally skips independent judgment. A blocking risk
       // tier therefore promotes to reviewed instead of weakening policy.
       const workflowClass =
@@ -427,6 +445,8 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
       const approvalFields = {
         [WORKGRAPH_RISK_TIER_KEY]: riskTier,
         [WORKGRAPH_WORKFLOW_CLASS_KEY]: workflowClass,
+        // A re-approved planned issue plans afresh; stale approvals never carry.
+        [WORKGRAPH_PLAN_APPROVED_KEY]: false,
       };
       if (phase === "escalated") {
         // The re-approve recovery path (failure-modes table: "escalation is
@@ -585,6 +605,15 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
       if (riskTier) lines.push(`Risk tier: ${riskTier}`);
       const workflowClass = workflowClassOf(issue);
       if (isLifecycleV1(issue)) lines.push(`Workflow class: ${workflowClass}`);
+      if (phase === "plan_review") {
+        const plan = await latestPlan(ctx.cwd, params.id);
+        lines.push(
+          "Plan awaiting your review — workgraph_approve_plan with decision approve, or reject plus feedback:",
+          plan ? renderPlan(plan) : "(no readable plan recorded — reject to plan again)",
+        );
+      } else if (typeof metadata[WORKGRAPH_PLAN_SUMMARY_KEY] === "string" && metadata[WORKGRAPH_PLAN_SUMMARY_KEY]) {
+        lines.push(`Plan: ${metadata[WORKGRAPH_PLAN_SUMMARY_KEY]}${planApprovedOf(issue) ? " (approved)" : ""}`);
+      }
       const runId = workflowRunIdOf(issue);
       if (runId) {
         const attempt = attemptOf(issue);
@@ -676,6 +705,213 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
         renewed: true,
         leases: renewed,
       });
+    },
+  });
+
+  pi.registerTool({
+    name: "workgraph_init",
+    label: "Initialize work graph",
+    description:
+      "Create the workgraph workspace for this repository (.workgraph/workgraph.db, gitignored). Idempotent: an existing workspace is left untouched.",
+    promptSnippet: "Initialize a work-graph workspace here",
+    promptGuidelines: [
+      "Use workgraph_init once per repository before creating issues; calling it again is harmless.",
+      "When asked to set up workgraph for a feature: call workgraph_init, then workgraph_create with approve: true, workflowClass planned, and acceptance criteria derived from the request; if the request names models for roles, call workgraph_tiers first (otherwise the roster in Pi settings applies).",
+    ],
+    parameters: InitParams,
+    executionMode: "sequential",
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const result = await initWorkspace(ctx.cwd, { prefix: params.prefix });
+      return textResult(
+        `${result.created ? "Initialized" : "Found an existing"} workgraph workspace for ${result.root} — database ${result.databasePath} (issue ids prefixed "${result.prefix}-").`,
+        result,
+      );
+    },
+  });
+
+  pi.registerTool({
+    name: "workgraph_create",
+    label: "Create work",
+    description:
+      "Create an issue in the work graph. With approve: true it is dispatchable immediately (phase ready); " +
+      "workflowClass planned makes the coordinator plan first and wait for workgraph_approve_plan before any code is written.",
+    promptSnippet: "Create a work-graph issue",
+    promptGuidelines: [
+      "Use workgraph_create to add work. Pass approve: true with acceptance criteria to dispatch it; use workflowClass planned when you want to review a plan before implementation.",
+    ],
+    parameters: CreateParams,
+    executionMode: "sequential",
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      await prepare(ctx);
+      const actor = defaultLeaseActor();
+      const riskTier = params.riskTier ?? (params.approve ? DEFAULT_RISK_TIER : undefined);
+      const requestedWorkflowClass =
+        params.workflowClass ?? (params.approve ? DEFAULT_WORKFLOW_CLASS : undefined);
+      const issue = await createIssue(
+        ctx.cwd,
+        {
+          title: params.title,
+          description: params.description,
+          priority: params.priority,
+          issueType: params.issueType,
+          acceptanceCriteria: params.acceptanceCriteria,
+          riskTier,
+          workflowClass: requestedWorkflowClass as WorkflowClassT | undefined,
+          approved: params.approve,
+          dependsOn: params.dependsOn,
+        },
+        actor.bdActor,
+      );
+      if (params.approve) {
+        await recordLeaseEvent(
+          ctx.cwd,
+          "approve",
+          issue.id,
+          {
+            riskTier,
+            workflowClass: workflowClassOf(issue),
+            requestedWorkflowClass,
+            acceptanceCriteria: params.acceptanceCriteria ?? null,
+            actor: identitySnapshot(actor),
+            via: "workgraph_create",
+          },
+          actor.bdActor,
+        );
+      }
+      const note = params.approve
+        ? `Approved: phase ready, workflow ${workflowClassOf(issue)}, risk ${riskTier}. The coordinator dispatches it on its next tick.`
+        : "Draft: approve it with workgraph_approve when it is ready to dispatch.";
+      return textResult(`Created ${renderIssue(issue)}\n${note}`, { issue });
+    },
+  });
+
+  pi.registerTool({
+    name: "workgraph_approve_plan",
+    label: "Review plan",
+    description:
+      "Approve or reject the plan recorded for an issue in phase plan_review. Approve: the next coordinator tick claims it for implementation with the plan attached. " +
+      "Reject (feedback required): it is planned again with your feedback.",
+    promptSnippet: "Approve or reject a recorded plan",
+    promptGuidelines: [
+      "When an issue waits in plan_review, read its plan with workgraph_status, then call workgraph_approve_plan with decision approve, or reject plus feedback.",
+    ],
+    parameters: ApprovePlanParams,
+    executionMode: "sequential",
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      await prepare(ctx);
+      const actor = defaultLeaseActor();
+      const cur = await show(ctx.cwd, params.id);
+      const phase = phaseOf(cur);
+      if (phase !== "plan_review") {
+        throw new Error(
+          `Cannot review a plan for ${params.id}: its phase is "${phase ?? "<legacy>"}", not plan_review.`,
+        );
+      }
+      const feedback = params.feedback?.trim() ?? "";
+      if (params.decision === "reject" && feedback === "") {
+        throw new Error("Rejecting a plan needs feedback: say what the next plan must change.");
+      }
+      const plan = await latestPlan(ctx.cwd, params.id);
+      if (params.decision === "approve" && plan === undefined) {
+        throw new Error(
+          `No readable plan is recorded for ${params.id}; reject it (with feedback) to plan again.`,
+        );
+      }
+      await transition(ctx.cwd, params.id, "plan_review", "ready", {
+        fields: {
+          [WORKGRAPH_PLAN_APPROVED_KEY]: params.decision === "approve",
+          [WORKGRAPH_PLAN_FEEDBACK_KEY]: params.decision === "approve" ? "" : feedback,
+        },
+        actor: actor.bdActor,
+      });
+      await recordLeaseEvent(
+        ctx.cwd,
+        params.decision === "approve" ? "plan-approved" : "plan-rejected",
+        params.id,
+        {
+          feedback: feedback || null,
+          steps: plan?.steps.length ?? null,
+          actor: identitySnapshot(actor),
+        },
+        actor.bdActor,
+      );
+      const text =
+        params.decision === "approve"
+          ? `Approved the plan for ${params.id} (${plan!.steps.length} steps). The coordinator implements it on its next tick.`
+          : `Rejected the plan for ${params.id}. It will be planned again with your feedback.`;
+      return textResult(text, {
+        id: params.id,
+        decision: params.decision,
+        steps: plan?.steps.length ?? null,
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "workgraph_tiers",
+    label: "Model tiers",
+    description:
+      "Set or show which model each workgraph role runs on (planner, implementer, reviewer, revision, verifier, finalizer) for this repository. " +
+      "Setting it here stores the choice in this repository's workspace. The usual home is Pi settings under \"workgraph\": { \"tiers\": { role: model } } — ~/.pi/agent/settings.json for every repository or .pi/settings.json for one. " +
+      "Precedence: --workgraph-tiers flag/env > project settings > this tool > global settings. With no arguments, shows the table in force and where it came from.",
+    promptSnippet: "Set or show per-role model tiers for this repository",
+    promptGuidelines: [
+      "Use workgraph_tiers with a table when the user names which model should plan, implement, or review; the roster in Pi settings applies otherwise.",
+    ],
+    parameters: TiersParams,
+    executionMode: "sequential",
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      await prepare(ctx);
+      const registry =
+        ctx.modelRegistry && typeof ctx.modelRegistry.getAvailable === "function"
+          ? ctx.modelRegistry
+          : undefined;
+      const describe = (config: TierConfig | undefined, origin: string): AgentToolResult<unknown> => {
+        if (!config) {
+          setResolvedTiers(undefined);
+          return textResult(`No model tiers ${origin}; every role uses its executor's default model.`, {
+            tiers: null,
+          });
+        }
+        if (!registry) {
+          return textResult(
+            `Tiers ${origin}: ${JSON.stringify(config)} (model registry unavailable in this context; resolved at the next session start).`,
+            { tiers: config, resolved: null },
+          );
+        }
+        const { resolved, unresolved } = resolveTiers(registry, config);
+        setResolvedTiers(resolved);
+        const lines = describeTiers(resolved);
+        for (const miss of unresolved) {
+          lines.push(`${miss.role}: no available model matches "${miss.pattern}" — runs untiered`);
+        }
+        return textResult(`Model tiers ${origin}:\n${lines.join("\n") || "(none resolved)"}`, {
+          tiers: config,
+          resolved: Object.fromEntries(
+            Object.entries(resolved).map(([role, tier]) => [role, { model: tier.id, thinking: tier.thinking ?? null }]),
+          ),
+          unresolved,
+        });
+      };
+
+      if (!params.clear && params.table === undefined) {
+        const effective = await effectiveTiers(resolveFlags(pi).tiers, ctx.cwd);
+        return describe(
+          effective?.tiers,
+          effective
+            ? `in force (from ${effective.origin})`
+            : 'configured — declare "workgraph": { "tiers": { "planner": "provider/id", ... } } in ~/.pi/agent/settings.json (all repos) or .pi/settings.json (this repo), or call this tool with a table',
+        );
+      }
+      let config: TierConfig | undefined;
+      if (params.table !== undefined) {
+        config = parseTiersValue(JSON.stringify(params.table));
+        if (!config) throw new Error("The tier table named no known role or model; nothing stored.");
+      } else {
+        config = undefined; // clear
+      }
+      await storeTiers(ctx.cwd, config);
+      return describe(config, config ? "stored for this workspace" : "stored (cleared)");
     },
   });
 }

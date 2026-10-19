@@ -45,6 +45,7 @@ import type {
   SubagentsRoleRoutes,
   WorkgraphConfig,
 } from "../config.ts";
+import { tierFor } from "../tiers.ts";
 import {
   CH,
   newEnvelope,
@@ -324,6 +325,13 @@ export function buildSubagentTask(
     }
   }
   if (msg.role === "planner") {
+    if (msg.feedback) {
+      lines.push(
+        "",
+        "A previous plan for this issue was REJECTED with this feedback — address it:",
+        msg.feedback,
+      );
+    }
     lines.push(
       "",
       "Produce a concrete implementation plan as structured output matching the provided schema. Do not modify product code.",
@@ -737,8 +745,15 @@ export function registerPiSubagentsExecutor(
           return;
         }
       }
-      const roleOptions =
-        configured.options?.[msg.role as keyof SubagentsRoleRoutes];
+      // A resolved tier is the default launch model for the role; an explicit
+      // per-role option (model, thinking, skills) still wins.
+      const tier = tierFor(msg.role);
+      const roleOptions = {
+        ...(tier
+          ? { model: tier.id, ...(tier.thinking ? { thinking: tier.thinking } : {}) }
+          : {}),
+        ...configured.options?.[msg.role as keyof SubagentsRoleRoutes],
+      };
       if (roleOptions?.thinking && !roleOptions.model) {
         reject("a thinking override requires an explicit model");
         return;

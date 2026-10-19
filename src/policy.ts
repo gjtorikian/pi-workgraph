@@ -36,7 +36,7 @@ export interface GatePolicy {
   requireAuthorIndependence: IndependenceRequirement;
   /** Maximum revision runs before escalation. */
   maxRevisions: number;
-  /** What escalation does; `block` = bd status blocked + phase escalated. */
+  /** What escalation does; `block` = store status blocked + phase escalated. */
   escalate: "block";
 }
 

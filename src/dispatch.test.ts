@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { bindExec, getExecLog, resetExecLog } from "./bd.ts";
+import { getOpLog, resetOpLog } from "./store.ts";
 import type { WorkgraphConfig } from "./config.ts";
 import {
   buildWorkPrompt,
@@ -77,7 +77,6 @@ function makeHarness(
   config: Partial<WorkgraphConfig> = {},
 ): Harness {
   const mock = makeMockPi();
-  bindExec((command, args, options) => mock.exec(command, args, options));
   const controller = registerDispatch(asExtensionAPI(mock), {
     getConfig: () => ({ ...TEST_CONFIG, ...config }),
     now: () => nowMs,
@@ -86,10 +85,10 @@ function makeHarness(
   return { mock, controller, ectx: makeEventContext(cwd) };
 }
 
-function claimExecs(): readonly string[][] {
-  return getExecLog()
-    .filter((entry) => entry.args.includes("--claim"))
-    .map((entry) => [...entry.args]);
+function claimExecs(): readonly string[] {
+  return getOpLog()
+    .filter((entry) => entry.op === "claim" || entry.op === "claimNext")
+    .map((entry) => entry.op);
 }
 
 beforeAll(() => {
@@ -107,7 +106,7 @@ afterEach(async () => {
     await controller.teardown();
   }
   resetLeasesForTest();
-  resetExecLog();
+  resetOpLog();
   nowMs = Date.now();
 });
 
@@ -156,10 +155,10 @@ describe("claim gating", () => {
     expect(current!.issue.id).toBe(issueId);
     expect(graph.showIssue(issueId).assignee).toBe(WORKER);
 
-    // Claim went through bd's atomic ready --claim, never a bare assignee write.
+    // Claim went through the atomic claim-next path, never a bare assignee write.
     const claims = claimExecs();
     expect(claims).toHaveLength(1);
-    expect(claims[0]![0]).toBe("ready");
+    expect(claims[0]).toBe("claimNext");
 
     expect(mock.sendMessages).toHaveLength(1);
     const wake = mock.sendMessages[0]!;
@@ -250,7 +249,7 @@ describe("heartbeat", () => {
     const issueId = controller.current()!.lease.issueId;
 
     // A rival reclaims: epoch moves past ours.
-    graph.bd([
+    graph.op([
       "update",
       issueId,
       "--set-metadata",
@@ -275,7 +274,7 @@ describe("heartbeat", () => {
     expect((entry!.data as { issueId: string }).issueId).toBe(issueId);
 
     // Audit record landed on the issue's comment trail.
-    const comments = JSON.parse(graph.bd(["comments", issueId, "--json"])) as {
+    const comments = JSON.parse(graph.op(["comments", issueId, "--json"])) as {
       text: string;
     }[];
     expect(
@@ -331,7 +330,7 @@ describe("lifecycle", () => {
     expect(released.status).toBe("open");
     expect(released.assignee ?? "").toBe("");
 
-    const comments = JSON.parse(graph.bd(["comments", issueId, "--json"])) as {
+    const comments = JSON.parse(graph.op(["comments", issueId, "--json"])) as {
       text: string;
     }[];
     expect(

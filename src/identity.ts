@@ -44,7 +44,7 @@ export function workerId(): string {
 }
 
 /**
- * The bridge for callers that act as the local session: holder AND bd
+ * The bridge for callers that act as the local session: holder AND the store
  * `--actor` are both this worker's identity. Phase 2's coordinator replaces
  * this with generated `workgraph-run/<id>` holders (initiator stays the
  * bdActor); until then every call site threads this explicitly — the lease

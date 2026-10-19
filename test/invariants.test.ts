@@ -18,7 +18,7 @@
  * the tick claiming, close succeeding) — never on setup.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { bindExec, getExecLog, resetExecLog } from "../src/bd.ts";
+import { getOpLog, resetOpLog } from "../src/store.ts";
 import type { WorkgraphConfig } from "../src/config.ts";
 import {
   registerCoordinator,
@@ -74,7 +74,6 @@ function run(name: string, params: unknown, cwd: string) {
 
 beforeAll(() => {
   mock = makeMockPi();
-  bindExec((command, args, options) => mock.exec(command, args, options));
   registerWorkgraphTools(asExtensionAPI(mock));
   // Pin 2 targets the COORDINATOR (phase 2 replaced registerDispatch in the
   // production wiring): no executor is installed on this mock's bus, so
@@ -109,7 +108,7 @@ describe("control-plane invariants (phase-0 pins, all flipped — see spec-phase
         const id = graph.createIssue("claimed elsewhere");
         // Claim via bd directly so THIS process tracks no lease on the
         // issue (same setup as the src/tools.test.ts conflict test).
-        graph.bd(["update", id, "--claim", "--actor", "other-actor"]);
+        graph.op(["update", id, "--claim", "--actor", "other-actor"]);
         // Target behavior: an untracked release is refused with a
         // fencing error instead of being performed.
         await expect(
@@ -135,7 +134,7 @@ describe("control-plane invariants (phase-0 pins, all flipped — see spec-phase
     "with no executor available, a dispatch tick claims nothing",
     async () => {
       resetLeasesForTest();
-      resetExecLog();
+      resetOpLog();
       const graph = makeScratchGraph({ prefix: "pindsp", seed: 1 });
       const ectx = makeEventContext(graph.dir); // isIdle() defaults true
       try {
@@ -151,9 +150,9 @@ describe("control-plane invariants (phase-0 pins, all flipped — see spec-phase
         expect(shown.status).toBe("open");
         expect(shown.assignee ?? "").toBe("");
         // The tick probed the pool but bd's claim path NEVER ran.
-        const log = getExecLog();
-        expect(log.some((entry) => entry.args.includes("--claim"))).toBe(false);
-        expect(log.some((entry) => entry.args[0] === "ready")).toBe(true);
+        const log = getOpLog();
+        expect(log.some((entry) => (entry.op === "claim" || entry.op === "claimNext"))).toBe(false);
+        expect(log.some((entry) => entry.op === "ready")).toBe(true);
       } finally {
         // Tear down while the scratch dir still exists so nothing leaks
         // into the remaining pins (teardown is idempotent — afterAll

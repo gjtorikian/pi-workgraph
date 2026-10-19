@@ -5,7 +5,7 @@
  */
 import { Value } from "typebox/value";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { bindExec, listComments } from "./bd.ts";
+import { listComments } from "./store.ts";
 import { resetIdentityForTest, workerId } from "./identity.ts";
 import {
   leaseEpochOf,
@@ -18,7 +18,7 @@ import {
   ApproveParams,
   ReadyParams,
   SplitParams,
-  type BeadsIssue,
+  type WorkIssue,
   type Lease,
 } from "./types.ts";
 import {
@@ -42,6 +42,10 @@ const TOOL_NAMES = [
   "workgraph_approve",
   "workgraph_override",
   "workgraph_status",
+  "workgraph_init",
+  "workgraph_create",
+  "workgraph_approve_plan",
+  "workgraph_tiers",
 ] as const;
 
 let mock: MockPi;
@@ -71,7 +75,6 @@ function resultText(result: { content: { type: string; text?: string }[] }) {
 
 beforeAll(() => {
   mock = makeMockPi();
-  bindExec((command, args, options) => mock.exec(command, args, options));
   registerWorkgraphTools(asExtensionAPI(mock));
   mock.setFlag("workgraph-worker-id", "test-worker-a");
   graph = makeScratchGraph({ seed: 2 });
@@ -83,7 +86,7 @@ afterAll(() => {
 });
 
 describe("registration surface", () => {
-  it("registers exactly the nine workgraph tools", () => {
+  it("registers exactly the thirteen workgraph tools", () => {
     expect([...mock.tools.keys()].sort()).toEqual([...TOOL_NAMES].sort());
   });
 
@@ -129,7 +132,7 @@ describe("schema validation", () => {
 describe("workgraph_ready", () => {
   it("lists seeded issues once approved (phase 3: the default pool is approved work)", async () => {
     for (const id of graph.seededIds) {
-      graph.bd([
+      graph.op([
         "update",
         id,
         "--set-metadata",
@@ -141,18 +144,18 @@ describe("workgraph_ready", () => {
     const result = await run("workgraph_ready", {}, graph.dir);
     const text = resultText(result);
     for (const id of graph.seededIds) expect(text).toContain(id);
-    const issues = (result.details as { issues: BeadsIssue[] }).issues;
+    const issues = (result.details as { issues: WorkIssue[] }).issues;
     expect(issues).toHaveLength(2);
   });
 
-  it("throws a `bd init` hint outside a beads workspace", async () => {
+  it("throws a workgraph_init hint outside a workspace", async () => {
     const { mkdtempSync, rmSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
     const bare = mkdtempSync(join(tmpdir(), "pi-workgraph-tools-bare-"));
     try {
       await expect(run("workgraph_ready", {}, bare)).rejects.toThrow(
-        /bd init/,
+        /workgraph_init/,
       );
     } finally {
       rmSync(bare, { recursive: true, force: true });
@@ -166,7 +169,7 @@ describe("workgraph_claim", () => {
     try {
       const id = local.createIssue("claim target", { priority: 0 });
       const result = await run("workgraph_claim", {}, local.dir);
-      const details = result.details as { issue: BeadsIssue; lease: Lease };
+      const details = result.details as { issue: WorkIssue; lease: Lease };
       expect(details.issue.id).toBe(id);
       expect(details.issue.assignee).toBe("test-worker-a");
       expect(workerId()).toBe("test-worker-a");
@@ -199,7 +202,7 @@ describe("workgraph_claim", () => {
       local.createIssue("decoy", { priority: 0 });
       const wanted = local.createIssue("wanted", { priority: 3 });
       const result = await run("workgraph_claim", { id: wanted }, local.dir);
-      const issue = (result.details as { issue: BeadsIssue }).issue;
+      const issue = (result.details as { issue: WorkIssue }).issue;
       expect(issue.id).toBe(wanted);
       expect(issue.status).toBe("in_progress");
     } finally {
@@ -211,7 +214,7 @@ describe("workgraph_claim", () => {
     const local = makeScratchGraph({ prefix: "tconf" });
     try {
       const id = local.createIssue("contested");
-      local.bd(["update", id, "--claim", "--actor", "other-actor"]);
+      local.op(["update", id, "--claim", "--actor", "other-actor"]);
       await expect(run("workgraph_claim", { id }, local.dir)).rejects.toThrow(
         /already claimed/,
       );
@@ -242,7 +245,7 @@ describe("workgraph_release", () => {
  *  setup shorthand for close tests; the gate itself is exercised below and
  *  in test/judgment.test.ts. */
 function stampAccepted(local: ScratchGraph, id: string): void {
-  local.bd([
+  local.op([
     "update",
     id,
     "--set-metadata",
@@ -293,7 +296,7 @@ describe("workgraph_close", () => {
     try {
       const id = local.createIssue("still being judged");
       await run("workgraph_claim", { id }, local.dir);
-      local.bd([
+      local.op([
         "update",
         id,
         "--set-metadata",
@@ -317,7 +320,7 @@ describe("workgraph_close", () => {
       const id = local.createIssue("not ours to close");
       // Claimed by ANOTHER actor outside this process: no tracked lease
       // here, so the fenced close must refuse instead of closing their work.
-      local.bd(["update", id, "--claim", "--actor", "other-actor"]);
+      local.op(["update", id, "--claim", "--actor", "other-actor"]);
       await expect(run("workgraph_close", { id }, local.dir)).rejects.toThrow(
         /fenc/i,
       );
@@ -389,7 +392,7 @@ describe("workgraph_approve", () => {
     const local = makeScratchGraph({ prefix: "tapv2" });
     try {
       const id = local.createIssue("already moving");
-      local.bd([
+      local.op([
         "update",
         id,
         "--set-metadata",
@@ -410,7 +413,7 @@ describe("workgraph_approve", () => {
     try {
       const id = local.createIssue("escalated work");
       // What escalateRun leaves behind: phase escalated, status blocked.
-      local.bd([
+      local.op([
         "update",
         id,
         "--status",
@@ -446,8 +449,8 @@ describe("workgraph_override", () => {
     try {
       const id = local.createIssue("stuck in judging");
       // Claimed elsewhere and mid-lifecycle: every normal guard says no.
-      local.bd(["update", id, "--claim", "--actor", "other-actor"]);
-      local.bd([
+      local.op(["update", id, "--claim", "--actor", "other-actor"]);
+      local.op([
         "update",
         id,
         "--set-metadata",
@@ -478,7 +481,7 @@ describe("workgraph_override", () => {
     const local = makeScratchGraph({ prefix: "tovr2" });
     try {
       const id = local.createIssue("abandoned claim");
-      local.bd(["update", id, "--claim", "--actor", "gone-worker"]);
+      local.op(["update", id, "--claim", "--actor", "gone-worker"]);
       await run(
         "workgraph_override",
         { id, action: "release", reason: "worker went away" },
@@ -500,8 +503,8 @@ describe("workgraph_override", () => {
     const local = makeScratchGraph({ prefix: "tovr3" });
     try {
       const id = local.createIssue("stranded mid-judging");
-      local.bd(["update", id, "--claim", "--actor", "gone-worker"]);
-      local.bd([
+      local.op(["update", id, "--claim", "--actor", "gone-worker"]);
+      local.op([
         "update",
         id,
         "--set-metadata",
@@ -546,7 +549,7 @@ describe("workgraph_status", () => {
         { id, acceptanceCriteria: "all tests green", riskTier: "low" },
         local.dir,
       );
-      local.bd([
+      local.op([
         "update",
         id,
         "--claim",
@@ -639,7 +642,7 @@ describe("workgraph_split", () => {
         },
         local.dir,
       );
-      const children = (result.details as { children: BeadsIssue[] }).children;
+      const children = (result.details as { children: WorkIssue[] }).children;
       expect(children).toHaveLength(2);
       // Unset child priority inherits the parent's.
       expect(children[0]!.priority).toBe(1);
@@ -664,8 +667,8 @@ describe("workgraph_split", () => {
         ),
       ).rejects.toThrow();
       const listed = JSON.parse(
-        local.bd(["list", "--json"]),
-      ) as BeadsIssue[];
+        local.op(["list", "--json"]),
+      ) as WorkIssue[];
       expect(listed.every((i) => i.title !== "orphan")).toBe(true);
     } finally {
       local.cleanup();
@@ -716,7 +719,7 @@ describe("workgraph_heartbeat", () => {
       const id = local.createIssue("stolen mid-work", { priority: 0 });
       await run("workgraph_claim", {}, local.dir);
       // Simulated reclaim by another worker: epoch bump + holder change.
-      local.bd([
+      local.op([
         "update",
         id,
         "--set-metadata",

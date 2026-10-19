@@ -9,23 +9,25 @@
  * extensions chain, so the handler always returns
  * `event.systemPrompt + section`.
  *
- * Graph state is TTL-cached (10 s) per cwd so back-to-back turns cost one bd
- * probe, not one per turn. Held-lease state is NOT cached — the registry is
+ * Graph state is TTL-cached (10 s) per cwd so back-to-back turns cost one
+ * store probe, not one per turn. Held-lease state is NOT cached — the registry is
  * in-memory and free, so the current-claim line is always live.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { bdBinaryAvailable, ensureWorkspace, ready, show } from "./bd.ts";
+import { ensureWorkspace, ready, show } from "./store.ts";
 import { heldLeases, type HeldLease } from "./lease.ts";
 import {
   attemptOf,
+  isLifecycleV1,
   lastVerdictOf,
   phaseOf,
   workflowRunIdOf,
 } from "./lifecycle.ts";
 import { formatCountdown } from "./status.ts";
-import type { BeadsIssue } from "./types.ts";
+import type { WorkIssue } from "./types.ts";
+import { WORKGRAPH_PLAN_SUMMARY_KEY } from "./types.ts";
 
-/** Cache TTL: bounds both bd churn and staleness (stale-list conflicts
+/** Cache TTL: bounds both store churn and staleness (stale-list conflicts
  *  resolve as clean claim failures, so 10 s is acceptable). */
 export const CONTEXT_CACHE_TTL_MS = 10_000;
 
@@ -33,14 +35,16 @@ export const CONTEXT_CACHE_TTL_MS = 10_000;
  *  cap — the section stays ~30 lines no matter the pool size). */
 export const READY_RENDER_LIMIT = 5;
 
-/** The bd-derived half of the injected section (cacheable). */
+/** The store-derived half of the injected section (cacheable). */
 export interface GraphState {
-  /** False when bd is missing OR the dir has no .beads/ — inject nothing. */
+  /** False when the dir has no workgraph workspace — inject nothing. */
   initialized: boolean;
-  /** Total claimable issues (dependency-unblocked, unassigned). */
+  /** Total claimable issues (dependency-unblocked, unassigned, not parked for plan review). */
   readyCount: number;
   /** Top {@link READY_RENDER_LIMIT} ready issues. */
-  readyTop: BeadsIssue[];
+  readyTop: WorkIssue[];
+  /** Issues whose recorded plan waits for a human (phase plan_review). */
+  planReview: WorkIssue[];
   /** Clock reading when this state was probed. */
   fetchedAt: number;
 }
@@ -76,29 +80,33 @@ async function probeGraphState(cwd: string, nowMs: number): Promise<GraphState> 
     initialized: false,
     readyCount: 0,
     readyTop: [],
+    planReview: [],
     fetchedAt: nowMs,
   };
-  // Distinguish bd-missing (cached spawnSync probe, no subprocess) from
-  // uninitialized (`ensureWorkspace` throws on `bd where` exit 1); both mean
-  // "inject nothing" — no regex heuristics in v0.
-  if (!bdBinaryAvailable()) return empty;
+  // An uninitialized dir (`ensureWorkspace` throws) means "inject nothing".
   try {
     await ensureWorkspace(cwd);
   } catch {
     return empty;
   }
   try {
-    // `-n 0` is unlimited (verified against bd 1.1.2): full count in one
-    // call, render capped at READY_RENDER_LIMIT.
+    // Unlimited fetch: full count in one call, render capped at READY_RENDER_LIMIT.
     const pool = await ready(cwd, 0);
+    // A plan parked for review sits in the store's ready pool (open,
+    // unassigned) but is NOT claimable — it is waiting on a human.
+    const planReview = pool.filter(
+      (issue) => isLifecycleV1(issue) && phaseOf(issue) === "plan_review",
+    );
+    const claimable = pool.filter((issue) => !planReview.includes(issue));
     return {
       initialized: true,
-      readyCount: pool.length,
-      readyTop: pool.slice(0, READY_RENDER_LIMIT),
+      readyCount: claimable.length,
+      readyTop: claimable.slice(0, READY_RENDER_LIMIT),
+      planReview: planReview.slice(0, READY_RENDER_LIMIT),
       fetchedAt: nowMs,
     };
   } catch {
-    // bd broke mid-session: inject nothing this turn; the cached failure
+    // The store broke mid-session: inject nothing this turn; the cached failure
     // bounds re-probing to once per TTL.
     return empty;
   }
@@ -112,7 +120,7 @@ function truncateLine(text: string, max = 120): string {
 /**
  * TTL-cached lifecycle view for one HELD issue (phase, run, attempt,
  * acceptance summary, last verdict). Held-lease EXISTENCE stays live (the
- * in-memory registry is free), but rendering these fields costs a `bd show`
+ * in-memory registry is free), but rendering these fields costs a store read
  * per issue — cached on the same TTL as the graph state so back-to-back
  * turns stay at one probe. Failures resolve to an empty view (cached too).
  */
@@ -138,7 +146,7 @@ async function cachedHeldIssueView(
       lastVerdict: lastVerdictOf(issue),
     };
   } catch {
-    // bd broke or the issue vanished: render the bare claim line this turn.
+    // The store broke or the issue vanished: render the bare claim line this turn.
   }
   heldViewCache.set(key, { view, fetchedAt: nowMs });
   return view;
@@ -146,7 +154,7 @@ async function cachedHeldIssueView(
 
 /**
  * The TTL-cached graph state for `cwd`. Failures are cached too — a broken
- * bd must not add a fresh probe on every turn.
+ * store must not add a fresh probe on every turn.
  */
 export async function cachedGraphState(
   cwd: string,
@@ -162,7 +170,7 @@ export async function cachedGraphState(
   return state;
 }
 
-function renderIssueLine(issue: BeadsIssue): string {
+function renderIssueLine(issue: WorkIssue): string {
   return `- ${issue.id} [P${issue.priority}] ${issue.title}`;
 }
 
@@ -176,7 +184,7 @@ export function renderWorkgraphSection(
   nowMs: number,
   heldViews?: Map<string, HeldIssueView>,
 ): string {
-  const lines: string[] = ["", "", "<workgraph>", "Work graph (beads) status:"];
+  const lines: string[] = ["", "", "<workgraph>", "Work graph status:"];
 
   if (held.length === 0) {
     lines.push("Current claim: none.");
@@ -211,9 +219,19 @@ export function renderWorkgraphSection(
     if (more > 0) lines.push(`- ...and ${more} more (workgraph_ready lists them).`);
   }
 
+  if (state.planReview.length > 0) {
+    lines.push("Plans awaiting your review (workgraph_status shows the plan; workgraph_approve_plan approves or rejects it):");
+    for (const issue of state.planReview) {
+      const summary = issue.metadata?.[WORKGRAPH_PLAN_SUMMARY_KEY];
+      lines.push(
+        `- ${issue.id} ${issue.title}${typeof summary === "string" && summary ? ` — ${summary}` : ""}`,
+      );
+    }
+  }
+
   lines.push(
     "Claiming rules:",
-    "1. Ready work is dispatched by the workgraph coordinator to a registered executor — do not claim from the ready pool yourself. To deliberately pick up one specific issue, use workgraph_claim (atomic, race-safe); never claim with `bd update` or by editing assignees from bash.",
+    "1. Ready work is dispatched by the workgraph coordinator to a registered executor — do not claim from the ready pool yourself. To deliberately pick up one specific issue, use workgraph_claim (atomic, race-safe); never by editing the store or assignees from bash.",
     "2. Never write an assignee field from bash — claims and releases go through the workgraph tools so leases stay consistent.",
     "3. Completion is REPORTED to the coordinator, which records the result and runs the judgment gate (review, revision, verification) — implementers never close their own work. workgraph_close succeeds only for issues whose lifecycle phase is accepted (past judgment); an explicit human override uses workgraph_override with a reason. Hand back a claim you will not finish with workgraph_release; never leave one dangling.",
     "</workgraph>",
@@ -223,7 +241,7 @@ export function renderWorkgraphSection(
 
 /**
  * Register the `before_agent_start` injector. Returns nothing when the
- * workspace is uninitialized (no `.beads/`) or bd is unavailable.
+ * workspace is uninitialized (no `.workgraph/`).
  */
 export function registerContextInjection(
   pi: ExtensionAPI,

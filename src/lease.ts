@@ -1,9 +1,9 @@
 /**
- * The lease layer: TTL + fencing over bd's primitives.
+ * The lease layer: TTL + fencing over the store's primitives.
  *
- * bd's atomic `--claim` is the mutex; the lease metadata trio
+ * the store's atomic claim is the mutex; the lease metadata trio
  * (`lease_holder`, `lease_epoch`, `lease_expires_at`) is the bookkeeping
- * that makes claims safe for unattended workers. bd has NO CAS, so the
+ * that makes claims safe for unattended workers. the store has NO CAS, so the
  * fencing token (`lease_epoch`) is mandatory: acquisition increments the
  * epoch, every subsequent holder write first re-reads and verifies its epoch
  * is still current, and a stale holder that wakes up after a reclaim finds a
@@ -21,8 +21,8 @@
  * run-scoped fencing gets silently bypassed.
  */
 import { recordLeaseEvent } from "./audit.ts";
-import { claim, claimNext, release, setMetadata, show } from "./bd.ts";
-import type { BeadsIssue, Lease, LeaseActor } from "./types.ts";
+import { claim, claimNext, release, setMetadata, show } from "./store.ts";
+import type { WorkIssue, Lease, LeaseActor } from "./types.ts";
 import {
   LEASE_EPOCH_KEY,
   LEASE_EXPIRES_AT_KEY,
@@ -58,30 +58,30 @@ export class FencingError extends Error {
 }
 
 // ---------------------------------------------------------------------------
-// Metadata readers — bd stores numeric-looking values as JSON numbers but
+// Metadata readers — values round-trip as written (strings or numbers), so
 // `metadata` is typed `Record<string, unknown>`; normalize, never trust.
 // ---------------------------------------------------------------------------
 
 /** The issue's fencing epoch; 0 when absent/garbled (never-leased issues). */
-export function leaseEpochOf(issue: BeadsIssue): number {
+export function leaseEpochOf(issue: WorkIssue): number {
   const raw = issue.metadata?.[LEASE_EPOCH_KEY];
   const n = typeof raw === "number" ? raw : Number(raw);
   return Number.isFinite(n) ? n : 0;
 }
 
 /** The issue's lease holder, if any. */
-export function leaseHolderOf(issue: BeadsIssue): string | undefined {
+export function leaseHolderOf(issue: WorkIssue): string | undefined {
   const raw = issue.metadata?.[LEASE_HOLDER_KEY];
   return typeof raw === "string" && raw !== "" ? raw : undefined;
 }
 
 /** The issue's lease expiry (RFC3339), if any. */
-export function leaseExpiresAtOf(issue: BeadsIssue): string | undefined {
+export function leaseExpiresAtOf(issue: WorkIssue): string | undefined {
   const raw = issue.metadata?.[LEASE_EXPIRES_AT_KEY];
   return typeof raw === "string" && raw !== "" ? raw : undefined;
 }
 
-/** RFC3339 UTC at second precision (bd's `updated_at` granularity). */
+/** RFC3339 UTC at second precision (the lease convention's second-precision timestamps). */
 export function rfc3339(ms: number): string {
   return new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
 }
@@ -143,14 +143,14 @@ export interface AcquireOptions {
   /** Clock injection for tests (default Date.now). */
   now?: () => number;
   /** The identity to acquire as: `holder` is stamped on the lease, `bdActor`
-   *  attributes the bd writes. Required — this module has no ambient
+   *  attributes the store writes. Required — this module has no ambient
    *  identity to fall back on. */
   actor: LeaseActor;
 }
 
 export type AcquireOutcome =
   /** Claimed and lease stamped; `renewal` when this worker already held it. */
-  | { kind: "acquired"; lease: Lease; issue: BeadsIssue; renewal: boolean }
+  | { kind: "acquired"; lease: Lease; issue: WorkIssue; renewal: boolean }
   /** Nothing ready to claim (claim-next path only). */
   | { kind: "empty" }
   /** The stamp was overwritten between claim and verification — extremely
@@ -158,17 +158,17 @@ export type AcquireOutcome =
   | { kind: "lost-race"; issueId: string };
 
 /**
- * Acquire a lease: piggyback on bd's atomic claim, then stamp the lease
- * metadata. Acquisition order is claim-then-stamp — bd's claim is the mutex,
+ * Acquire a lease: piggyback on the store's atomic claim, then stamp the lease
+ * metadata. Acquisition order is claim-then-stamp — the store's claim is the mutex,
  * the stamp is bookkeeping — and the narrow window between them is closed by
  * post-write verification (same-key metadata races are last-writer-wins),
  * not by pretending the sequence is atomic.
  *
- * Re-acquiring an issue this worker already holds (bd's claim is idempotent
+ * Re-acquiring an issue this worker already holds (the claim is idempotent
  * for the same actor) is treated as a RENEWAL: the epoch does not
  * double-increment.
  *
- * Throws BdError on a claim conflict (`already claimed by ...` verbatim).
+ * Throws StoreError on a claim conflict (`already claimed by ...` verbatim).
  */
 export async function acquireLease(
   cwd: string,
@@ -178,7 +178,7 @@ export async function acquireLease(
   const me = opts.actor.holder;
   const actor = opts.actor.bdActor;
 
-  let issue: BeadsIssue;
+  let issue: WorkIssue;
   if (opts.issueId) {
     await claim(cwd, opts.issueId, actor); // atomic; throws on conflict
     issue = await show(cwd, opts.issueId);
@@ -259,7 +259,7 @@ export interface RenewOptions {
   /** Clock injection for tests (default Date.now). */
   now?: () => number;
   /** The identity renewing: `holder` is fenced against, `bdActor` attributes
-   *  the bd writes. Required — no ambient identity here. */
+   *  the store writes. Required — no ambient identity here. */
   actor: LeaseActor;
 }
 

@@ -24,16 +24,11 @@
  *
  *   any unexpected error: exit 2 with the error on stderr.
  */
-import {
-  execFile,
-  spawn,
-  type ChildProcess,
-} from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import type { ExecOptions, ExecResult } from "@earendil-works/pi-coding-agent";
-import { BdError, bindExec, claim, close, show } from "../../src/bd.ts";
+import { StoreError, claim, close, show } from "../../src/store.ts";
 import { setWorkerIdOverride, workerId } from "../../src/identity.ts";
 import {
   acquireLease,
@@ -53,7 +48,7 @@ export interface SpawnWorkerOptions {
   /** Scratch workspace the worker operates in. */
   cwd: string;
   issueId: string;
-  /** Distinct identity for this worker (env WORKGRAPH_WORKER_ID + BEADS_ACTOR). */
+  /** Distinct identity for this worker (env WORKGRAPH_WORKER_ID). */
   workerId: string;
   /** Lease TTL for "hold" mode, in ms (env WORKGRAPH_LEASE_TTL_MS). */
   ttlMs?: number;
@@ -86,7 +81,6 @@ export function spawnWorker(opts: SpawnWorkerOptions): WorkerProc {
       env: {
         ...process.env,
         WORKGRAPH_WORKER_ID: opts.workerId,
-        BEADS_ACTOR: opts.workerId,
         ...(opts.ttlMs !== undefined
           ? { WORKGRAPH_LEASE_TTL_MS: String(opts.ttlMs) }
           : {}),
@@ -187,47 +181,6 @@ export function spawnWorker(opts: SpawnWorkerOptions): WorkerProc {
 // Child entrypoint
 // ---------------------------------------------------------------------------
 
-/**
- * Direct execFile-backed ExecFn with pi's exec.js result semantics (killed →
- * code 0, spawn failure → code 1) — mock-pi's `realExec` is the semantic
- * reference; child processes have no pi to delegate to.
- */
-function childExec(
-  command: string,
-  args: string[],
-  options?: ExecOptions,
-): Promise<ExecResult> {
-  return new Promise((resolve) => {
-    execFile(
-      command,
-      args,
-      { cwd: options?.cwd, timeout: options?.timeout },
-      (error, out, err) => {
-        const stdoutText = String(out);
-        const stderrText = String(err);
-        if (!error) {
-          resolve({ stdout: stdoutText, stderr: stderrText, code: 0, killed: false });
-          return;
-        }
-        const anyErr = error as NodeJS.ErrnoException & {
-          killed?: boolean;
-          signal?: string | null;
-          code?: number | string | null;
-        };
-        const killed =
-          anyErr.killed === true ||
-          (typeof anyErr.signal === "string" && anyErr.signal.length > 0);
-        if (killed) {
-          resolve({ stdout: stdoutText, stderr: stderrText, code: 0, killed: true });
-          return;
-        }
-        const code = typeof anyErr.code === "number" ? anyErr.code : 1;
-        resolve({ stdout: stdoutText, stderr: stderrText, code, killed: false });
-      },
-    );
-  });
-}
-
 async function childMain(): Promise<void> {
   const [, , mode, cwd, issueId] = process.argv;
   if (!mode || !cwd || !issueId) {
@@ -235,7 +188,6 @@ async function childMain(): Promise<void> {
     process.exit(2);
   }
 
-  bindExec(childExec);
   setWorkerIdOverride(process.env.WORKGRAPH_WORKER_ID);
   const me = workerId();
   const ttlMs = Number(process.env.WORKGRAPH_LEASE_TTL_MS ?? "300000");
@@ -284,7 +236,7 @@ async function childMain(): Promise<void> {
     process.stderr.write(`unknown mode: ${mode}\n`);
     process.exit(2);
   } catch (e) {
-    if (e instanceof BdError && /already claimed/i.test(e.message)) {
+    if (e instanceof StoreError && /already claimed/i.test(e.message)) {
       process.stdout.write("CONFLICT\n");
       process.exit(1);
     }

@@ -15,7 +15,7 @@
  * Run via `npm run test:planner`.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { bindExec, listComments } from "../src/bd.ts";
+import { listComments } from "../src/store.ts";
 import type { WorkgraphConfig } from "../src/config.ts";
 import {
   registerCoordinator,
@@ -66,6 +66,9 @@ const CONFIG: WorkgraphConfig = {
   acceptTimeoutMs: 150,
   compatInSessionExecutor: false,
   workerIdOverride: WORKER,
+  // The human gate has its own suite (test/plan-gate.test.ts); this one
+  // pins the auto-flow topology.
+  planApproval: "auto",
 };
 
 /** Distinct provenance per tier — independent under every policy. */
@@ -106,7 +109,6 @@ interface Harness {
 
 function makeHarness(overrides: Partial<WorkgraphConfig> = {}): Harness {
   const mock = makeMockPi();
-  bindExec((command, args, options) => mock.exec(command, args, options));
   const config: WorkgraphConfig = { ...CONFIG, ...overrides };
   setWorkerIdOverride(WORKER);
   const coordinator = registerCoordinator(asExtensionAPI(mock), {
@@ -151,7 +153,7 @@ function approve(
   ];
   if (opts.acceptance) args.push("--acceptance", opts.acceptance);
   args.push("--actor", "approver");
-  graph.bd(args);
+  graph.op(args);
 }
 
 async function auditCount(
@@ -271,7 +273,6 @@ describe("planning phase edges", () => {
 
   it("walks ready → planning → implementing, and rejects planning → judging", async () => {
     const mock = makeMockPi();
-    bindExec((command, args, options) => mock.exec(command, args, options));
     const graph = makeScratchGraph({ prefix: "planwalk" });
     try {
       const id = graph.createIssue("planner walk");

@@ -1,13 +1,13 @@
 /**
  * The git push guard (`scripts/git-push-guard.mjs`) as a black box: a real
- * scratch bd graph, the real script in a child process, assertions on exit
+ * scratch graph, the real script in a child process, assertions on exit
  * status — the Lease Convention "merely detects" contract (§4). The guard
- * must never write lease metadata; every case below reads state stamped by
- * bd itself.
+ * must never write lease metadata; every case below reads state stamped
+ * directly into the store.
  */
 import { execFileSync } from "node:child_process";
 import { chmodSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { makeScratchGraph, type ScratchGraph } from "./helpers/scratch.ts";
@@ -27,7 +27,7 @@ function stampLease(
   holder: string,
   expiresAt: string,
 ): void {
-  graph.bd([
+  graph.op([
     "update",
     id,
     "--set-metadata",
@@ -121,19 +121,22 @@ describe("git push guard", () => {
     }
   }, 60_000);
 
-  it("install chains the pre-existing hook (bd's managed pre-push) and configures the sentinel", () => {
+  it("install chains the pre-existing hook and configures the sentinel", () => {
     const graph = makeScratchGraph({ prefix: "guardins" });
     try {
       const id = graph.createIssue("sentinel: the stack");
+      execFileSync("git", ["init", "-q"], { cwd: graph.dir });
 
-      // bd init created the git repo, set core.hooksPath=.beads/hooks, and
-      // installed its own managed pre-push there. Substitute an observable
-      // stand-in for bd's hook so chaining is assertable.
-      const hooksDir = execFileSync(
-        "git",
-        ["rev-parse", "--git-path", "hooks"],
-        { cwd: graph.dir, encoding: "utf8" },
-      ).trim();
+      // Stand in for a pre-existing hook so chaining is assertable.
+      // `--git-path` answers relative to the repo, so anchor it there — never
+      // to the test runner's own cwd.
+      const hooksDir = resolve(
+        graph.dir,
+        execFileSync("git", ["rev-parse", "--git-path", "hooks"], {
+          cwd: graph.dir,
+          encoding: "utf8",
+        }).trim(),
+      );
       const hook = join(hooksDir, "pre-push");
       const fake = "#!/bin/sh\necho chained-ran >&2\nexit 7\n";
       writeFileSync(hook, fake);
@@ -175,6 +178,37 @@ describe("git push guard", () => {
       expect(readFileSync(`${hook}.pre-workgraph`, "utf8")).toBe(fake);
     } finally {
       graph.cleanup();
+    }
+  }, 60_000);
+});
+
+describe("git push guard with a central store", () => {
+  it("finds the repository's central database through the agent dir", async () => {
+    const { mkdirSync, mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { closeWorkspace, configureStore, initWorkspace, sync } = await import("../src/store.ts");
+    const agentDir = process.env.PI_CODING_AGENT_DIR!; // test/setup.ts points this at a temp dir
+    const repo = mkdtempSync(join(tmpdir(), "pi-workgraph-guard-central-"));
+    mkdirSync(join(repo, ".git"), { recursive: true });
+    configureStore("central", { agentDir });
+    try {
+      const init = await initWorkspace(repo, { prefix: "gc" });
+      expect(init.databasePath.startsWith(join(agentDir, "workgraph"))).toBe(true);
+      const id = sync.createIssue(repo, { title: "sentinel: the stack" }).id;
+      const configured = { WORKGRAPH_STACK_ISSUE: id, PI_CODING_AGENT_DIR: agentDir };
+      expect(runGuard(SCRIPT, repo, configured).status).toBe(0); // never leased → allow
+      sync.setMetadata(repo, id, {
+        lease_holder: "restacker@ci/abc123",
+        lease_epoch: "1",
+        lease_expires_at: rfc3339(Date.now() + 3_600_000),
+      });
+      const blocked = runGuard(SCRIPT, repo, configured);
+      expect(blocked.status).toBe(1);
+      expect(blocked.output).toContain("restacker@ci/abc123");
+    } finally {
+      configureStore("repo");
+      closeWorkspace(repo);
+      rmSync(repo, { recursive: true, force: true });
     }
   }, 60_000);
 });

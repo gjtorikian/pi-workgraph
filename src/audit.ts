@@ -1,8 +1,8 @@
 /**
- * Lease + lifecycle audit trail. bd's own audit surface records NOTHING for
- * `--claim` or `--set-metadata` writes (verified), and bd 1.1.2 has no
- * `bd audit` subcommand, so every lease transition emits its own record as
- * an issue comment (`bd comment`; read back via `bd comments <id> --json` —
+ * Lease + lifecycle audit trail. the store's own audit surface records NOTHING for
+ * `--claim` or `--set-metadata` writes (verified), and the former the store backend has no
+ * `the store audit` subcommand, so every lease transition emits its own record as
+ * an issue comment (an issue comment; read back via `listComments` —
  * the mechanism that round-trips cleanly through JSON reads).
  *
  * Phase 3 extends the {@link LeaseEvent} union with structured
@@ -18,7 +18,7 @@
  * protocol stays correct without the trail, and a broken audit surface must
  * not take claiming down with it.
  */
-import { addComment } from "./bd.ts";
+import { addComment } from "./store.ts";
 import type { LeaseEvent } from "./types.ts";
 
 /** Prefix on every audit comment; tests and humans grep for it. */

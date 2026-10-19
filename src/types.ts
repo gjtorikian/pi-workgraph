@@ -1,9 +1,9 @@
 /**
  * Shared data shapes and tool parameter schemas for pi-workgraph.
  *
- * bd guarantees five fields on every issue (`id`, `title`, `status`,
+ * the store guarantees five fields on every issue (`id`, `title`, `status`,
  * `priority`, `issue_type`); everything else is optional — issues created
- * with a bare `bd create <title>` omit assignee, description, metadata, etc.
+ * with a bare the store omit assignee, description, metadata, etc.
  * Treating any non-guaranteed field as required is how prior art crashed on
  * minimally-populated issues.
  */
@@ -11,7 +11,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { type Static, Type } from "typebox";
 
 /** A reference to another issue inside a `dependencies` array. */
-export interface BeadsIssueRef {
+export interface WorkIssueRef {
   id: string;
   title?: string;
   status?: string;
@@ -20,8 +20,8 @@ export interface BeadsIssueRef {
   dependency_type?: string;
 }
 
-/** An issue as returned by `bd ... --json`. */
-export interface BeadsIssue {
+/** An issue as returned by `the store ... --json`. */
+export interface WorkIssue {
   id: string;
   title: string;
   status: string;
@@ -33,14 +33,14 @@ export interface BeadsIssue {
   notes?: string;
   labels?: string[];
   metadata?: Record<string, unknown>;
-  dependencies?: BeadsIssueRef[];
+  dependencies?: WorkIssueRef[];
   created_at?: string;
   created_by?: string;
   updated_at?: string;
   closed_at?: string;
   close_reason?: string;
   schema_version?: number;
-  /** bd's native acceptance-criteria field (`--acceptance`, bd >= 1.1.2). */
+  /** the store's native acceptance-criteria field (`--acceptance`, the store >= 1.1.2). */
   acceptance_criteria?: string;
 }
 
@@ -73,7 +73,7 @@ export const LEASE_EXPIRES_AT_KEY = "lease_expires_at";
 export interface LeaseActor {
   /** Value written to the lease_holder metadata key. */
   holder: string;
-  /** bd `--actor` for audit attribution (may differ from holder: the initiator). */
+  /** the store actor for audit attribution (may differ from holder: the initiator). */
   bdActor: string;
 }
 
@@ -104,9 +104,13 @@ export const WORKGRAPH_LAST_VERDICT_KEY = "workgraph_last_verdict";
 export const WORKGRAPH_FAILURE_FINGERPRINT_KEY = "workgraph_failure_fingerprint";
 export const WORKGRAPH_PLAN_SUMMARY_KEY = "workgraph_plan_summary";
 export const WORKGRAPH_PLANNER_PROVENANCE_KEY = "workgraph_planner_provenance";
+/** Set when a human approved the recorded plan; the next claim implements it. */
+export const WORKGRAPH_PLAN_APPROVED_KEY = "workgraph_plan_approved";
+/** Human feedback from a rejected plan, handed to the next planner run. */
+export const WORKGRAPH_PLAN_FEEDBACK_KEY = "workgraph_plan_feedback";
 
 /**
- * The lifecycle phase union (README "Durable lifecycle metadata"). Beads'
+ * The lifecycle phase union (README "Durable lifecycle metadata"). the store'
  * four native statuses stay untouched; this is workgraph semantics stored in
  * `workgraph_phase`. Legal edges live in `src/lifecycle.ts`'s LEGAL table.
  */
@@ -114,6 +118,7 @@ export type WorkgraphPhase =
   | "draft"
   | "ready"
   | "planning"
+  | "plan_review"
   | "implementing"
   | "judging"
   | "revising"
@@ -134,7 +139,7 @@ export const DEFAULT_WORKFLOW_CLASS: WorkflowClassT = "reviewed";
 // identity.ts is the default (workerId-backed) implementation.
 // ---------------------------------------------------------------------------
 
-/** The human/session that initiated coordination (bd `--actor` attribution). */
+/** The human/session that initiated coordination (the store actor attribution). */
 export interface InitiatorIdentity {
   kind: "initiator";
   id: string;
@@ -199,6 +204,12 @@ export type LeaseEvent =
   | "verdict-invalid"
   /** Planner tier: a planner completion carried no parseable plan. */
   | "plan-invalid"
+  /** Planner tier: a plan was recorded and parked for human review. */
+  | "plan-review"
+  /** workgraph_approve_plan: a human approved the recorded plan. */
+  | "plan-approved"
+  /** workgraph_approve_plan: a human rejected the plan; it re-plans with feedback. */
+  | "plan-rejected"
   /** One-shot work failed and was promoted to the reviewed workflow. */
   | "workflow-promoted"
   /** Successful one-shot work closed without an independent review. */
@@ -370,7 +381,7 @@ export const ApproveParams = Type.Object({
   }),
   acceptanceCriteria: Type.Optional(
     Type.String({
-      description: "Acceptance criteria recorded on the issue (bd --acceptance)",
+      description: "Acceptance criteria recorded on the issue",
     }),
   ),
   riskTier: Type.Optional(
@@ -399,3 +410,89 @@ export const StatusParams = Type.Object({
   id: Type.String({ description: "Issue id to inspect" }),
 });
 export type StatusParamsT = Static<typeof StatusParams>;
+
+export const InitParams = Type.Object({
+  prefix: Type.Optional(
+    Type.String({
+      description:
+        "Issue-id prefix for this workspace (default: derived from the directory name)",
+    }),
+  ),
+});
+export type InitParamsT = Static<typeof InitParams>;
+
+export const CreateParams = Type.Object({
+  title: Type.String({ description: "Short issue title" }),
+  description: Type.Optional(Type.String({ description: "What the work is" })),
+  priority: Type.Optional(
+    Type.Integer({ minimum: 0, maximum: 4, description: "0 (highest) to 4 (default 2)" }),
+  ),
+  issueType: Type.Optional(
+    Type.String({ description: "task (default), bug, feature, chore, ..." }),
+  ),
+  acceptanceCriteria: Type.Optional(
+    Type.String({ description: "What the judgment gate checks the result against" }),
+  ),
+  riskTier: Type.Optional(
+    StringEnum(["low", "medium", "high"], {
+      description: "Judgment-gate risk tier (default medium)",
+    }),
+  ),
+  workflowClass: Type.Optional(
+    StringEnum(["oneshot", "reviewed", "planned"], {
+      description:
+        "Execution topology: planned = plan first (human reviews the plan), reviewed (default) = implement then independent review, oneshot = low-risk direct",
+    }),
+  ),
+  approve: Type.Optional(
+    Type.Boolean({
+      description:
+        "Create the issue already approved (phase ready) so the coordinator dispatches it on the next tick",
+    }),
+  ),
+  dependsOn: Type.Optional(
+    Type.Array(Type.String(), {
+      description: "Issue ids this one is blocked by",
+    }),
+  ),
+});
+export type CreateParamsT = Static<typeof CreateParams>;
+
+export const ApprovePlanParams = Type.Object({
+  id: Type.String({ description: "Issue id whose plan is awaiting review (phase plan_review)" }),
+  decision: StringEnum(["approve", "reject"], {
+    description:
+      "approve: implement this plan on the next tick; reject: plan again, with the feedback below",
+  }),
+  feedback: Type.Optional(
+    Type.String({
+      description: "What to change (handed to the next planner run on reject; recorded on approve)",
+    }),
+  ),
+});
+export type ApprovePlanParamsT = Static<typeof ApprovePlanParams>;
+
+export const TiersParams = Type.Object({
+  clear: Type.Optional(
+    Type.Boolean({ description: "Clear the table stored for this repository" }),
+  ),
+  table: Type.Optional(
+    Type.Record(
+      Type.String(),
+      Type.Union([
+        Type.String({ description: "provider/id, * globs allowed" }),
+        Type.Object({
+          model: Type.String(),
+          thinking: Type.Optional(
+            StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]),
+          ),
+        }),
+      ]),
+      {
+        description:
+          "Role → model table (roles: planner, implementer, reviewer, revision, verifier, finalizer, scout); a value is \"provider/id\" (globs allowed) or { model, thinking }",
+      },
+    ),
+  ),
+});
+export type TiersParamsT = Static<typeof TiersParams>;
