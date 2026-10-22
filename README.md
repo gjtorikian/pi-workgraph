@@ -284,7 +284,7 @@ work, or judgment cannot pass.
 
 ## Tools
 
-Thirteen typed tools, all schema-validated and race-safe. Agents are
+Fourteen typed tools, all schema-validated and race-safe. Agents are
 instructed to use these instead of touching the store from bash — bare
 assignee writes are how leases get corrupted.
 
@@ -300,6 +300,7 @@ assignee writes are how leases get corrupted.
 | `workgraph_heartbeat`    | Renew the leases this worker holds (verifies the fencing epoch, pushes `lease_expires_at` forward)           |
 | `workgraph_approve`      | Approve a draft/legacy/escalated issue: acceptance criteria, workflow class, risk tier, phase `ready`        |
 | `workgraph_approve_plan` | Approve a recorded plan (implement it next) or reject it with feedback (plan again)                          |
+| `workgraph_answer_decision` | Answer the question a run parked for a human; re-approve, and every later run of the issue carries the answer |
 | `workgraph_tiers`        | Set or show per-role model tiers for this repository (a role → model table, or clear)                        |
 | `workgraph_override`     | Explicit human override: force-close or force-release, bypassing guards — always audited                     |
 | `workgraph_status`       | One issue's full control-plane state: phase, plan, lease, attempt, verdict, acceptance criteria              |
@@ -776,8 +777,10 @@ Bridge semantics:
 - **Supervisor decisions pause the workflow.** A detached child produces an
   explicit blocked decision request, not a failed implementation to judge.
   The coordinator saves the question, parks the issue in Escalated, and keeps
-  the revision limit unchanged. The dashboard displays the question and accepts
-  an answer before resuming the original task in its retained checkout.
+  the revision limit unchanged. `workgraph_status` shows the question;
+  `workgraph_answer_decision` records the answer, and `workgraph_approve`
+  resumes the issue: every later run of it (implementer, reviewer, revision)
+  receives the question and the answer and reuses the retained checkout.
   Detached children are interrupted by run ID; an interrupt receipt alone is
   not confirmation that the child stopped. Without a confirmed exit, resuming
   remains blocked. This lifecycle uses the pi-subagents foreground completion

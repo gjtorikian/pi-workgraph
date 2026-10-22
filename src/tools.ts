@@ -82,6 +82,7 @@ import {
 } from "./tiers.ts";
 import type { WorkIssue, WorkflowClassT } from "./types.ts";
 import {
+  AnswerDecisionParams,
   ApproveParams,
   ApprovePlanParams,
   ClaimParams,
@@ -96,6 +97,8 @@ import {
   StatusParams,
   TiersParams,
   DEFAULT_WORKFLOW_CLASS,
+  WORKGRAPH_DECISION_ANSWER_KEY,
+  WORKGRAPH_DECISION_QUESTION_KEY,
   WORKGRAPH_EXECUTOR_ID_KEY,
   WORKGRAPH_PHASE_KEY,
   WORKGRAPH_PLAN_APPROVED_KEY,
@@ -423,7 +426,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
         cur.metadata?.workgraph_decision_pending === "true"
       )
         throw new Error(
-          "This issue needs a human decision. Answer its decision request in the board before resuming it.",
+          "This issue needs a human decision. workgraph_status shows the question; answer it with workgraph_answer_decision, then approve again.",
         );
       if (phase !== undefined && phase !== "draft" && phase !== "escalated") {
         throw new Error(
@@ -573,6 +576,61 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
+    name: "workgraph_answer_decision",
+    label: "Answer decision",
+    description:
+      "Answer the question a run of this issue parked for a human (phase escalated, decision pending). " +
+      "Records the answer, audits it, and clears the block; then workgraph_approve resumes the issue and " +
+      "every later run receives the question and the answer.",
+    promptSnippet: "Answer a parked decision request on a work-graph issue",
+    promptGuidelines: [
+      "When workgraph_approve refuses an escalated issue because it needs a human decision, read the question with workgraph_status, get the human's answer, call workgraph_answer_decision with it, then approve again.",
+    ],
+    parameters: AnswerDecisionParams,
+    executionMode: "sequential",
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      await prepare(ctx);
+      const actor = defaultLeaseActor();
+      const cur = await show(ctx.cwd, params.id);
+      const metadata = cur.metadata ?? {};
+      if (
+        metadata.workgraph_decision_pending !== true &&
+        metadata.workgraph_decision_pending !== "true"
+      ) {
+        throw new Error(`${params.id} has no pending decision request.`);
+      }
+      const question = metadata[WORKGRAPH_DECISION_QUESTION_KEY];
+      // Audit FIRST, as override does: a half-applied answer must still be visible.
+      await recordLeaseEvent(
+        ctx.cwd,
+        "decision-answered",
+        params.id,
+        {
+          decisionId: metadata.workgraph_decision_id,
+          question,
+          answer: params.answer,
+          actor: identitySnapshot(actor),
+        },
+        actor.bdActor,
+      );
+      await setMetadata(
+        ctx.cwd,
+        params.id,
+        {
+          workgraph_decision_pending: false,
+          [WORKGRAPH_DECISION_ANSWER_KEY]: params.answer,
+          workgraph_decision_answered_at: new Date().toISOString(),
+        },
+        actor.bdActor,
+      );
+      return textResult(
+        `Answered the decision on ${params.id}. Re-approve it with workgraph_approve; every later run receives the question and this answer.`,
+        { id: params.id, question: question ?? null },
+      );
+    },
+  });
+
+  pi.registerTool({
     name: "workgraph_status",
     label: "Work status",
     description:
@@ -627,6 +685,15 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
       }
       const verdict = lastVerdictOf(issue);
       if (verdict) lines.push(`Last verdict: ${verdict}`);
+      const question = metadata[WORKGRAPH_DECISION_QUESTION_KEY];
+      if (
+        metadata.workgraph_decision_pending === true ||
+        metadata.workgraph_decision_pending === "true"
+      ) {
+        lines.push(`Decision awaiting your answer (workgraph_answer_decision, then workgraph_approve): ${question}`);
+      } else if (typeof metadata[WORKGRAPH_DECISION_ANSWER_KEY] === "string") {
+        lines.push(`Decision answered: ${question} → ${metadata[WORKGRAPH_DECISION_ANSWER_KEY]}`);
+      }
       const holder = leaseHolderOf(issue);
       if (holder) {
         lines.push(

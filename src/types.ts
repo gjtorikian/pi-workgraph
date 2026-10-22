@@ -108,6 +108,10 @@ export const WORKGRAPH_PLANNER_PROVENANCE_KEY = "workgraph_planner_provenance";
 export const WORKGRAPH_PLAN_APPROVED_KEY = "workgraph_plan_approved";
 /** Human feedback from a rejected plan, handed to the next planner run. */
 export const WORKGRAPH_PLAN_FEEDBACK_KEY = "workgraph_plan_feedback";
+/** A parked run's question to the human (set with `workgraph_decision_pending`). */
+export const WORKGRAPH_DECISION_QUESTION_KEY = "workgraph_decision_question";
+/** The human's answer (workgraph_answer_decision); attached to every later run of the issue. */
+export const WORKGRAPH_DECISION_ANSWER_KEY = "workgraph_decision_answer";
 
 /**
  * The lifecycle phase union (README "Durable lifecycle metadata"). the store'
@@ -219,6 +223,8 @@ export type LeaseEvent =
   /** Judgment (phase 3): escalated (fingerprint repeat, bounds, no reviewer). */
   | "escalated"
   | "decision-needed"
+  /** workgraph_answer_decision: a human answered the parked question. */
+  | "decision-answered"
   /** Judgment (phase 3): verdict passed the gate — issue accepted and closed. */
   | "judgment-closed"
   | "finalization-completed"
@@ -405,6 +411,15 @@ export const OverrideParams = Type.Object({
   }),
 });
 export type OverrideParamsT = Static<typeof OverrideParams>;
+
+export const AnswerDecisionParams = Type.Object({
+  id: Type.String({ description: "Issue id whose run parked a question (phase escalated, decision pending)" }),
+  answer: Type.String({
+    minLength: 1,
+    description: "The human's answer, handed to every later run of the issue",
+  }),
+});
+export type AnswerDecisionParamsT = Static<typeof AnswerDecisionParams>;
 
 export const StatusParams = Type.Object({
   id: Type.String({ description: "Issue id to inspect" }),

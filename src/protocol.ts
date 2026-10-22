@@ -188,6 +188,14 @@ export const RunRequest = Type.Object({
    * the same issue (planner role only). Optional and v1-safe.
    */
   feedback: Type.Optional(Type.String()),
+  /**
+   * A question an earlier run of this issue parked for a human, with the
+   * answer (workgraph_answer_decision). Attached to every later run of the
+   * issue so no role re-asks it. Optional and v1-safe.
+   */
+  decision: Type.Optional(
+    Type.Object({ question: Type.String(), answer: Type.String() }),
+  ),
 });
 export type RunRequestT = Static<typeof RunRequest>;
 

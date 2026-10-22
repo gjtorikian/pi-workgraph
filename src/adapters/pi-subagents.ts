@@ -62,7 +62,7 @@ import {
   type RunRequestT,
 } from "../protocol.ts";
 import { DEFAULT_WORKFLOW_CLASS, type WorkflowClassT } from "../types.ts";
-import { ISSUE_HALT_EVENT, issueHaltNotice } from "../issue-control.ts";
+import { ISSUE_HALT_EVENT, issueHaltNotice, renderDecision } from "../issue-control.ts";
 import { workflowWorkspace, type WorkflowWorkspace } from "./workspace.ts";
 import { supervisorQuestion } from "./subagent-decision.ts";
 
@@ -310,6 +310,7 @@ export function buildSubagentTask(
     lines.push("", `Acceptance criteria: ${msg.issue.acceptanceCriteria}`);
   }
   if (msg.plan) lines.push("", "Accepted implementation plan:", msg.plan);
+  if (msg.decision) lines.push("", ...renderDecision(msg.decision));
   if (msg.instructions)
     lines.push("", "Workflow instructions:", msg.instructions);
   if (msg.role === "reviewer") {

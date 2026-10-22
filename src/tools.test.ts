@@ -46,6 +46,7 @@ const TOOL_NAMES = [
   "workgraph_create",
   "workgraph_approve_plan",
   "workgraph_tiers",
+  "workgraph_answer_decision",
 ] as const;
 
 let mock: MockPi;
@@ -86,7 +87,7 @@ afterAll(() => {
 });
 
 describe("registration surface", () => {
-  it("registers exactly the thirteen workgraph tools", () => {
+  it("registers exactly the fourteen workgraph tools", () => {
     expect([...mock.tools.keys()].sort()).toEqual([...TOOL_NAMES].sort());
   });
 

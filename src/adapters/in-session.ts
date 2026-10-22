@@ -52,6 +52,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { WorkgraphConfig } from "../config.ts";
 import { DISPATCH_MESSAGE_TYPE } from "../dispatch.ts";
+import { renderDecision } from "../issue-control.ts";
 import {
   CH,
   Discover,
@@ -123,6 +124,8 @@ export function buildInSessionPrompt(request: RunRequestT): string {
   }
   if (request.plan)
     lines.push("", "Accepted implementation plan:", request.plan);
+  if (request.decision)
+    lines.push("", ...renderDecision(request.decision));
   lines.push(
     "",
     `You are executing workflow run ${request.workflowRunId} (lease epoch ${request.leaseEpoch}); the lease is heartbeated automatically while you work.`,
@@ -150,6 +153,8 @@ function buildPlannerPrompt(request: RunRequestT): string {
       request.feedback,
     );
   }
+  if (request.decision)
+    lines.push("", ...renderDecision(request.decision));
   lines.push(
     "",
     `This is the planning step of workflow run ${request.workflowRunId} (lease epoch ${request.leaseEpoch}).`,

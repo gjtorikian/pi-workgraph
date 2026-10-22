@@ -71,6 +71,7 @@ import {
 } from "./executor-registry.ts";
 import { FinalizationResult, parseFinalizationResult } from "./finalization.ts";
 import {
+  decisionAnswer,
   ISSUE_HALT_EVENT,
   issueHaltNotice,
   sourceWorkspace,
@@ -1302,6 +1303,7 @@ export function registerCoordinator(
       leaseEpoch: run.lease.epoch,
       role: "implementer",
       attempt: run.attempt,
+      ...decisionAnswer(run.issue.metadata),
       workspace: {
         repoPath: run.cwd,
         ...sourceWorkspace(run.issue.metadata),
@@ -1658,6 +1660,7 @@ export function registerCoordinator(
       leaseEpoch: run.lease.epoch,
       role: "revision",
       attempt,
+      ...decisionAnswer(run.issue.metadata),
       workspace: {
         repoPath: run.cwd,
         ...sourceWorkspace(run.issue.metadata),
@@ -2125,6 +2128,7 @@ export function registerCoordinator(
         leaseEpoch: run.lease.epoch,
         role: "reviewer",
         attempt,
+        ...decisionAnswer(run.issue.metadata),
         workspace: {
           repoPath: run.cwd,
           ...sourceWorkspace(run.issue.metadata),
@@ -2769,6 +2773,7 @@ export function registerCoordinator(
       leaseEpoch: run.lease.epoch,
       role,
       attempt: 1,
+      ...decisionAnswer(run.issue.metadata),
       workspace: {
         repoPath: run.cwd,
         ...sourceWorkspace(run.issue.metadata),

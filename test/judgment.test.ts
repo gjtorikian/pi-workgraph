@@ -54,12 +54,14 @@ import {
   type VerdictT,
 } from "../src/types.ts";
 import { installFakeExecutor } from "./helpers/fake-executor.ts";
+import { registerWorkgraphTools } from "../src/tools.ts";
 import { registerPiSubagentsExecutor } from "../src/adapters/pi-subagents.ts";
 import { installFakeSubagents } from "./helpers/fake-subagents.ts";
 import {
   asExtensionAPI,
   makeEventContext,
   makeMockPi,
+  makeToolContext,
   type MockPi,
 } from "./helpers/mock-pi.ts";
 import { makeScratchGraph, type ScratchGraph } from "./helpers/scratch.ts";
@@ -1043,6 +1045,63 @@ describe("executor failure diagnostics", () => {
       expect(metadataOf(graph, id).workgraph_decision_pending).toBe(true);
       expect(await auditCount(graph.dir, id, "decision-needed")).toBe(1);
       expect(graph.showIssue(id).status).toBe("blocked");
+    } finally {
+      fake.uninstall();
+      await coordinator.teardown(ectx.ctx);
+      graph.cleanup();
+    }
+  }, 60_000);
+
+  it("an answered decision re-approves into a run that carries the answer and the retained workspace", async () => {
+    const { mock, coordinator } = makeHarness();
+    registerWorkgraphTools(asExtensionAPI(mock));
+    const runTool = (name: string, params: unknown, cwd: string) =>
+      mock.tools.get(name)!.execute(`call-${name}`, params, undefined, undefined, makeToolContext(cwd));
+    const graph = makeScratchGraph({ prefix: "answered" });
+    const id = graph.createIssue("choose password compatibility policy");
+    approve(graph, id);
+    const fake = installFakeExecutor(mock.events, {
+      roles: ["implementer", "reviewer"],
+      roleScripts: {
+        implementer: [
+          { outcome: "blocked", decisionQuestion: "Allow a breaking change?" },
+          { provenance: IMPL_PROV },
+        ],
+        reviewer: { provenance: REV_PROV, verdict: CLEAN_VERDICT },
+      },
+    });
+    const ectx = makeEventContext(graph.dir);
+    try {
+      await settle(mock, ectx.ctx);
+      await mock.flushEvents();
+      expect(metadataOf(graph, id).workgraph_decision_pending).toBe(true);
+      await expect(runTool("workgraph_approve", { id }, graph.dir)).rejects.toThrow(
+        /workgraph_answer_decision/,
+      );
+
+      await expect(
+        runTool("workgraph_answer_decision", { id: graph.createIssue("other"), answer: "yes" }, graph.dir),
+      ).rejects.toThrow(/no pending decision/);
+      await runTool("workgraph_answer_decision", { id, answer: "Yes, bump the major." }, graph.dir);
+      expect(metadataOf(graph, id).workgraph_decision_pending).toBe(false);
+      expect(metadataOf(graph, id).workgraph_decision_answer).toBe("Yes, bump the major.");
+      expect(await auditCount(graph.dir, id, "decision-answered")).toBe(1);
+
+      await runTool("workgraph_approve", { id }, graph.dir);
+      expect(phaseOf(graph.showIssue(id))).toBe("ready");
+      await settle(mock, ectx.ctx);
+      await mock.flushEvents();
+      expect(fake.requests.map((r) => r.role)).toEqual(["implementer", "implementer", "reviewer"]);
+      expect(fake.requests[0]!.decision).toBeUndefined();
+      for (const request of fake.requests.slice(1)) {
+        expect(request.decision).toEqual({
+          question: "Allow a breaking change?",
+          answer: "Yes, bump the major.",
+        });
+        expect(request.workspace.sourceWorkflowRunId).toBe(fake.requests[0]!.workflowRunId);
+      }
+      expect(phaseOf(graph.showIssue(id))).toBe("accepted");
+      expect(graph.showIssue(id).status).toBe("closed");
     } finally {
       fake.uninstall();
       await coordinator.teardown(ectx.ctx);
