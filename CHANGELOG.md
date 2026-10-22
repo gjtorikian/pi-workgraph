@@ -1,3 +1,25 @@
+## [0.4.0](https://github.com/gjtorikian/pi-workgraph/compare/v0.3.1...v0.4.0) (2026-10-22)
+
+### ⚠ BREAKING CHANGES
+
+* beads (`bd`) is no longer used or required and existing bd graphs are not migrated. The Lease Convention bumps to version 2: key names and invariants are unchanged, but the state lives in `.workgraph/workgraph.db` (or the central store) instead of bd issue metadata. The in-session executor now offers the planner role, and planned work waits for human plan approval by default (`planApproval: "auto"` restores the previous straight-through flow).
+
+### Features
+
+* **tools:** answer a parked decision request and resume the issue ([134a0cb](https://github.com/gjtorikian/pi-workgraph/commit/134a0cb816afda317ba41a0ea63916320caf5925))
+* Drop beads for a built-in store; add plan gate and tiers ([7a51458](https://github.com/gjtorikian/pi-workgraph/commit/7a514585f1effe6066715f580d69a8655a97175e))
+* **workflow:** Support human run supervision ([48bfbaf](https://github.com/gjtorikian/pi-workgraph/commit/48bfbaf924058474e45ab1447d2b503ed5ae0a16))
+* Add caller-defined finalization stage ([d9bb5c0](https://github.com/gjtorikian/pi-workgraph/commit/d9bb5c07921904d618f7ad9f8863c20c6404b767))
+* **policy:** Require only model independence by default ([955d015](https://github.com/gjtorikian/pi-workgraph/commit/955d0150597957aa6b0ad5f680c3f3c15b488e41))
+
+### Bug Fixes
+
+* **workflow:** Pause for human decisions ([1a72a67](https://github.com/gjtorikian/pi-workgraph/commit/1a72a6742a4c0055daf8a3fc45d97ba3cd399dd8))
+* **workspace:** Allow worktrees from dirty sources ([1e2f3cd](https://github.com/gjtorikian/pi-workgraph/commit/1e2f3cd2b88e4eee35d9a716de3a79a7e1855477))
+* **workflow:** Recover from failed worker steps ([64a8de0](https://github.com/gjtorikian/pi-workgraph/commit/64a8de0d15c693d6d4cc2e5aa812eeda17067512))
+* **subagents:** Wait for the child and honor its exit status ([8b9d97d](https://github.com/gjtorikian/pi-workgraph/commit/8b9d97d3d1ece11528b20b18f63815a4fd4e6a51))
+
+
 ## [0.3.1](https://github.com/gjtorikian/pi-workgraph/compare/v0.3.0...v0.3.1) (2026-09-02)
 
 ### Bug Fixes
