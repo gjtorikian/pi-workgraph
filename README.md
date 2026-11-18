@@ -492,10 +492,9 @@ the npm semver. Version 2 moved the home of the state from the beads (`bd`)
 database to this package's own SQLite store; the key names, value shapes,
 and invariants are unchanged. A third-party tool (any harness, not just
 Pi) can respect or detect pi-workgraph leases by reading
-`.workgraph/workgraph.db` (read-only; `scripts/git-push-guard.mjs` is a
-worked example) and implementing what follows. Every stated
-invariant is tied to a test in this repository via an HTML comment in this
-document's source.
+`.workgraph/workgraph.db` (read-only) and implementing what follows. Every
+stated invariant is tied to a test in this repository via an HTML comment in
+this document's source.
 
 ### 1. Metadata fields
 
@@ -632,10 +631,6 @@ stealing a human's claim is worse than a stalled issue.
   bookkeeping says otherwise.
 - **Claims without lease metadata are never auto-reclaimed** — extend the
   same courtesy in your implementation.
-- **A worked detector ships in this repo**: `scripts/git-push-guard.mjs`,
-  a chaining `pre-push` hook that blocks `git push` while a designated
-  sentinel issue holds a live lease — "don't push during the restack"
-  turned into verified state. See [docs/git-push-guard.md](docs/git-push-guard.md).
 
 ### 5. Audit events
 
