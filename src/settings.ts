@@ -13,7 +13,8 @@
  *       "executors": { "planner": "in-session", "implementer": "pi-subagents" },
  *       "subagentsExecutor": true,                   // or the bridge's JSON block
  *       "store": "central",                          // keep databases out of checkouts
- *       "planApproval": "required"                 // or "auto"
+ *       "planApproval": "required",                // or "auto"
+ *       "planCritique": "off"                      // or "high-risk"
  *     }
  *   }
  *
@@ -37,6 +38,8 @@ export const SETTINGS_KEY = "workgraph";
 export interface WorkgraphSettings {
   tiers?: TierConfig;
   planApproval?: "required" | "auto";
+  /** Advisory plan critique: "off" (default) or "high-risk" (planned issues with riskTier high). */
+  planCritique?: "off" | "high-risk";
   /** Per-role executor pins, e.g. { planner: "in-session", implementer: "pi-subagents" }. */
   executors?: Record<string, string>;
   /** The pi-subagents bridge block, as config.ts parses it: `true` or `{ enabled, routes, options, versionRange }`. */
@@ -123,6 +126,14 @@ export function parseWorkgraphSettings(raw: unknown): WorkgraphSettings | undefi
       `[pi-workgraph] settings: planApproval must be "required" or "auto", got ${JSON.stringify(record.planApproval)}`,
     );
   }
+  if (record.planCritique === "off" || record.planCritique === "high-risk") {
+    out.planCritique = record.planCritique;
+  } else if (record.planCritique !== undefined) {
+    // Dropped, never guessed at: an unknown value must not turn the critique on.
+    console.error(
+      `[pi-workgraph] settings: planCritique must be "off" or "high-risk", got ${JSON.stringify(record.planCritique)}`,
+    );
+  }
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -174,6 +185,14 @@ export function settingsPlanApproval(
   return sources.project?.planApproval ?? sources.global?.planApproval;
 }
 
+/** Plan-critique mode from settings (project over global), if either sets it. */
+export function settingsPlanCritique(
+  location: SettingsLocation = {},
+): WorkgraphSettings["planCritique"] {
+  const sources = workgraphSettings(location);
+  return sources.project?.planCritique ?? sources.global?.planCritique;
+}
+
 /** Roles an executor pin may name (the protocol's role vocabulary). */
 export const PINNABLE_ROLES = [
   "planner",
@@ -182,6 +201,7 @@ export const PINNABLE_ROLES = [
   "revision",
   "verifier",
   "finalizer",
+  "plan_critic",
 ] as const;
 
 /** Parse `{ role: executorId }`; unknown roles and empty ids are dropped. */

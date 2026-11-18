@@ -6,14 +6,16 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveConfig } from "./config.ts";
 import {
   effectiveTiers,
   noteSessionCwd,
+  parseExecutorPins,
   parseWorkgraphSettings,
   settingsExecutors,
   settingsPlanApproval,
+  settingsPlanCritique,
   settingsStore,
   workgraphSettings,
 } from "./settings.ts";
@@ -41,6 +43,17 @@ afterEach(() => {
   for (const graph of graphs.splice(0)) graph.cleanup();
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
+
+/** Run `body` with console.error silenced, returning its result and the lines it logged. */
+function withLoggedErrors<T>(body: () => T): { result: T; logged: string[] } {
+  const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    const result = body();
+    return { result, logged: spy.mock.calls.map((args) => args.join(" ")) };
+  } finally {
+    spy.mockRestore();
+  }
+}
 
 describe("parseWorkgraphSettings", () => {
   it("accepts a table for tiers and a plan-approval mode", () => {
@@ -128,7 +141,59 @@ describe("planApproval from settings", () => {
   });
 });
 
+describe("planCritique from settings", () => {
+  it("parses both modes from the block", () => {
+    expect(parseWorkgraphSettings({ workgraph: { planCritique: "high-risk" } })).toEqual({ planCritique: "high-risk" });
+    expect(parseWorkgraphSettings({ workgraph: { planCritique: "off" } })).toEqual({ planCritique: "off" });
+  });
+
+  it("the project value wins over the global one; unset in both reads as undefined", () => {
+    const agentDir = tempDir("agent");
+    const project = tempDir("project");
+    expect(settingsPlanCritique({ agentDir, cwd: project })).toBeUndefined();
+
+    writeSettings(agentDir, undefined, { workgraph: { planCritique: "high-risk" } });
+    expect(settingsPlanCritique({ agentDir, cwd: project })).toBe("high-risk");
+
+    writeSettings(project, ".pi", { workgraph: { planCritique: "off" } });
+    expect(settingsPlanCritique({ agentDir, cwd: project })).toBe("off");
+    // A project block that does not set the key leaves the global value in force.
+    writeSettings(project, ".pi", { workgraph: { planApproval: "auto" } });
+    expect(settingsPlanCritique({ agentDir, cwd: project })).toBe("high-risk");
+  });
+
+  it("drops an invalid planCritique value with one log line, never turning the critique on", () => {
+    for (const value of ["banana", "HIGH-RISK", "all", true, 1, null]) {
+      const { result, logged } = withLoggedErrors(() =>
+        parseWorkgraphSettings({ workgraph: { planCritique: value, store: "central" } }),
+      );
+      expect(result, `planCritique ${JSON.stringify(value)} must be dropped`).toEqual({ store: "central" });
+      expect(logged).toEqual([
+        `[pi-workgraph] settings: planCritique must be "off" or "high-risk", got ${JSON.stringify(value)}`,
+      ]);
+    }
+  });
+
+  it("an invalid project value does not mask a valid global one", () => {
+    const agentDir = tempDir("agent");
+    const project = tempDir("project");
+    writeSettings(agentDir, undefined, { workgraph: { planCritique: "high-risk" } });
+    writeSettings(project, ".pi", { workgraph: { planCritique: "sometimes" } });
+    const { result } = withLoggedErrors(() => settingsPlanCritique({ agentDir, cwd: project }));
+    expect(result).toBe("high-risk");
+  });
+});
+
 describe("executor pins from settings", () => {
+  it("keeps a plan_critic pin", () => {
+    const { result, logged } = withLoggedErrors(() => parseExecutorPins({ plan_critic: "pi-subagents" }));
+    expect(result).toEqual({ plan_critic: "pi-subagents" });
+    expect(logged).toEqual([]);
+    expect(
+      parseWorkgraphSettings({ workgraph: { executors: { planner: "in-session", plan_critic: " pi-subagents " } } }),
+    ).toEqual({ executors: { planner: "in-session", plan_critic: "pi-subagents" } });
+  });
+
   it("parses the executors block, merges project over global, and feeds config", () => {
     expect(
       parseWorkgraphSettings({

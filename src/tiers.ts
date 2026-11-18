@@ -28,6 +28,7 @@ export const TIER_ROLES = [
   "revision",
   "verifier",
   "finalizer",
+  "plan_critic",
   // Reserved: the read-only research helper ("who searches"). Accepted in
   // tables today so a roster can name it; dispatched once the role lands.
   "scout",

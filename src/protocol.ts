@@ -80,6 +80,14 @@ export function newEnvelope(now: () => number = Date.now): EnvelopeT {
  * the planning phase when some offer advertises the role (README "The planner
  * tier"). Order is narrative — the lifecycle runs planner → implementer →
  * reviewer, with `revision`/`verifier` as the gate's own sub-roles.
+ *
+ * `plan_critic` is the same kind of v1-safe addition: an adapter that never
+ * offers it is unaffected, because a role is only requested from an executor
+ * that advertises it. The one hazard is version skew: a build that validates
+ * against the shorter enum rejects a whole offer naming `plan_critic`. Both
+ * sides of the protocol ship in this repository, so they upgrade together.
+ * It is listed last because it is an advisory sub-step of planning, not a
+ * lifecycle stage.
  */
 export const ExecutorRole = StringEnum([
   "planner",
@@ -88,6 +96,7 @@ export const ExecutorRole = StringEnum([
   "revision",
   "verifier",
   "finalizer",
+  "plan_critic",
 ]);
 export type ExecutorRoleT = Static<typeof ExecutorRole>;
 
