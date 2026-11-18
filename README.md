@@ -159,6 +159,94 @@ ready ──claim (planner)──► planning ──plan recorded──► plan_
 - `--workgraph-plan-approval auto` restores the straight-through planner →
   implementer flow.
 
+### Plan critique (optional)
+
+For high-risk `planned` work, a second reader can check the recorded plan
+before it parks: a `plan_critic` run with fresh context (it never saw the
+planner's conversation) reads the plan against the repository and reports
+up to 5 gaps, each a question an implementer who received only the plan
+would have to guess the answer to.
+
+The critique is **advisory**. It never approves, rejects, or changes a
+plan, and the implementer never sees the gaps. They are for you, at the
+gate: approve anyway, or reject and put the gap in your feedback. If the
+critic is unavailable for any reason, the plan parks without a critique and
+the status says why.
+
+It is off by default. Turn it on in Pi's settings:
+
+```jsonc
+{
+  "workgraph": {
+    "planCritique": "high-risk",          // default "off"
+    "tiers": {
+      "plan_critic": { "model": "anthropic/claude-opus-*", "thinking": "high" }
+    },
+    "executors": { "plan_critic": "pi-subagents" },
+    "subagentsExecutor": true
+  }
+}
+```
+
+`--workgraph-plan-critique` / `WORKGRAPH_PLAN_CRITIQUE` is the headless
+override (flag/env > project > global, like `planApproval`). The tier is
+yours to choose; the code names no model. Enabling the bridge also changes
+who runs the other roles, and [Who runs what](#who-runs-what) shows how to
+pin them.
+
+`workgraph_status` prints each gap under the step it concerns, marked `?`:
+
+```text
+Plan awaiting your review — workgraph_approve_plan with decision approve, or reject plus feedback:
+Critique (advisory): 2 gaps, marked "?" under the steps they concern.
+add retry backoff to the client
+
+Steps:
+1. add a RetryPolicy type
+   targets: src/retry.ts
+   ? is the policy per client or per request?
+2. handle retries in the request path
+   ? which errors retry, 429 only or 5xx too?
+```
+
+A gap about the plan as a whole follows the steps under `Plan as a whole:`,
+and a plan with nothing to guess at reads `build-ready, 0 gaps`. The
+per-turn "Plans awaiting your review" line carries the count as a suffix,
+`· critique: 2 gaps`.
+
+A critique is attempted only when all of these hold:
+
+- `planCritique` is `"high-risk"`.
+- The issue's `riskTier` is `high`.
+- `planApproval` is `required`. With `auto` there is no gate to show the
+  gaps at.
+- An executor offers the `plan_critic` role. The in-session executor does
+  not; enable the pi-subagents bridge. When no executor offers it, the plan
+  parks with `Critique unavailable: no plan_critic executor.`
+
+The limits, stated plainly:
+
+- **One attempt, 10 minutes.** The critic gets one try and a 10-minute
+  wait. The bridge launches upstream runs one at a time, and time the
+  critic spends queued behind another bridge run counts against the 10
+  minutes. When the wait runs out, the critic is cancelled and the plan
+  parks without a critique.
+- **It reads the source checkout.** The critic sees your working tree,
+  uncommitted files included. An implementer in a worktree starts from the
+  committed HEAD, so a gap that exists only because a file is not committed
+  yet is invisible to the critic.
+- **Closing Pi mid-critique** parks the plan without a critique. It is not
+  retried.
+- **Same model, same blind spots.** A critic on the planner's model tends
+  to miss what the planner missed. The summary says when that happened
+  (`2 gaps, same model as planner`); a `plan_critic` tier that resolves to
+  a different model avoids it.
+
+The idea comes from Google's
+[Elephant-Goldfish Model](https://github.com/google/elephant-goldfish-model):
+a reader with none of the author's context finds the gaps the author cannot
+see.
+
 ## Model tiers
 
 One table routes roles to models, for every executor at once. Declare it
@@ -187,8 +275,10 @@ in session, the current thinking level (your global default, if you set
 one); in pi-subagents, the launched profile's default. Set it explicitly
 for any role you care about.
 Roles: `planner`, `implementer`, `reviewer`, `revision`, `verifier`,
-`finalizer`, and `scout` (reserved for the read-only research helper; it
-can be named now and is dispatched once that role lands).
+`finalizer`, `plan_critic` (the optional
+[plan critique](#plan-critique-optional)), and `scout` (reserved for the
+read-only research helper; it can be named now and is dispatched once that
+role lands).
 
 From inside a session, `workgraph_tiers` sets or shows the table for the
 current repository (stored in its workspace), and `/workgraph tiers
@@ -236,7 +326,8 @@ bridge enabled planning would leave your session. Pin it:
       "planner": "in-session",          // plan in the chat, with you watching
       "implementer": "pi-subagents",    // build in a worktree
       "reviewer": "pi-subagents",       // independent review in a fresh child
-      "revision": "pi-subagents"
+      "revision": "pi-subagents",
+      "plan_critic": "pi-subagents"     // only asked when planCritique is on
     },
     "subagentsExecutor": true          // enable the bridge here too — no flag needed
   }
@@ -248,6 +339,10 @@ fail-closed rule as `--workgraph-executor-id`, which these override role by
 role). Executor ids: `in-session` and `pi-subagents`; your own adapter's
 `executorId` works the same way. `--workgraph-executors` /
 `WORKGRAPH_EXECUTORS` is the headless override (JSON).
+
+`plan_critic` pins like any other role, with one difference: its pin never
+decides a claim. A pin on an executor that does not offer the role costs
+the [critique](#plan-critique-optional), and the plan parks without one.
 
 Note the in-session executor offers `planner` and `implementer` only: with
 nothing else online, `reviewed` and `planned` work reaches judgment and
@@ -316,6 +411,7 @@ Resolution order per value: CLI flag > environment variable > default.
 | Flag                                     | Environment variable                   | Default                         | Purpose                                                                                                                                 |
 | ---------------------------------------- | -------------------------------------- | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
 | `--workgraph-plan-approval`              | `WORKGRAPH_PLAN_APPROVAL`              | `required`                      | Plan gate for `planned` work: `required` (a human approves each plan) or `auto`                                                         |
+| `--workgraph-plan-critique`              | `WORKGRAPH_PLAN_CRITIQUE`              | `off`                           | Advisory critique of a plan before it parks: `off` or `high-risk` (see [Plan critique](#plan-critique-optional))                        |
 | `--workgraph-tiers`                      | `WORKGRAPH_TIERS`                      | what `workgraph_tiers` stored   | Headless override of the settings-file role → model table, as JSON (see [Model tiers](#model-tiers))                                 |
 | `--workgraph-executors`                  | `WORKGRAPH_EXECUTORS`                  | settings `executors`            | Per-role executor pins as JSON (see [Who runs what](#who-runs-what))                                                                     |
 | `--workgraph-store`                      | `WORKGRAPH_STORE`                      | settings `store`, else `repo`   | Where databases live: `repo`, `central`, or an absolute directory (see [Where the store lives](#where-the-store-lives))               |
@@ -558,9 +654,11 @@ for the `workgraph-lease` prefix. The seven lease kinds:
 | `fencing-loss`          | A holder's heartbeat discovered its lease was reclaimed                            |
 
 The coordinator and tools add lifecycle kinds under the same prefix —
-among them `approve`, `plan-review` (a plan was parked for a human),
-`plan-approved`, `plan-rejected`, `revision-requested`, `escalated`, and
-`judgment-closed`.
+among them `approve`, `plan-critique` (a critic's gaps were recorded
+against a plan), `plan-critique-unavailable` (a critique was attempted and
+the plan parked without one, with the reason), `plan-review` (a plan was
+parked for a human), `plan-approved`, `plan-rejected`,
+`revision-requested`, `escalated`, and `judgment-closed`.
 Audit writes never block lease operations: the protocol stays correct
 without the trail, and a broken audit surface must not take claiming down
 with it.
@@ -721,7 +819,10 @@ Four rules the code enforces, each with a reason:
   enforces `targets`, and a planner's refined `acceptanceCriteria` is
   recorded in the plan trail rather than overwriting the approved criteria
   on the issue — a planner that could rewrite its own bar would defeat the
-  judgment gate.
+  judgment gate. The same holds for a
+  [plan critique](#plan-critique-optional): its gaps are recorded beside
+  the plan for the human at the gate, the core never acts on them, and the
+  implementer's request does not carry them.
 - **Legacy issues never plan.** Their compatibility entry is
   `implementing`, so compat-mode dispatch stays predictable.
 
@@ -765,12 +866,13 @@ The bridge ships **disabled**. Opt in explicitly:
 
 When configured and version-gated, it answers discovery as
 `executorId: "pi-subagents"` offering `planner`, `implementer`, `reviewer`,
-and `revision` roles with `isolation: "worktree"` and a priority above the
-in-session adapter — an operator who opted in prefers isolated background
-workers. Unconfigured, the bridge is **never registered**: an unconfigured
-extension answers discovery with no subagents offer and holds zero bus
-subscriptions (a double gate — index.ts never calls the register function,
-and the register function re-checks config itself).
+`revision`, and `plan_critic` roles with `isolation: "worktree"` and a
+priority above the in-session adapter — an operator who opted in prefers
+isolated background workers. Unconfigured, the bridge is **never
+registered**: an unconfigured extension answers discovery with no subagents
+offer and holds zero bus subscriptions (a double gate — index.ts never
+calls the register function, and the register function re-checks config
+itself).
 
 Bridge semantics:
 
@@ -795,6 +897,13 @@ Bridge semantics:
 - **Reported provenance.** Completions carry the model upstream _reported
   using_, never the one requested; the provider is split off only when the
   `provider/id` format is unambiguous.
+- **A plan critic judges a plan, never an implementation.** `plan_critic`
+  runs launch the upstream `reviewer` profile by default (upstream ships no
+  plan-critic profile), in the source checkout like the planner. The task
+  says that no implementation exists and asks one question: what would an
+  implementer who receives only this plan have to guess? Route the role to
+  another profile with `routes.planned.plan_critic`. Its structured output
+  rides the completion as `critique`, never as a verdict.
 
 The adapter accepts up to four runs and queues their foreground calls, launching
 one at a time because pi-subagents permits only one foreground call per session.
@@ -826,7 +935,8 @@ and role without hard-coding model IDs into the control plane:
       "planner": "planner",
       "implementer": "worker",
       "reviewer": "reviewer",
-      "revision": "fixer"
+      "revision": "fixer",
+      "plan_critic": "reviewer"
     }
   }
 }'

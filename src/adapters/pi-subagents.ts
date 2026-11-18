@@ -105,7 +105,9 @@ export const UPSTREAM_EVENTS = {
  * request a worktree-isolated fresh worker; reviewer runs are SEPARATE
  * fresh launches carrying the structured-verdict output schema — never a
  * finalization pass on the implementer's own run. Planner runs use the
- * upstream `planner` profile and structured output. `verifier` is
+ * upstream `planner` profile and structured output. Plan-critic runs use
+ * the upstream `reviewer` profile by default and carry the plan-critique
+ * output schema; they judge a PLAN, never an implementation. `verifier` is
  * deliberately unmapped (and not offered).
  */
 export const ROLE_MAP: Partial<
@@ -116,6 +118,7 @@ export const ROLE_MAP: Partial<
   revision: { agent: "worker", worktree: true },
   reviewer: { agent: "reviewer", worktree: false },
   finalizer: { agent: "worker", worktree: false },
+  plan_critic: { agent: "reviewer", worktree: false },
 };
 
 export const PI_SUBAGENTS_ROLES: ExecutorRoleT[] = [
@@ -123,6 +126,7 @@ export const PI_SUBAGENTS_ROLES: ExecutorRoleT[] = [
   "implementer",
   "reviewer",
   "revision",
+  "plan_critic",
 ];
 
 /** Resolve a named upstream profile without coupling the core to model IDs. */
@@ -309,7 +313,17 @@ export function buildSubagentTask(
   if (msg.issue.acceptanceCriteria) {
     lines.push("", `Acceptance criteria: ${msg.issue.acceptanceCriteria}`);
   }
-  if (msg.plan) lines.push("", "Accepted implementation plan:", msg.plan);
+  if (msg.plan) {
+    // A critic reads the plan BEFORE the human gate: calling it accepted
+    // would tell the critic the decision it informs was already made.
+    lines.push(
+      "",
+      msg.role === "plan_critic"
+        ? "Proposed implementation plan (not yet approved by a human):"
+        : "Accepted implementation plan:",
+      msg.plan,
+    );
+  }
   if (msg.decision) lines.push("", ...renderDecision(msg.decision));
   if (msg.instructions)
     lines.push("", "Workflow instructions:", msg.instructions);
@@ -336,6 +350,21 @@ export function buildSubagentTask(
     lines.push(
       "",
       "Produce a concrete implementation plan as structured output matching the provided schema. Do not modify product code.",
+    );
+  }
+  if (msg.role === "plan_critic") {
+    // The default upstream profile is `reviewer`, whose own prompt reviews
+    // an implementation. The task has to say plainly that none exists, or
+    // the critic goes looking for changes instead of gaps in the plan.
+    lines.push(
+      "",
+      "You are a PLAN CRITIC reading this plan cold. You have the issue, its acceptance criteria, the proposed plan above, and this repository. You did not see how the plan was made. No implementation exists yet: there is nothing to review except the plan.",
+      "Answer one question: what would an implementer who receives only this plan have to guess?",
+      "Report at most 5 gaps, most important first, as structured output matching the provided schema. For each gap, `step` is the 1-based number of the plan step it concerns (omit it for a gap about the plan as a whole), and `note` is the specific question the implementer would have to answer, in one sentence.",
+      "Worth reporting: a step with two plausible readings; a decision the plan leaves open; a file, function, or type the plan names that does not exist in this repository and is not marked as new; an acceptance criterion that no step delivers.",
+      "Not worth reporting: style preferences, alternative designs, general risks, or open questions the plan already lists.",
+      "If the plan can be built as written, return an empty gaps list. An empty list is a valid and useful answer.",
+      "Do not modify any files. Your output is advisory: a human reads it next to the plan and decides.",
     );
   }
   if (msg.priorFindings !== undefined && msg.priorFindings.length > 0) {
@@ -610,9 +639,17 @@ export function registerPiSubagentsExecutor(
       run.role === "planner" && first?.structuredOutput !== undefined
         ? first.structuredOutput
         : undefined;
+    // The critique rides ONLY a plan-critic run's structured output, under
+    // the same rule: emitted as-is, never synthesized. The coordinator's
+    // critique parser is the validator, and its failure path parks the plan.
+    const critique =
+      run.role === "plan_critic" && first?.structuredOutput !== undefined
+        ? first.structuredOutput
+        : undefined;
     const completed: RunCompletedT & {
       verdict?: unknown;
       plan?: unknown;
+      critique?: unknown;
       finalization?: unknown;
       workspace?: WorkflowWorkspace;
     } = {
@@ -642,6 +679,7 @@ export function registerPiSubagentsExecutor(
       },
       ...(verdict !== undefined ? { verdict } : {}),
       ...(plan !== undefined ? { plan } : {}),
+      ...(critique !== undefined ? { critique } : {}),
       ...(run.role === "finalizer"
         ? { finalization: first?.structuredOutput }
         : {}),
@@ -730,8 +768,15 @@ export function registerPiSubagentsExecutor(
         return;
       }
 
+      // Planning-time roles read the source checkout: the workflow's
+      // workspace is cut for the implementer, so none exists yet when a
+      // planner or a plan critic runs, and resolving one would reject them.
       let workspace: WorkflowWorkspace | undefined;
-      if (deps.getConfig().finalization && msg.role !== "planner") {
+      if (
+        deps.getConfig().finalization &&
+        msg.role !== "planner" &&
+        msg.role !== "plan_critic"
+      ) {
         try {
           if (!msg.workspace.repoPath)
             throw new Error("workflow request is missing its repository path");
