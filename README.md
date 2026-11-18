@@ -229,7 +229,7 @@ The limits, stated plainly:
 - **One attempt, 10 minutes.** The critic gets one try and a 10-minute
   wait. The bridge launches upstream runs one at a time, and time the
   critic spends queued behind another bridge run counts against the 10
-  minutes. When the wait runs out, the critic is cancelled and the plan
+  minutes. When the wait runs out, the critic is canceled and the plan
   parks without a critique.
 - **It reads the source checkout.** The critic sees your working tree,
   uncommitted files included. An implementer in a worktree starts from the

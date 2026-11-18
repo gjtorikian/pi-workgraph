@@ -586,7 +586,7 @@ describe("the critic's completion", () => {
 // cancel
 // ---------------------------------------------------------------------------
 
-describe("cancelling a plan critic", () => {
+describe("canceling a plan critic", () => {
   // Only an in-flight critic is covered. A critic still queued behind
   // another bridge run was never submitted upstream, so the bridge cancels
   // it locally and nothing reaches the fake (`fake.cancels` stays empty);

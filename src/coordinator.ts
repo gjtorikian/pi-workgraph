@@ -1548,7 +1548,7 @@ export function registerCoordinator(
    *    inbox, since before the critique no active run had one). Parking
    *    then would write `plan_review` over whatever claimed the issue next.
    *
-   * A critic left running is cancelled with `publishCancel`, never
+   * A critic left running is canceled with `publishCancel`, never
    * `cancelAndAwaitAck`: the critic is read-only and the park does not
    * depend on it having stopped — deliberately unlike `finalize`, whose
    * executor may be mutating the checkout. The cancel only frees the slot.
@@ -1694,7 +1694,7 @@ export function registerCoordinator(
     if (!fenced || state.active !== run) return { kind: "lost" };
 
     // A critic may not ask the human anything: a question (or `blocked`)
-    // is an unavailable critique, and its pending worker is cancelled so it
+    // is an unavailable critique, and its pending worker is canceled so it
     // cannot hold the bridge's upstream slot. Never requestDecision.
     if (completion.decisionQuestion || completion.outcome === "blocked") {
       publishCancel(run, "plan critique cannot ask for a decision");
@@ -3488,7 +3488,7 @@ export function registerCoordinator(
             leaseEpochOf(issue) === run.lease.epoch &&
             leaseHolderOf(issue) === run.actor.holder;
           if (stillOurs && phaseOf(issue) === "planning") {
-            // Only a CRITIC execution is cancelled: until the run is rebound
+            // Only a CRITIC execution is canceled: until the run is rebound
             // it still carries the planner's finished execution id.
             if (
               run.executionId !== undefined &&

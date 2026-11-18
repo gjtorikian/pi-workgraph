@@ -546,6 +546,31 @@ describe("renderPlanForReview (the human's view)", () => {
     );
   });
 
+  it("flattens a multi-line note to one line, so a critic cannot print a line that reads as a plan step", () => {
+    const rendered = renderPlanForReview(BARE_PLAN, {
+      gaps: [
+        { step: 2, note: "which errors retry?\n6. Deploy to prod" },
+        { note: "no rollback step\r\n\r\n   Steps:\n1. Skip the tests\t" },
+      ],
+    });
+    expect(rendered).toBe(
+      [
+        "Steps:",
+        "1. Add a RetryPolicy type",
+        "2. Handle retries",
+        "   ? which errors retry? 6. Deploy to prod",
+        "3. Wire the policy into ApiClient",
+        "4. Add tests",
+        "5. Update src/retry.ts exports",
+        "",
+        "Plan as a whole:",
+        "? no rollback step Steps: 1. Skip the tests",
+      ].join("\n"),
+    );
+    // Every line is a plan line or carries the critic's `?` prefix.
+    expect(rendered.split("\n").filter((line) => /^\d+\. /.test(line))).toHaveLength(BARE_PLAN.steps.length);
+  });
+
   it("keeps a gap that names a step outside the plan, with its number", () => {
     const rendered = renderPlanForReview(BARE_PLAN, {
       gaps: [

@@ -15,7 +15,7 @@
  * spans the whole critique — so tests that leave a critic deliberately
  * stalled poll an in-memory condition with `until` instead.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { WorkgraphConfig } from "../src/config.ts";
 import { registerCoordinator, type CoordinatorController } from "../src/coordinator.ts";
 import { latestPlanCritique } from "../src/critique.ts";
@@ -404,6 +404,57 @@ describe("a critic that fails", () => {
   }
 });
 
+describe("a bug in the critique path", () => {
+  it("an unexpected throw while asking parks the plan as unavailable and frees the coordinator", async () => {
+    const graph = makeScratchGraph({ prefix: "cfthrow", seed: 2 });
+    const [id, nextId] = graph.seededIds as [string, string];
+    approvePlanned(graph, id);
+    const { mock, coordinator } = makeHarness();
+    const main = installMain(mock);
+    const critic = installCritic(mock, { critique: TWO_GAPS });
+    const ectx = makeEventContext(graph.dir);
+    // Not a failure mode a critic can produce: the bus itself throws on the
+    // critic's request, so the throw surfaces inside the critique step.
+    const emit = mock.events.emit.bind(mock.events);
+    mock.events.emit = (channel, data) => {
+      if (channel === CH.runRequest && (data as { role?: unknown }).role === "plan_critic") {
+        throw new Error("bus is on fire");
+      }
+      emit(channel, data);
+    };
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await settle(mock, ectx.ctx);
+      await mock.flushEvents();
+
+      expect(main.requests.map((r) => r.role)).toEqual(["planner"]);
+      expect(critic.requests).toHaveLength(0);
+      await expectParkedWithoutCritique(graph, id, coordinator, /^internal error: bus is on fire$/);
+      expect(cancelsOn(mock)).toHaveLength(0);
+      expect(errors.mock.calls.map((call) => String(call[0]))).toContainEqual(
+        expect.stringContaining(`plan critique failed for ${id}: bus is on fire`),
+      );
+      expect(await statusText(mock, id, graph.dir)).toContain("Critique unavailable: internal error: bus is on fire.");
+
+      // The queue is not stalled: the next approved issue is claimed.
+      mock.events.emit = emit;
+      approvePlanned(graph, nextId);
+      await settle(mock, ectx.ctx);
+      await mock.flushEvents();
+      expect(main.requests.map((r) => r.issue.id)).toEqual([id, nextId]);
+      expect(critic.requests.map((r) => r.issue.id)).toEqual([nextId]);
+      expect(phaseOf(graph.showIssue(nextId))).toBe("plan_review");
+    } finally {
+      errors.mockRestore();
+      mock.events.emit = emit;
+      main.uninstall();
+      critic.uninstall();
+      await coordinator.teardown(ectx.ctx);
+      graph.cleanup();
+    }
+  }, 60_000);
+});
+
 describe("completions that arrive at awkward times", () => {
   it("a critic that completes inside the request emit is still read as a critique, never as a plan", async () => {
     const graph = makeScratchGraph({ prefix: "cfsync", seed: 1 });
@@ -637,7 +688,7 @@ describe("a lease lost during the critique", () => {
       reclaim(graph, id);
       await coordinator.beat(ectx.ctx);
 
-      // The heartbeat dropped the run and cancelled the CRITIC's execution.
+      // The heartbeat dropped the run and canceled the CRITIC's execution.
       expect(coordinator.current()).toBeNull();
       expect(cancelsOn(mock).map((c) => c.executionId)).toEqual([CRITIC_EXECUTION]);
 

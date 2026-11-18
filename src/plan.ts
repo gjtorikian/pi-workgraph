@@ -218,8 +218,14 @@ function planLines(plan: PlanT, notes?: ReviewNotes): string[] {
  * its own line under the step it names, prefixed `   ? `. A gap with no
  * step, or one naming a step outside the rendered range (past the end of the
  * plan, or folded past {@link MAX_STEPS}), follows the last step under a
- * `Plan as a whole:` line with its step number kept in the text — no gap is
- * ever dropped at render time. Gaps keep the critic's order.
+ * `Plan as a whole:` line with its step number kept in the text — step
+ * routing never drops a gap. The render is still bounded by
+ * {@link MAX_REVIEW_RENDER_CHARS}, so on a plan whose own text exceeds that
+ * cap the tail is cut, late gaps included. Gaps keep the critic's order.
+ *
+ * Each note is flattened to ONE line first. A critic's line break would
+ * otherwise start a line without the `?` prefix, and a note such as
+ * "…\n6. Deploy to prod" would read as a plan step in the approval view.
  *
  * Never pass the result to an executor: a critique is advice for the human
  * approving the plan, and an implementer that read the gaps would treat a
@@ -232,15 +238,16 @@ export function renderPlanForReview(plan: PlanT, critique?: PlanCritiqueT): stri
   const byStep = new Map<number, string[]>();
   const wholePlan: string[] = [];
   for (const gap of critique.gaps) {
+    const note = gap.note.replace(/\s+/g, " ").trim();
     if (gap.step === undefined) {
-      wholePlan.push(gap.note);
+      wholePlan.push(note);
     } else if (!Number.isInteger(gap.step) || gap.step < 1 || gap.step > rendered) {
       // Not a rendered step: keep the number so the reader can still place it.
-      wholePlan.push(`(step ${gap.step}) ${gap.note}`);
+      wholePlan.push(`(step ${gap.step}) ${note}`);
     } else {
       const notes = byStep.get(gap.step);
-      if (notes) notes.push(gap.note);
-      else byStep.set(gap.step, [gap.note]);
+      if (notes) notes.push(note);
+      else byStep.set(gap.step, [note]);
     }
   }
   return truncate(planLines(plan, { byStep, wholePlan }).join("\n"), MAX_REVIEW_RENDER_CHARS);

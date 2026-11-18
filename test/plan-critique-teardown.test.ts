@@ -222,7 +222,7 @@ describe("teardown during a plan critique", () => {
       expect(coordinator.current()).toBeNull();
       await expectParkedByTeardown(graph, id);
 
-      // The cancelled critic answering anyway changes nothing.
+      // The canceled critic answering anyway changes nothing.
       const kinds = await auditKinds(graph.dir, id);
       critic.complete();
       await mock.flushEvents();
@@ -255,7 +255,7 @@ describe("teardown during a plan critique", () => {
       expect(cancelsOn(mock)).toHaveLength(0);
 
       // The accept window then closes: the never-accepted request is
-      // cancelled so it cannot start later, and nothing else moves.
+      // canceled so it cannot start later, and nothing else moves.
       const kinds = await auditKinds(graph.dir, id);
       await mock.flushEvents();
       const cancels = cancelsOn(mock);
@@ -273,7 +273,7 @@ describe("teardown during a plan critique", () => {
     }
   }, 60_000);
 
-  it("parks the plan when no critic had been asked yet, without cancelling the planner's finished run", async () => {
+  it("parks the plan when no critic had been asked yet, without canceling the planner's finished run", async () => {
     const graph = makeScratchGraph({ prefix: "ctddisc", seed: 1 });
     const id = graph.seededIds[0]!;
     approvePlanned(graph, id);
