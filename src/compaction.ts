@@ -9,14 +9,19 @@
  * 0.83 types) — returning a full `compaction: CompactionResult` from our own
  * `compact()` call is the only way to shape an in-flight compaction.
  *
+ * The summary call runs at the session's thinking level unless
+ * `--workgraph-compaction-reasoning-level` overrides it: reasoning tokens
+ * share the summary's output budget, so a high-reasoning session can hit
+ * `maxTokens` mid-summary.
+ *
  * Errors NEVER block compaction: any failure — no in-flight issue, no model,
  * unresolvable credentials (`auth.ok === false`), or a thrown `compact()` —
  * returns `undefined` so the default compaction proceeds.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { compact } from "@earendil-works/pi-coding-agent";
-import { heldLeases } from "./lease.ts";
 import { resolveConfig } from "./config.ts";
+import { heldLeases } from "./lease.ts";
 
 /** The in-flight work the summary must retain. */
 export interface CurrentWork {
@@ -98,7 +103,7 @@ export function registerCompactionTakeover(
       const lease = heldLeases(cwd)[0];
       return lease ? { issueId: lease.issueId } : null;
     });
-  const config = resolveConfig(pi)
+
   pi.on("session_before_compact", async (event, ctx) => {
     try {
       const current = getCurrent(ctx.cwd);
@@ -111,6 +116,11 @@ export function registerCompactionTakeover(
         event.customInstructions,
         current,
       );
+      // Resolved per compaction, never at registration: flags are not
+      // readable at extension load, so a value captured there would
+      // silently drop `--workgraph-compaction-reasoning-level`.
+      const thinkingLevel =
+        resolveConfig(pi).compactionReasoningLevel ?? ctx.thinkingLevel;
       const result = await compactFn(
         event.preparation,
         model,
@@ -118,7 +128,7 @@ export function registerCompactionTakeover(
         sendableHeaders(auth.headers),
         instructions,
         event.signal,
-        config.reasoningLevel || ctx.thinkingLevel,
+        thinkingLevel,
         undefined,
         auth.env,
       );
