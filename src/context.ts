@@ -25,7 +25,7 @@ import {
 } from "./lifecycle.ts";
 import { formatCountdown } from "./status.ts";
 import type { WorkIssue } from "./types.ts";
-import { WORKGRAPH_PLAN_SUMMARY_KEY } from "./types.ts";
+import { WORKGRAPH_PLAN_CRITIQUE_KEY, WORKGRAPH_PLAN_SUMMARY_KEY } from "./types.ts";
 
 /** Cache TTL: bounds both store churn and staleness (stale-list conflicts
  *  resolve as clean claim failures, so 10 s is acceptable). */
@@ -223,8 +223,13 @@ export function renderWorkgraphSection(
     lines.push("Plans awaiting your review (workgraph_status shows the plan; workgraph_approve_plan approves or rejects it):");
     for (const issue of state.planReview) {
       const summary = issue.metadata?.[WORKGRAPH_PLAN_SUMMARY_KEY];
+      // Metadata only: the gaps themselves are one workgraph_status away,
+      // and a comment read per parked plan does not belong on the per-turn path.
+      const critique = issue.metadata?.[WORKGRAPH_PLAN_CRITIQUE_KEY];
       lines.push(
-        `- ${issue.id} ${issue.title}${typeof summary === "string" && summary ? ` — ${summary}` : ""}`,
+        `- ${issue.id} ${issue.title}${typeof summary === "string" && summary ? ` — ${summary}` : ""}${
+          typeof critique === "string" && critique ? ` · critique: ${critique}` : ""
+        }`,
       );
     }
   }

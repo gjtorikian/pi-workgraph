@@ -99,3 +99,42 @@ describe("resolution", () => {
     expect(tierFor("nonsense")).toBeUndefined();
   });
 });
+
+describe("the plan_critic tier", () => {
+  it("parses as a string or an object spec", () => {
+    expect(parseTiersValue('{"plan_critic":"anthropic/claude-opus-*"}')).toEqual({
+      plan_critic: { model: "anthropic/claude-opus-*" },
+    });
+    expect(parseTiersValue('{"plan_critic":{"model":"openai/gpt-5","thinking":"high"}}')).toEqual({
+      plan_critic: { model: "openai/gpt-5", thinking: "high" },
+    });
+  });
+
+  it("resolves against the registry and answers tierFor", () => {
+    const { resolved, unresolved } = resolveTiers(REGISTRY, {
+      planner: { model: "anthropic/claude-sonnet-*" },
+      plan_critic: { model: "anthropic/claude-opus-*", thinking: "high" },
+    });
+    expect(unresolved).toEqual([]);
+    expect(resolved.plan_critic).toMatchObject({ role: "plan_critic", id: "anthropic/claude-opus-5", thinking: "high" });
+    expect(describeTiers(resolved)).toEqual([
+      "planner: anthropic/claude-sonnet-4-5",
+      "plan_critic: anthropic/claude-opus-5 (thinking high)",
+    ]);
+    setResolvedTiers(resolved);
+    expect(tierFor("plan_critic")?.id).toBe("anthropic/claude-opus-5");
+  });
+
+  it("has no built-in default: tierFor(\"plan_critic\") is undefined unless a table names the role", () => {
+    expect(tierFor("plan_critic")).toBeUndefined();
+    // A table that names other roles does not lend the critic a model either.
+    setResolvedTiers(
+      resolveTiers(REGISTRY, {
+        planner: { model: "anthropic/claude-opus-*" },
+        reviewer: { model: "openai/gpt-5" },
+      }).resolved,
+    );
+    expect(tierFor("planner")?.id).toBe("anthropic/claude-opus-5");
+    expect(tierFor("plan_critic")).toBeUndefined();
+  });
+});

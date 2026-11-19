@@ -11,6 +11,7 @@ import {
   parseExecutorPins,
   settingsExecutors,
   settingsPlanApproval,
+  settingsPlanCritique,
   settingsStore,
   settingsSubagentsExecutor,
 } from "./settings.ts";
@@ -23,7 +24,8 @@ export type SubagentsRoleRoutes = Partial<
     | "reviewer"
     | "revision"
     | "verifier"
-    | "finalizer",
+    | "finalizer"
+    | "plan_critic",
     string
   >
 >;
@@ -134,6 +136,11 @@ export interface WorkgraphConfig {
    */
   planApproval?: "required" | "auto";
   /**
+   * Advisory plan critique: `off` (the default) or `high-risk` (planned
+   * issues with riskTier high). An unknown value resolves to `off`.
+   */
+  planCritique?: "off" | "high-risk";
+  /**
    * Role → model routing consulted by executor adapters (a JSON table; the
    * usual home is Pi settings). Resolved against the model registry at
    * session start; see src/tiers.ts.
@@ -211,6 +218,11 @@ const FLAGS = [
     name: "workgraph-plan-approval",
     description:
       "Plan gate for planned work: required (default — a human approves each plan with workgraph_approve_plan) or auto (env WORKGRAPH_PLAN_APPROVAL)",
+  },
+  {
+    name: "workgraph-plan-critique",
+    description:
+      "Advisory plan critique before a plan parks for approval: off (default) or high-risk (planned issues with riskTier high) (headless override of Pi settings; env WORKGRAPH_PLAN_CRITIQUE)",
   },
   {
     name: "workgraph-executors",
@@ -345,6 +357,7 @@ function parseSubagentsRoutes(
     "revision",
     "verifier",
     "finalizer",
+    "plan_critic",
   ];
   const input = raw as Record<string, unknown>;
   const routes: SubagentsWorkflowRoutes = {};
@@ -382,6 +395,7 @@ function parseSubagentsOptions(
     "revision",
     "verifier",
     "finalizer",
+    "plan_critic",
   ] as const) {
     const input = (raw as Record<string, unknown>)[role];
     if (!input || typeof input !== "object" || Array.isArray(input)) continue;
@@ -528,6 +542,7 @@ export function resolveConfig(pi: ExtensionAPI): WorkgraphConfig {
       "WORKGRAPH_SUBAGENTS_EXECUTOR",
     ),
     planApproval: planApprovalValue(pi),
+    planCritique: planCritiqueValue(pi),
     tiers: tiersValue(pi),
     executorByRole: executorsValue(pi),
     store: stringValue(pi, "workgraph-store", "WORKGRAPH_STORE") ?? settingsStore(),
@@ -544,6 +559,20 @@ function planApprovalValue(pi: ExtensionAPI): WorkgraphConfig["planApproval"] {
     `[pi-workgraph] ignoring workgraph-plan-approval value "${raw}" (expected required or auto)`,
   );
   return "required";
+}
+
+function planCritiqueValue(pi: ExtensionAPI): WorkgraphConfig["planCritique"] {
+  const raw = stringValue(pi, "workgraph-plan-critique", "WORKGRAPH_PLAN_CRITIQUE");
+  if (raw === undefined) return settingsPlanCritique() ?? "off";
+  const lowered = raw.toLowerCase();
+  if (lowered === "high-risk") return "high-risk";
+  if (lowered === "off" || lowered === "false") return "off";
+  // Never falls through to settings and never guesses: an unknown value
+  // must not turn the critique on.
+  console.error(
+    `[pi-workgraph] ignoring workgraph-plan-critique value "${raw}": planCritique must be "off" or "high-risk"`,
+  );
+  return "off";
 }
 
 function tiersValue(pi: ExtensionAPI): TierConfig | undefined {

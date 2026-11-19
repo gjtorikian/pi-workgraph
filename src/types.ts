@@ -108,6 +108,8 @@ export const WORKGRAPH_PLANNER_PROVENANCE_KEY = "workgraph_planner_provenance";
 export const WORKGRAPH_PLAN_APPROVED_KEY = "workgraph_plan_approved";
 /** Human feedback from a rejected plan, handed to the next planner run. */
 export const WORKGRAPH_PLAN_FEEDBACK_KEY = "workgraph_plan_feedback";
+/** Compact summary of the advisory critique of the parked plan ("" when none was attempted). */
+export const WORKGRAPH_PLAN_CRITIQUE_KEY = "workgraph_plan_critique";
 /** A parked run's question to the human (set with `workgraph_decision_pending`). */
 export const WORKGRAPH_DECISION_QUESTION_KEY = "workgraph_decision_question";
 /** The human's answer (workgraph_answer_decision); attached to every later run of the issue. */
@@ -208,6 +210,10 @@ export type LeaseEvent =
   | "verdict-invalid"
   /** Planner tier: a planner completion carried no parseable plan. */
   | "plan-invalid"
+  /** Plan critique: a critic's gaps were recorded against a plan. */
+  | "plan-critique"
+  /** Plan critique: the critique could not be obtained; the plan parked without one. */
+  | "plan-critique-unavailable"
   /** Planner tier: a plan was recorded and parked for human review. */
   | "plan-review"
   /** workgraph_approve_plan: a human approved the recorded plan. */
@@ -298,6 +304,29 @@ export const Plan = Type.Object({
   risks: Type.Optional(Type.Array(Type.String())),
 });
 export type PlanT = Static<typeof Plan>;
+
+// ---------------------------------------------------------------------------
+// Plan critique shapes (plan_critic role). Same TRANSPORT trick again: a
+// critic completion carries a `critique` field on the non-strict RunCompleted
+// schema, and `src/critique.ts` validates it before it is persisted. A
+// critique is ADVISORY text for the human reviewing the plan — the core never
+// acts on it and never forwards it to an implementer.
+// ---------------------------------------------------------------------------
+
+export const PlanGap = Type.Object({
+  /** 1-based index into plan.steps. Omitted for a gap about the plan as a whole. */
+  step: Type.Optional(Type.Integer({ minimum: 1 })),
+  /** The question an implementer would have to answer. */
+  note: Type.String({ minLength: 1 }),
+});
+export type PlanGapT = Static<typeof PlanGap>;
+
+export const PlanCritique = Type.Object({
+  /** What an implementer would have to guess at. Empty means build-ready. */
+  gaps: Type.Array(PlanGap),
+  summary: Type.Optional(Type.String()),
+});
+export type PlanCritiqueT = Static<typeof PlanCritique>;
 
 // ---------------------------------------------------------------------------
 // Tool parameter schemas (TypeBox). Pi validates tool-call arguments against
@@ -505,7 +534,7 @@ export const TiersParams = Type.Object({
       ]),
       {
         description:
-          "Role → model table (roles: planner, implementer, reviewer, revision, verifier, finalizer, scout); a value is \"provider/id\" (globs allowed) or { model, thinking }",
+          "Role → model table (roles: planner, implementer, reviewer, revision, verifier, finalizer, plan_critic, scout); a value is \"provider/id\" (globs allowed) or { model, thinking }",
       },
     ),
   ),

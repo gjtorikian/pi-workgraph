@@ -159,6 +159,94 @@ ready ──claim (planner)──► planning ──plan recorded──► plan_
 - `--workgraph-plan-approval auto` restores the straight-through planner →
   implementer flow.
 
+### Plan critique (optional)
+
+For high-risk `planned` work, a second reader can check the recorded plan
+before it parks: a `plan_critic` run with fresh context (it never saw the
+planner's conversation) reads the plan against the repository and reports
+up to 5 gaps, each a question an implementer who received only the plan
+would have to guess the answer to.
+
+The critique is **advisory**. It never approves, rejects, or changes a
+plan, and the implementer never sees the gaps. They are for you, at the
+gate: approve anyway, or reject and put the gap in your feedback. If the
+critic is unavailable for any reason, the plan parks without a critique and
+the status says why.
+
+It is off by default. Turn it on in Pi's settings:
+
+```jsonc
+{
+  "workgraph": {
+    "planCritique": "high-risk", // default "off"
+    "tiers": {
+      "plan_critic": { "model": "anthropic/claude-opus-*", "thinking": "high" },
+    },
+    "executors": { "plan_critic": "pi-subagents" },
+    "subagentsExecutor": true,
+  },
+}
+```
+
+`--workgraph-plan-critique` / `WORKGRAPH_PLAN_CRITIQUE` is the headless
+override (flag/env > project > global, like `planApproval`). The tier is
+yours to choose; the code names no model. Enabling the bridge also changes
+who runs the other roles, and [Who runs what](#who-runs-what) shows how to
+pin them.
+
+`workgraph_status` prints each gap under the step it concerns, marked `?`:
+
+```text
+Plan awaiting your review — workgraph_approve_plan with decision approve, or reject plus feedback:
+Critique (advisory): 2 gaps, marked "?" under the steps they concern.
+add retry backoff to the client
+
+Steps:
+1. add a RetryPolicy type
+   targets: src/retry.ts
+   ? is the policy per client or per request?
+2. handle retries in the request path
+   ? which errors retry, 429 only or 5xx too?
+```
+
+A gap about the plan as a whole follows the steps under `Plan as a whole:`,
+and a plan with nothing to guess at reads `build-ready, 0 gaps`. The
+per-turn "Plans awaiting your review" line carries the count as a suffix,
+`· critique: 2 gaps`.
+
+A critique is attempted only when all of these hold:
+
+- `planCritique` is `"high-risk"`.
+- The issue's `riskTier` is `high`.
+- `planApproval` is `required`. With `auto` there is no gate to show the
+  gaps at.
+- An executor offers the `plan_critic` role. The in-session executor does
+  not; enable the pi-subagents bridge. When no executor offers it, the plan
+  parks with `Critique unavailable: no plan_critic executor.`
+
+The limitations are:
+
+- **One attempt, 10 minutes.** The critic gets one try and a 10-minute
+  wait. The bridge launches upstream runs one at a time, and time the
+  critic spends queued behind another bridge run counts against the 10
+  minutes. When the wait runs out, the critic is canceled and the plan
+  parks without a critique.
+- **It reads the source checkout.** The critic sees your working tree,
+  uncommitted files included. An implementer in a worktree starts from the
+  committed HEAD, so a gap that exists only because a file is not committed
+  yet is invisible to the critic.
+- **Closing Pi mid-critique** parks the plan without a critique. It is not
+  retried.
+- **Same model, same blind spots.** A critic on the planner's model tends
+  to miss what the planner missed. The summary says when that happened
+  (`2 gaps, same model as planner`); a `plan_critic` tier that resolves to
+  a different model avoids it.
+
+The idea comes from Google's
+[Elephant-Goldfish Model](https://github.com/google/elephant-goldfish-model):
+a reader with none of the author's context finds the gaps the author cannot
+see.
+
 ## Model tiers
 
 One table routes roles to models, for every executor at once. Declare it
@@ -170,14 +258,20 @@ prompting:
 {
   "workgraph": {
     "tiers": {
-      "planner":     { "model": "anthropic/claude-opus-*",   "thinking": "high" },
-      "implementer": { "model": "anthropic/claude-sonnet-*", "thinking": "medium" },
-      "reviewer":    { "model": "anthropic/claude-opus-*",   "thinking": "high" },
-      "revision":    { "model": "anthropic/claude-sonnet-*", "thinking": "medium" },
-      "scout":       { "model": "anthropic/claude-haiku-*",  "thinking": "low" }
+      "planner": { "model": "anthropic/claude-opus-*", "thinking": "high" },
+      "implementer": {
+        "model": "anthropic/claude-sonnet-*",
+        "thinking": "medium",
+      },
+      "reviewer": { "model": "anthropic/claude-opus-*", "thinking": "high" },
+      "revision": {
+        "model": "anthropic/claude-sonnet-*",
+        "thinking": "medium",
+      },
+      "scout": { "model": "anthropic/claude-haiku-*", "thinking": "low" },
     },
-    "planApproval": "required"
-  }
+    "planApproval": "required",
+  },
 }
 ```
 
@@ -187,8 +281,10 @@ in session, the current thinking level (your global default, if you set
 one); in pi-subagents, the launched profile's default. Set it explicitly
 for any role you care about.
 Roles: `planner`, `implementer`, `reviewer`, `revision`, `verifier`,
-`finalizer`, and `scout` (reserved for the read-only research helper; it
-can be named now and is dispatched once that role lands).
+`finalizer`, `plan_critic` (the optional
+[plan critique](#plan-critique-optional)), and `scout` (reserved for the
+read-only research helper; it can be named now and is dispatched once that
+role lands).
 
 From inside a session, `workgraph_tiers` sets or shows the table for the
 current repository (stored in its workspace), and `/workgraph tiers
@@ -233,13 +329,14 @@ bridge enabled planning would leave your session. Pin it:
 {
   "workgraph": {
     "executors": {
-      "planner": "in-session",          // plan in the chat, with you watching
-      "implementer": "pi-subagents",    // build in a worktree
-      "reviewer": "pi-subagents",       // independent review in a fresh child
-      "revision": "pi-subagents"
+      "planner": "in-session", // plan in the chat, with you watching
+      "implementer": "pi-subagents", // build in a worktree
+      "reviewer": "pi-subagents", // independent review in a fresh child
+      "revision": "pi-subagents",
+      "plan_critic": "pi-subagents", // only asked when planCritique is on
     },
-    "subagentsExecutor": true          // enable the bridge here too — no flag needed
-  }
+    "subagentsExecutor": true, // enable the bridge here too — no flag needed
+  },
 }
 ```
 
@@ -248,6 +345,10 @@ fail-closed rule as `--workgraph-executor-id`, which these override role by
 role). Executor ids: `in-session` and `pi-subagents`; your own adapter's
 `executorId` works the same way. `--workgraph-executors` /
 `WORKGRAPH_EXECUTORS` is the headless override (JSON).
+
+`plan_critic` pins like any other role, with one difference: its pin never
+decides a claim. A pin on an executor that does not offer the role costs
+the [critique](#plan-critique-optional), and the plan parks without one.
 
 Note the in-session executor offers `planner` and `implementer` only: with
 nothing else online, `reviewed` and `planned` work reaches judgment and
@@ -278,7 +379,7 @@ Adapters consume the table:
   explicit per-role `options` entry still wins.
 
 The core still does no routing: the judgment gate's
-`requireAuthorIndependence` checks the *reported* provenance — keep the
+`requireAuthorIndependence` checks the _reported_ provenance — keep the
 reviewer on a different model than the implementer for medium/high-risk
 work, or judgment cannot pass.
 
@@ -288,22 +389,22 @@ Fourteen typed tools, all schema-validated and race-safe. Agents are
 instructed to use these instead of touching the store from bash — bare
 assignee writes are how leases get corrupted.
 
-| Tool                     | What it does                                                                                                 |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------ |
-| `workgraph_init`         | Create the workspace (`.workgraph/workgraph.db`, gitignored); idempotent                                     |
-| `workgraph_create`       | Create an issue — optionally approved, with acceptance criteria, risk tier, workflow class, and dependencies |
-| `workgraph_ready`        | List approved claimable issues (dependency-unblocked, unassigned); `legacy: true` lists unapproved           |
-| `workgraph_claim`        | Atomically claim an issue by id, or the next ready one; stamps a lease                                       |
-| `workgraph_release`      | Voluntarily hand a claimed issue back to the pool (fenced; clears assignee, reopens)                         |
-| `workgraph_close`        | Close an issue (fenced; lifecycle-v1 work must be phase `accepted` — the judgment gate's output)             |
-| `workgraph_split`        | Split an issue into child issues; the parent is blocked until every child closes                             |
-| `workgraph_heartbeat`    | Renew the leases this worker holds (verifies the fencing epoch, pushes `lease_expires_at` forward)           |
-| `workgraph_approve`      | Approve a draft/legacy/escalated issue: acceptance criteria, workflow class, risk tier, phase `ready`        |
-| `workgraph_approve_plan` | Approve a recorded plan (implement it next) or reject it with feedback (plan again)                          |
+| Tool                        | What it does                                                                                                  |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `workgraph_init`            | Create the workspace (`.workgraph/workgraph.db`, gitignored); idempotent                                      |
+| `workgraph_create`          | Create an issue — optionally approved, with acceptance criteria, risk tier, workflow class, and dependencies  |
+| `workgraph_ready`           | List approved claimable issues (dependency-unblocked, unassigned); `legacy: true` lists unapproved            |
+| `workgraph_claim`           | Atomically claim an issue by id, or the next ready one; stamps a lease                                        |
+| `workgraph_release`         | Voluntarily hand a claimed issue back to the pool (fenced; clears assignee, reopens)                          |
+| `workgraph_close`           | Close an issue (fenced; lifecycle-v1 work must be phase `accepted` — the judgment gate's output)              |
+| `workgraph_split`           | Split an issue into child issues; the parent is blocked until every child closes                              |
+| `workgraph_heartbeat`       | Renew the leases this worker holds (verifies the fencing epoch, pushes `lease_expires_at` forward)            |
+| `workgraph_approve`         | Approve a draft/legacy/escalated issue: acceptance criteria, workflow class, risk tier, phase `ready`         |
+| `workgraph_approve_plan`    | Approve a recorded plan (implement it next) or reject it with feedback (plan again)                           |
 | `workgraph_answer_decision` | Answer the question a run parked for a human; re-approve, and every later run of the issue carries the answer |
-| `workgraph_tiers`        | Set or show per-role model tiers for this repository (a role → model table, or clear)                        |
-| `workgraph_override`     | Explicit human override: force-close or force-release, bypassing guards — always audited                     |
-| `workgraph_status`       | One issue's full control-plane state: phase, plan, lease, attempt, verdict, acceptance criteria              |
+| `workgraph_tiers`           | Set or show per-role model tiers for this repository (a role → model table, or clear)                         |
+| `workgraph_override`        | Explicit human override: force-close or force-release, bypassing guards — always audited                      |
+| `workgraph_status`          | One issue's full control-plane state: phase, plan, lease, attempt, verdict, acceptance criteria               |
 
 The in-session executor adds `workgraph_submit_plan`, valid only during a
 planning turn. `/workgraph init [prefix]` and `/workgraph tiers` are the
@@ -316,9 +417,10 @@ Resolution order per value: CLI flag > environment variable > default.
 | Flag                                     | Environment variable                   | Default                         | Purpose                                                                                                                                 |
 | ---------------------------------------- | -------------------------------------- | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
 | `--workgraph-plan-approval`              | `WORKGRAPH_PLAN_APPROVAL`              | `required`                      | Plan gate for `planned` work: `required` (a human approves each plan) or `auto`                                                         |
-| `--workgraph-tiers`                      | `WORKGRAPH_TIERS`                      | what `workgraph_tiers` stored   | Headless override of the settings-file role → model table, as JSON (see [Model tiers](#model-tiers))                                 |
-| `--workgraph-executors`                  | `WORKGRAPH_EXECUTORS`                  | settings `executors`            | Per-role executor pins as JSON (see [Who runs what](#who-runs-what))                                                                     |
-| `--workgraph-store`                      | `WORKGRAPH_STORE`                      | settings `store`, else `repo`   | Where databases live: `repo`, `central`, or an absolute directory (see [Where the store lives](#where-the-store-lives))               |
+| `--workgraph-plan-critique`              | `WORKGRAPH_PLAN_CRITIQUE`              | `off`                           | Advisory critique of a plan before it parks: `off` or `high-risk` (see [Plan critique](#plan-critique-optional))                        |
+| `--workgraph-tiers`                      | `WORKGRAPH_TIERS`                      | what `workgraph_tiers` stored   | Headless override of the settings-file role → model table, as JSON (see [Model tiers](#model-tiers))                                    |
+| `--workgraph-executors`                  | `WORKGRAPH_EXECUTORS`                  | settings `executors`            | Per-role executor pins as JSON (see [Who runs what](#who-runs-what))                                                                    |
+| `--workgraph-store`                      | `WORKGRAPH_STORE`                      | settings `store`, else `repo`   | Where databases live: `repo`, `central`, or an absolute directory (see [Where the store lives](#where-the-store-lives))                 |
 | `--workgraph-lease-ttl-ms`               | `WORKGRAPH_LEASE_TTL_MS`               | `300000` (5 min)                | Lease time-to-live; expired leases are reclaimable                                                                                      |
 | `--workgraph-heartbeat-ms`               | `WORKGRAPH_HEARTBEAT_MS`               | `60000` (60 s)                  | How often held leases are renewed                                                                                                       |
 | `--workgraph-poll-ms`                    | `WORKGRAPH_POLL_MS`                    | `30000` (30 s)                  | Coordinator poll interval (floored at 5 s in production wiring)                                                                         |
@@ -390,21 +492,20 @@ the npm semver. Version 2 moved the home of the state from the beads (`bd`)
 database to this package's own SQLite store; the key names, value shapes,
 and invariants are unchanged. A third-party tool (any harness, not just
 Pi) can respect or detect pi-workgraph leases by reading
-`.workgraph/workgraph.db` (read-only; `scripts/git-push-guard.mjs` is a
-worked example) and implementing what follows. Every stated
-invariant is tied to a test in this repository via an HTML comment in this
-document's source.
+`.workgraph/workgraph.db` (read-only) and implementing what follows. Every
+stated invariant is tied to a test in this repository via an HTML comment in
+this document's source.
 
 ### 1. Metadata fields
 
 Lease state lives in three issue-metadata keys. These key names are
 **frozen**: renaming one is a breaking protocol change.
 
-| Key                | Type    | Meaning                                                              |
-| ------------------ | ------- | -------------------------------------------------------------------- |
-| `lease_holder`     | string  | Worker identity of the current holder                                |
-| `lease_epoch`      | integer | Fencing token — monotonic per issue, **never resets**                |
-| `lease_expires_at` | string  | Lease expiry, RFC3339 UTC at **second** precision                    |
+| Key                | Type    | Meaning                                               |
+| ------------------ | ------- | ----------------------------------------------------- |
+| `lease_holder`     | string  | Worker identity of the current holder                 |
+| `lease_epoch`      | integer | Fencing token — monotonic per issue, **never resets** |
+| `lease_expires_at` | string  | Lease expiry, RFC3339 UTC at **second** precision     |
 
 `lease_holder` values are **opaque strings** — compare them for equality,
 never parse meaning out of them. Two shapes appear today: the initiating
@@ -530,10 +631,6 @@ stealing a human's claim is worse than a stalled issue.
   bookkeeping says otherwise.
 - **Claims without lease metadata are never auto-reclaimed** — extend the
   same courtesy in your implementation.
-- **A worked detector ships in this repo**: `scripts/git-push-guard.mjs`,
-  a chaining `pre-push` hook that blocks `git push` while a designated
-  sentinel issue holds a live lease — "don't push during the restack"
-  turned into verified state. See [docs/git-push-guard.md](docs/git-push-guard.md).
 
 ### 5. Audit events
 
@@ -558,9 +655,11 @@ for the `workgraph-lease` prefix. The seven lease kinds:
 | `fencing-loss`          | A holder's heartbeat discovered its lease was reclaimed                            |
 
 The coordinator and tools add lifecycle kinds under the same prefix —
-among them `approve`, `plan-review` (a plan was parked for a human),
-`plan-approved`, `plan-rejected`, `revision-requested`, `escalated`, and
-`judgment-closed`.
+among them `approve`, `plan-critique` (a critic's gaps were recorded
+against a plan), `plan-critique-unavailable` (a critique was attempted and
+the plan parked without one, with the reason), `plan-review` (a plan was
+parked for a human), `plan-approved`, `plan-rejected`,
+`revision-requested`, `escalated`, and `judgment-closed`.
 Audit writes never block lease operations: the protocol stays correct
 without the trail, and a broken audit surface must not take claiming down
 with it.
@@ -590,23 +689,23 @@ The store's native statuses stay simple (`open`, `in_progress`, `blocked`,
 `closed`); lifecycle phase is workgraph semantics, stored in namespaced
 issue metadata:
 
-| Key                             | Meaning                                                                                                      |
-| ------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `workgraph_lifecycle_version`   | Lifecycle schema version, initially `1`                                                                      |
+| Key                             | Meaning                                                                                                                     |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `workgraph_lifecycle_version`   | Lifecycle schema version, initially `1`                                                                                     |
 | `workgraph_phase`               | `draft`, `ready`, `planning`, `plan_review`, `implementing`, `judging`, `revising`, `verifying`, `accepted`, or `escalated` |
-| `workgraph_workflow_run_id`     | Stable ID covering planning, implementation, and all judgment/revision attempts for one claim                |
-| `workgraph_executor_id`         | Selected executor adapter                                                                                    |
-| `workgraph_attempt`             | Current implementation/revision attempt number                                                               |
-| `workgraph_risk_tier`           | Policy input such as `low`, `medium`, or `high`                                                              |
-| `workgraph_workflow_class`      | Execution topology: `oneshot`, `reviewed` (default), or `planned`                                            |
-| `workgraph_active_execution_id` | Executor-specific active run ID, when accepted                                                               |
-| `workgraph_author_provenance`   | Compact JSON describing effective harness, profile, provider, and model                                      |
-| `workgraph_last_verdict`        | Compact verdict summary and durable audit-event reference                                                    |
-| `workgraph_failure_fingerprint` | Hash used to detect a repeated failed attempt                                                                |
-| `workgraph_plan_summary`        | Compact plan summary; the full plan lives in the `workgraph-plan` comment trail                              |
-| `workgraph_planner_provenance`  | Compact JSON describing the planner's effective harness, provider, and model                                 |
-| `workgraph_plan_approved`       | `true` once a human approved the recorded plan; the next claim implements it (cleared on re-approve)        |
-| `workgraph_plan_feedback`       | Feedback from a rejected plan, carried on the next planner request and consumed by the next recorded plan   |
+| `workgraph_workflow_run_id`     | Stable ID covering planning, implementation, and all judgment/revision attempts for one claim                               |
+| `workgraph_executor_id`         | Selected executor adapter                                                                                                   |
+| `workgraph_attempt`             | Current implementation/revision attempt number                                                                              |
+| `workgraph_risk_tier`           | Policy input such as `low`, `medium`, or `high`                                                                             |
+| `workgraph_workflow_class`      | Execution topology: `oneshot`, `reviewed` (default), or `planned`                                                           |
+| `workgraph_active_execution_id` | Executor-specific active run ID, when accepted                                                                              |
+| `workgraph_author_provenance`   | Compact JSON describing effective harness, profile, provider, and model                                                     |
+| `workgraph_last_verdict`        | Compact verdict summary and durable audit-event reference                                                                   |
+| `workgraph_failure_fingerprint` | Hash used to detect a repeated failed attempt                                                                               |
+| `workgraph_plan_summary`        | Compact plan summary; the full plan lives in the `workgraph-plan` comment trail                                             |
+| `workgraph_planner_provenance`  | Compact JSON describing the planner's effective harness, provider, and model                                                |
+| `workgraph_plan_approved`       | `true` once a human approved the recorded plan; the next claim implements it (cleared on re-approve)                        |
+| `workgraph_plan_feedback`       | Feedback from a rejected plan, carried on the next planner request and consumed by the next recorded plan                   |
 
 ### 2. State transitions
 
@@ -721,7 +820,10 @@ Four rules the code enforces, each with a reason:
   enforces `targets`, and a planner's refined `acceptanceCriteria` is
   recorded in the plan trail rather than overwriting the approved criteria
   on the issue — a planner that could rewrite its own bar would defeat the
-  judgment gate.
+  judgment gate. The same holds for a
+  [plan critique](#plan-critique-optional): its gaps are recorded beside
+  the plan for the human at the gate, the core never acts on them, and the
+  implementer's request does not carry them.
 - **Legacy issues never plan.** Their compatibility entry is
   `implementing`, so compat-mode dispatch stays predictable.
 
@@ -765,12 +867,13 @@ The bridge ships **disabled**. Opt in explicitly:
 
 When configured and version-gated, it answers discovery as
 `executorId: "pi-subagents"` offering `planner`, `implementer`, `reviewer`,
-and `revision` roles with `isolation: "worktree"` and a priority above the
-in-session adapter — an operator who opted in prefers isolated background
-workers. Unconfigured, the bridge is **never registered**: an unconfigured
-extension answers discovery with no subagents offer and holds zero bus
-subscriptions (a double gate — index.ts never calls the register function,
-and the register function re-checks config itself).
+`revision`, and `plan_critic` roles with `isolation: "worktree"` and a
+priority above the in-session adapter — an operator who opted in prefers
+isolated background workers. Unconfigured, the bridge is **never
+registered**: an unconfigured extension answers discovery with no subagents
+offer and holds zero bus subscriptions (a double gate — index.ts never
+calls the register function, and the register function re-checks config
+itself).
 
 Bridge semantics:
 
@@ -795,6 +898,13 @@ Bridge semantics:
 - **Reported provenance.** Completions carry the model upstream _reported
   using_, never the one requested; the provider is split off only when the
   `provider/id` format is unambiguous.
+- **A plan critic judges a plan, never an implementation.** `plan_critic`
+  runs launch the upstream `reviewer` profile by default (upstream ships no
+  plan-critic profile), in the source checkout like the planner. The task
+  says that no implementation exists and asks one question: what would an
+  implementer who receives only this plan have to guess? Route the role to
+  another profile with `routes.planned.plan_critic`. Its structured output
+  rides the completion as `critique`, never as a verdict.
 
 The adapter accepts up to four runs and queues their foreground calls, launching
 one at a time because pi-subagents permits only one foreground call per session.
@@ -826,7 +936,8 @@ and role without hard-coding model IDs into the control plane:
       "planner": "planner",
       "implementer": "worker",
       "reviewer": "reviewer",
-      "revision": "fixer"
+      "revision": "fixer",
+      "plan_critic": "reviewer"
     }
   }
 }'
@@ -891,7 +1002,6 @@ in about half a minute.
 ## License
 
 [MIT](./LICENSE)
-
 
 ### Caller-defined finalization
 

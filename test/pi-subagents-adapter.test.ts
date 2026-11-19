@@ -153,7 +153,7 @@ describe("bridge registration gating", () => {
     expect(offers[0]).toMatchObject({
       inReplyTo: discover.messageId,
       executorId: PI_SUBAGENTS_EXECUTOR_ID,
-      roles: ["planner", "implementer", "reviewer", "revision"],
+      roles: ["planner", "implementer", "reviewer", "revision", "plan_critic"],
       harness: "pi-subagents",
       isolation: "worktree",
       supportsCancellation: true,

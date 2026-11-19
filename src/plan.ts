@@ -23,6 +23,12 @@
  * unwritable comment — and `renderPlan` caps again independently, because
  * what goes into a prompt is bounded by context, not by comment size.
  *
+ * TWO AUDIENCES: `renderPlan` is what an implementer receives;
+ * `renderPlanForReview` is what a human approving the plan reads — the same
+ * text plus the gaps of a plan critique (`src/critique.ts`). They share one
+ * private line builder, and only the human-only function accepts a critique,
+ * so no call to `renderPlan` can leak one into a prompt.
+ *
  * WHAT A PLAN IS NOT: it is evidence, never authority. The core does not
  * interpret steps, does not enforce `targets`, and does not let a planner's
  * `acceptanceCriteria` overwrite the approved criteria on the issue — a
@@ -30,7 +36,7 @@
  */
 import { Value } from "typebox/value";
 import { addComment, listComments } from "./store.ts";
-import type { PlanStepT, PlanT } from "./types.ts";
+import type { PlanCritiqueT, PlanStepT, PlanT } from "./types.ts";
 import { Plan } from "./types.ts";
 
 /** Prefix on every plan comment; tests and humans grep for it. */
@@ -53,6 +59,13 @@ export const MAX_SUMMARY_CHARS = 160;
 
 /** Cap on the rendered plan text handed to an executor. */
 export const MAX_RENDER_CHARS = 8000;
+
+/**
+ * Cap on the plan text rendered for a human reviewer. Larger than the prompt
+ * cap so the gaps of a full critique cannot push the last ones past the
+ * truncation point.
+ */
+export const MAX_REVIEW_RENDER_CHARS = MAX_RENDER_CHARS + 2000;
 
 /** Thrown when a reported plan payload fails schema validation. */
 export class PlanError extends Error {
@@ -146,6 +159,26 @@ export function planSummary(plan: PlanT): string {
  * items would expand scope past what was approved.
  */
 export function renderPlan(plan: PlanT): string {
+  return truncate(planLines(plan).join("\n"), MAX_RENDER_CHARS);
+}
+
+/** Reviewer notes the human-only render threads through {@link planLines}. */
+interface ReviewNotes {
+  /** 1-based step number → notes printed directly under that step's own lines. */
+  byStep: ReadonlyMap<number, readonly string[]>;
+  /** Notes about the plan as a whole, printed after the last step. */
+  wholePlan: readonly string[];
+}
+
+/**
+ * The one line builder behind {@link renderPlan} and
+ * {@link renderPlanForReview}, so the two can never drift on step
+ * formatting. Private on purpose: `notes` is how critique text reaches a
+ * rendering, and the exported implementer-facing function has no parameter
+ * that could carry it. With no notes the output is `renderPlan`'s, line for
+ * line.
+ */
+function planLines(plan: PlanT, notes?: ReviewNotes): string[] {
   const lines: string[] = [];
   if (plan.summary) lines.push(plan.summary, "");
   if (plan.acceptanceCriteria) {
@@ -163,16 +196,61 @@ export function renderPlan(plan: PlanT): string {
       lines.push(`   targets: ${step.targets.join(", ")}`);
     }
     if (step.rationale) lines.push(`   why: ${step.rationale}`);
+    for (const note of notes?.byStep.get(i + 1) ?? []) lines.push(`   ? ${note}`);
   });
   const folded = plan.steps.length - steps.length;
   if (folded > 0) lines.push(`… and ${folded} further step(s), folded.`);
+  if (notes && notes.wholePlan.length > 0) {
+    lines.push("", "Plan as a whole:");
+    for (const note of notes.wholePlan) lines.push(`? ${note}`);
+  }
   if (plan.risks && plan.risks.length > 0) {
     lines.push("", "Open questions from the planner (advisory — not work items):");
     for (const risk of plan.risks.slice(0, MAX_STEPS)) {
       lines.push(`- ${truncate(risk, MAX_STEP_CHARS)}`);
     }
   }
-  return truncate(lines.join("\n"), MAX_RENDER_CHARS);
+  return lines;
+}
+
+/**
+ * HUMAN-ONLY. The same text as {@link renderPlan}, with each critique gap on
+ * its own line under the step it names, prefixed `   ? `. A gap with no
+ * step, or one naming a step outside the rendered range (past the end of the
+ * plan, or folded past {@link MAX_STEPS}), follows the last step under a
+ * `Plan as a whole:` line with its step number kept in the text — step
+ * routing never drops a gap. The render is still bounded by
+ * {@link MAX_REVIEW_RENDER_CHARS}, so on a plan whose own text exceeds that
+ * cap the tail is cut, late gaps included. Gaps keep the critic's order.
+ *
+ * Each note is flattened to ONE line first. A critic's line break would
+ * otherwise start a line without the `?` prefix, and a note such as
+ * "…\n6. Deploy to prod" would read as a plan step in the approval view.
+ *
+ * Never pass the result to an executor: a critique is advice for the human
+ * approving the plan, and an implementer that read the gaps would treat a
+ * critic's questions as instructions. With no critique, or one with no gaps,
+ * this returns exactly `renderPlan(plan)`.
+ */
+export function renderPlanForReview(plan: PlanT, critique?: PlanCritiqueT): string {
+  if (!critique || critique.gaps.length === 0) return renderPlan(plan);
+  const rendered = Math.min(plan.steps.length, MAX_STEPS);
+  const byStep = new Map<number, string[]>();
+  const wholePlan: string[] = [];
+  for (const gap of critique.gaps) {
+    const note = gap.note.replace(/\s+/g, " ").trim();
+    if (gap.step === undefined) {
+      wholePlan.push(note);
+    } else if (!Number.isInteger(gap.step) || gap.step < 1 || gap.step > rendered) {
+      // Not a rendered step: keep the number so the reader can still place it.
+      wholePlan.push(`(step ${gap.step}) ${note}`);
+    } else {
+      const notes = byStep.get(gap.step);
+      if (notes) notes.push(note);
+      else byStep.set(gap.step, [note]);
+    }
+  }
+  return truncate(planLines(plan, { byStep, wholePlan }).join("\n"), MAX_REVIEW_RENDER_CHARS);
 }
 
 /**

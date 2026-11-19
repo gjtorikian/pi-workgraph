@@ -68,7 +68,8 @@ import {
   workflowClassOf,
   workflowRunIdOf,
 } from "./lifecycle.ts";
-import { latestPlan, renderPlan } from "./plan.ts";
+import { latestPlanCritique } from "./critique.ts";
+import { latestPlan, renderPlanForReview } from "./plan.ts";
 import { DEFAULT_RISK_TIER } from "./policy.ts";
 import { resolveConfig as resolveFlags } from "./config.ts";
 import { effectiveTiers } from "./settings.ts";
@@ -102,11 +103,39 @@ import {
   WORKGRAPH_EXECUTOR_ID_KEY,
   WORKGRAPH_PHASE_KEY,
   WORKGRAPH_PLAN_APPROVED_KEY,
+  WORKGRAPH_PLAN_CRITIQUE_KEY,
   WORKGRAPH_PLAN_FEEDBACK_KEY,
   WORKGRAPH_PLAN_SUMMARY_KEY,
   WORKGRAPH_RISK_TIER_KEY,
   WORKGRAPH_WORKFLOW_CLASS_KEY,
 } from "./types.ts";
+
+const CRITIQUE_UNAVAILABLE_PREFIX = "unavailable:";
+
+/** Whether a `workgraph_plan_critique` value reports gaps a reader can look up. */
+function critiqueHasGaps(summary: string): boolean {
+  return summary !== "" && !summary.startsWith(CRITIQUE_UNAVAILABLE_PREFIX) && !summary.startsWith("0 gaps");
+}
+
+/**
+ * The line `workgraph_status` prints between the review header and the plan,
+ * from the `workgraph_plan_critique` metadata value (formats owned by
+ * `critiqueSummary` / `unavailableSummary` in critique.ts, matched by
+ * prefix). Undefined when no critique was attempted for this plan.
+ * `detailsReadable` is whether the gaps themselves could be read back; when
+ * they could not (the comment write failed), the count is all there is.
+ */
+function planCritiqueLine(summary: string, detailsReadable: boolean): string | undefined {
+  if (summary === "") return undefined;
+  if (summary.startsWith(CRITIQUE_UNAVAILABLE_PREFIX)) {
+    const reason = summary.slice(CRITIQUE_UNAVAILABLE_PREFIX.length).trim();
+    return `Critique unavailable: ${reason.replace(/\.+$/, "")}.`;
+  }
+  if (summary.startsWith("0 gaps")) return `Critique (advisory): build-ready, ${summary}.`;
+  return detailsReadable
+    ? `Critique (advisory): ${summary}, marked "?" under the steps they concern.`
+    : `Critique (advisory): ${summary}, but its details could not be read.`;
+}
 
 function textResult<TDetails>(
   text: string,
@@ -665,9 +694,21 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
       if (isLifecycleV1(issue)) lines.push(`Workflow class: ${workflowClass}`);
       if (phase === "plan_review") {
         const plan = await latestPlan(ctx.cwd, params.id);
+        // The critique is read only when the summary says there are gaps to
+        // show: the summary is rewritten on every park, so it — not the
+        // comment trail — says whether THIS plan was critiqued.
+        const summary = metadata[WORKGRAPH_PLAN_CRITIQUE_KEY];
+        const critiqued = typeof summary === "string" && critiqueHasGaps(summary);
+        const critique = critiqued ? await latestPlanCritique(ctx.cwd, params.id) : undefined;
+        // Gaps are only "marked under the steps" when there are steps to mark.
+        const critiqueLine =
+          typeof summary === "string"
+            ? planCritiqueLine(summary, plan !== undefined && critique !== undefined)
+            : undefined;
         lines.push(
           "Plan awaiting your review — workgraph_approve_plan with decision approve, or reject plus feedback:",
-          plan ? renderPlan(plan) : "(no readable plan recorded — reject to plan again)",
+          ...(critiqueLine !== undefined ? [critiqueLine] : []),
+          plan ? renderPlanForReview(plan, critique) : "(no readable plan recorded — reject to plan again)",
         );
       } else if (typeof metadata[WORKGRAPH_PLAN_SUMMARY_KEY] === "string" && metadata[WORKGRAPH_PLAN_SUMMARY_KEY]) {
         lines.push(`Plan: ${metadata[WORKGRAPH_PLAN_SUMMARY_KEY]}${planApprovedOf(issue) ? " (approved)" : ""}`);
