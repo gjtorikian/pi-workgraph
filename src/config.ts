@@ -15,18 +15,9 @@ import {
   settingsStore,
   settingsSubagentsExecutor,
 } from "./settings.ts";
-import { parseTiersValue, type TierConfig } from "./tiers.ts";
+import { parseTiersValue, THINKING_LEVELS, type TierConfig } from "./tiers.ts";
 
-/** Pi thinking levels plus `off` (no reasoning). */
-const THINKING_LEVELS = [
-  "off",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-] as const;
+/** A Pi thinking level, or `off` for no reasoning. */
 export type CompactionReasoningLevel = (typeof THINKING_LEVELS)[number];
 
 export type SubagentsRoleRoutes = Partial<
