@@ -162,6 +162,10 @@ function approve(graph: ScratchGraph, id: string, riskTier = "medium"): void {
     "workgraph_lifecycle_version=1",
     "--set-metadata",
     "workgraph_phase=ready",
+    // The check the core runs before any review: the shell builtin, which
+    // passes. Medium- and high-risk work with none does not reach review.
+    "--set-metadata",
+    "workgraph_check=true",
     "--set-metadata",
     `workgraph_risk_tier=${riskTier}`,
     "--set-metadata",
@@ -1058,7 +1062,8 @@ describe("gate report", () => {
         `review: 1 blocked (${high}), 1 would block (${low})`,
         // Evaluated for both issues, and passed for both.
         "tree-binding: 0 blocked, 0 would block",
-        "check: no records",
+        // The fixture's check (`true`) ran once per issue and passed.
+        "check: 0 blocked, 0 would block",
         "criteria-evidence: no records",
         "weakened-tests: no records",
         "unproven-tests: no records",

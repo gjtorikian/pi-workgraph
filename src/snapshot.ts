@@ -87,10 +87,19 @@ const SNAPSHOT_IDENTITY = {
   GIT_COMMITTER_EMAIL: "pi-workgraph@localhost",
 };
 
-function gitEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
+/**
+ * This process's environment without the variables that redirect git. For
+ * anything started in a workspace that may run git itself: the snapshot
+ * calls here, and the check command (`src/check.ts`).
+ */
+export function workspaceEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   for (const name of REDIRECTING_ENV) delete env[name];
-  return { ...env, GIT_TERMINAL_PROMPT: "0", ...extra };
+  return env;
+}
+
+function gitEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
+  return { ...workspaceEnv(), GIT_TERMINAL_PROMPT: "0", ...extra };
 }
 
 /**

@@ -19,8 +19,8 @@
  *
  * This module owns the pure/protocol pieces — enumeration, partition, the
  * correlated status exchange, and audit-trail reconstruction of a judging
- * run's author completion and of its tree binding (workspace path, base
- * and result tree). The ADOPTION itself (coordinator state, inboxes,
+ * run's author completion, of its tree binding (workspace path, base
+ * and result tree) and of the bar it was claimed under. The ADOPTION itself (coordinator state, inboxes,
  * heartbeats, the judgment loop) lives in coordinator.ts's `reconcile()`,
  * which composes these. Everything here is fenced + idempotent: a
  * reconciliation that crashes midway is safe to re-run — unprocessed issues
@@ -28,6 +28,7 @@
  */
 import type { EventBus } from "@earendil-works/pi-coding-agent";
 import { AUDIT_PREFIX } from "./audit.ts";
+import { parseBar, type Bar } from "./check.ts";
 import { listComments, listInProgressUpdatedBefore } from "./store.ts";
 import { leaseExpiresAtOf, leaseHolderOf, rfc3339 } from "./lease.ts";
 import {
@@ -394,6 +395,55 @@ export async function reconstructBinding(
     ...(baseCommit !== undefined ? { baseCommit } : {}),
     ...(baseTree !== undefined ? { baseTree } : {}),
   };
+}
+
+// ---------------------------------------------------------------------------
+// The frozen bar
+// ---------------------------------------------------------------------------
+
+const BAR_FROZEN_PREFIX = `${AUDIT_PREFIX} bar-frozen `;
+
+/**
+ * The bar a run was claimed under, from the newest `bar-frozen` event that
+ * carries THIS run's id. Undefined when there is none: a run claimed before
+ * the bar existed, or one whose event write was lost. The caller then
+ * freezes a bar at re-adoption and says so on the trail.
+ *
+ * Read from the event and never rebuilt from the issue and the settings:
+ * both may have been edited since the claim, which is exactly what a frozen
+ * bar is there to ignore.
+ */
+export async function reconstructBar(
+  cwd: string,
+  issue: WorkIssue,
+): Promise<Bar | undefined> {
+  const workflowRunId = workflowRunIdOf(issue);
+  if (workflowRunId === undefined) return undefined;
+  let comments: Awaited<ReturnType<typeof listComments>>;
+  try {
+    comments = await listComments(cwd, issue.id);
+  } catch {
+    return undefined;
+  }
+  for (let i = comments.length - 1; i >= 0; i--) {
+    const text = comments[i]!.text;
+    if (!text.startsWith(BAR_FROZEN_PREFIX)) continue;
+    let details: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(text.slice(BAR_FROZEN_PREFIX.length));
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        continue;
+      }
+      details = parsed as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (details.workflowRunId !== workflowRunId) continue;
+    // The newest event for this run decides, readable or not: falling
+    // through to an older one could resurrect a bar that was replaced.
+    return parseBar(details.bar);
+  }
+  return undefined;
 }
 
 function stringArray(raw: unknown): string[] {

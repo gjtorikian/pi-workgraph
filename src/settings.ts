@@ -15,7 +15,8 @@
  *       "store": "central",                          // keep databases out of checkouts
  *       "planApproval": "required",                // or "auto"
  *       "planCritique": "off",                     // or "high-risk"
- *       "policy": { "low": { "gates": { "scope": "off" } } }  // gate modes per risk tier
+ *       "policy": { "low": { "gates": { "scope": "off" } } }, // gate modes per risk tier
+ *       "check": { "command": "npm test" }           // the repository's default check
  *     }
  *   }
  *
@@ -28,11 +29,13 @@
  * path and treated as absent — a typo in settings must never take the
  * extension down.
  *
- * ONE EXCEPTION: `policy`. This module carries it through unvalidated, and
- * config.ts rejects an invalid one instead of dropping it. A dropped policy
- * would fall back to the default gate modes without a word, so work would
- * close, or be blocked, under modes nobody chose. The reader stays
- * non-throwing; the rejection stops dispatch and names the bad key.
+ * TWO EXCEPTIONS: `policy` and `check`. This module carries both through
+ * unvalidated, and config.ts rejects an invalid one instead of dropping it.
+ * A dropped policy would fall back to the default gate modes without a
+ * word, so work would close, or be blocked, under modes nobody chose; a
+ * dropped `check` would leave every issue that relies on the repository
+ * default unchecked. The reader stays non-throwing; the rejection stops
+ * dispatch and names the bad key.
  */
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -55,6 +58,8 @@ export interface WorkgraphSettings {
   store?: string;
   /** The gate policy as raw JSON, for config.ts to validate: the object `--workgraph-policy` takes. */
   policy?: string;
+  /** The `check` block as raw JSON, for config.ts to validate: `{ command?, timeoutMs?, setup? }`. */
+  check?: string;
 }
 
 export interface SettingsSources {
@@ -135,6 +140,10 @@ export function parseWorkgraphSettings(raw: unknown): WorkgraphSettings | undefi
     if (record.policy.trim()) out.policy = record.policy.trim();
   } else if (record.policy !== undefined && record.policy !== null) {
     out.policy = JSON.stringify(record.policy);
+  }
+  // Carried through as written, like the policy: config.ts validates it.
+  if (record.check !== undefined && record.check !== null) {
+    out.check = JSON.stringify(record.check);
   }
   if (record.planApproval === "required" || record.planApproval === "auto") {
     out.planApproval = record.planApproval;
@@ -255,6 +264,16 @@ export function settingsSubagentsExecutor(location: SettingsLocation = {}): stri
 export function settingsPolicy(location: SettingsLocation = {}): string | undefined {
   const sources = workgraphSettings(location);
   return sources.project?.policy ?? sources.global?.policy;
+}
+
+/**
+ * The raw `check` block from settings (project over global), for config.ts's
+ * validator. The project block replaces the global one whole, as the policy
+ * does.
+ */
+export function settingsCheck(location: SettingsLocation = {}): string | undefined {
+  const sources = workgraphSettings(location);
+  return sources.project?.check ?? sources.global?.check;
 }
 
 /** The store policy from settings (project over global), if either sets it. */

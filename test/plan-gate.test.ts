@@ -471,6 +471,7 @@ describe("workgraph_init and workgraph_create", () => {
           workflowClass: "planned",
           riskTier: "high",
           acceptanceCriteria: "tests green",
+          check: "npm test",
           dependsOn: [draftIssue.id],
         },
         dir,

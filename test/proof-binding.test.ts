@@ -36,7 +36,8 @@ import {
 import { resetIdentityForTest, setWorkerIdOverride } from "../src/identity.ts";
 import { heldLeases, resetLeasesForTest } from "../src/lease.ts";
 import type { PolicyOverrides } from "../src/policy.ts";
-import { latestStamp, listGateRecords } from "../src/proof.ts";
+import { commandDigest } from "../src/check.ts";
+import { latestStamp, listGateRecords, listReceipts } from "../src/proof.ts";
 import {
   changedFiles,
   fileAt,
@@ -140,12 +141,30 @@ function metadataOf(graph: ScratchGraph, id: string): Record<string, unknown> {
   return (graph.showIssue(id).metadata ?? {}) as Record<string, unknown>;
 }
 
-/** Approve an issue the way workgraph_approve does, from outside this process. */
+/**
+ * Approve an issue the way workgraph_approve does, from outside this
+ * process. By default it carries the check the core runs before any review:
+ * `true`, the shell builtin, which passes. `check: null` approves with none
+ * (low-risk work may), and `waiver` records that no check applies, which is
+ * how work outside a git repository gets past the check gate: a receipt
+ * names a tree, and there is none to name.
+ */
 function approve(
   graph: ScratchGraph,
   id: string,
-  opts: { riskTier?: string; workflowClass?: string } = {},
+  opts: {
+    riskTier?: string;
+    workflowClass?: string;
+    check?: string | null;
+    waiver?: string;
+  } = {},
 ): void {
+  const check =
+    opts.waiver !== undefined
+      ? null
+      : opts.check === undefined
+        ? "true"
+        : opts.check;
   graph.op([
     "update",
     id,
@@ -153,6 +172,10 @@ function approve(
     "workgraph_lifecycle_version=1",
     "--set-metadata",
     "workgraph_phase=ready",
+    ...(check !== null ? ["--set-metadata", `workgraph_check=${check}`] : []),
+    ...(opts.waiver !== undefined
+      ? ["--set-metadata", `workgraph_check_waiver=${opts.waiver}`]
+      : []),
     "--set-metadata",
     `workgraph_risk_tier=${opts.riskTier ?? "medium"}`,
     "--set-metadata",
@@ -496,8 +519,22 @@ describe("the tree-binding gate", () => {
       expect(verdicts).toHaveLength(1);
       expect(verdicts[0]!.tree).toBe(tree);
 
+      // The check receipt names the same tree: one receipt, for the command
+      // the issue was approved with, written by the core.
+      const receipts = await listReceipts(repo.dir, id);
+      expect(receipts).toHaveLength(1);
+      expect(receipts[0]).toMatchObject({
+        tree,
+        commandDigest: commandDigest("true"),
+        exitCode: 0,
+        passed: true,
+        workflowRunId: fake.requests[0]!.workflowRunId,
+        attempt: 1,
+      });
+
       // The stamp: one, naming the same tree, its base, the anchored commit,
-      // the verdict it rests on and both evaluated gates.
+      // the verdict it rests on, the three evaluated gates and the check
+      // receipt's log.
       expect(await payloads(repo.dir, id, STAMP_MARKER)).toHaveLength(1);
       const stamp = await latestStamp(repo.dir, id);
       expect(stamp).toEqual({
@@ -510,16 +547,23 @@ describe("the tree-binding gate", () => {
           executionId: fake.completions[1]!.executionId,
           summary: "pass blocking=0 advisory=0",
         },
-        gates: { "tree-binding": "pass", review: "pass" },
+        gates: { "tree-binding": "pass", check: "pass", review: "pass" },
+        check: "passed",
+        checkLogSha256: receipts[0]!.log.sha256,
       });
       expect(repo.git("rev-parse", `${stamp!.commit}^{tree}`)).toBe(tree);
 
-      // Both gate records carry the tree.
+      // All three gate records carry the tree, and the check ran before the
+      // reviewer was asked.
       const records = await listGateRecords(repo.dir, id);
       expect(records.map((r) => [r.gate, r.result, r.blocked, r.tree])).toEqual([
         ["tree-binding", "pass", false, tree],
+        ["check", "pass", false, tree],
         ["review", "pass", false, tree],
       ]);
+      // The check's log is not in the tree it checked, or in the checkout's
+      // status: the proof directory ignores itself.
+      expect(repo.git("status", "--porcelain", "--", ".workgraph/proof")).toBe("");
 
       // The reviewer was sent to the workspace, with both trees.
       const review = fake.requests.find((r) => r.role === "reviewer")!;
@@ -609,7 +653,8 @@ describe("the tree-binding gate", () => {
   it("no git repository under observe: the issue closes, with one would-block and records that name no tree", async () => {
     const graph = makeScratchGraph({ prefix: "pbobs", seed: 1 });
     const id = graph.seededIds[0]!;
-    approve(graph, id);
+    // Waived: a check cannot run where there is no tree to bind its receipt to.
+    approve(graph, id, { waiver: "not a git repository" });
     const { mock, coordinator } = makeHarness({
       policy: { medium: { gates: { "tree-binding": "observe" } } },
     });
@@ -647,7 +692,12 @@ describe("the tree-binding gate", () => {
       expect(stamp).not.toHaveProperty("tree");
       expect(stamp).not.toHaveProperty("baseTree");
       expect(stamp).not.toHaveProperty("commit");
-      expect(stamp!.gates).toEqual({ "tree-binding": "unknown", review: "pass" });
+      expect(stamp!.gates).toEqual({
+        "tree-binding": "unknown",
+        check: "not-applicable",
+        review: "pass",
+      });
+      expect(stamp!.check).toBe("waived");
       const review = fake.requests.find((r) => r.role === "reviewer")!;
       expect(review.workspace.path).toBe(graph.dir);
       expect(review.workspace.tree).toBeUndefined();
@@ -753,8 +803,12 @@ describe("the tree-binding gate", () => {
     const repo = makeScratchRepo({ prefix: "pboff", seed: 1 });
     const id = repo.seededIds[0]!;
     approve(repo, id);
+    // Both gates that feed the stamp are off here: this case pins what
+    // `off` means, which is that nothing is evaluated at all. (With the
+    // check gate left on, a stamp is written for it, without tree fields;
+    // `test/proof-check.test.ts` covers that.)
     const { mock, coordinator } = makeHarness({
-      policy: { medium: { gates: { "tree-binding": "off" } } },
+      policy: { medium: { gates: { "tree-binding": "off", check: "off" } } },
     });
     const fake = installFakeExecutor(mock.events, {
       roles: ["implementer", "reviewer"],
@@ -773,6 +827,7 @@ describe("the tree-binding gate", () => {
       expect(repo.showIssue(id).status).toBe("closed");
 
       const metadata = metadataOf(repo, id);
+      expect(await listReceipts(repo.dir, id)).toEqual([]);
       for (const key of [
         WORKGRAPH_WORKSPACE_PATH_KEY,
         WORKGRAPH_BASE_TREE_KEY,
@@ -1025,8 +1080,15 @@ describe("a workspace that changes under judgment", () => {
       expect(fileAt(repo.dir, stamp!.tree!, "late.txt")).toBe("late\n");
       // No review ran, so the stamp rests on no verdict.
       expect(stamp).not.toHaveProperty("verdict");
-      expect(stamp!.gates).toEqual({ "tree-binding": "pass" });
+      expect(stamp!.gates).toEqual({ "tree-binding": "pass", check: "pass" });
       expect(stamp!.tree).toBe(treeOf(repo.dir));
+      // The edit sent the issue back through the check as well: one receipt
+      // for the tree first checked, one for the tree that was stamped.
+      const receipts = await listReceipts(repo.dir, id);
+      expect(receipts).toHaveLength(2);
+      expect(receipts[0]!.tree).not.toBe(stamp!.tree);
+      expect(receipts[1]!.tree).toBe(stamp!.tree);
+      expect(stamp!.checkLogSha256).toBe(receipts[1]!.log.sha256);
     } finally {
       fake.uninstall();
       await coordinator.teardown(ectx.ctx);
@@ -1100,6 +1162,20 @@ describe("the close stamp", () => {
       expect(at("workgraph-lease finalization-completed ")).toBeLessThan(
         at("workgraph-proof stamp-amended "),
       );
+      // The tree finalization produced was checked again before the close:
+      // a second receipt, for the finalized tree, and its own gate record.
+      const receipts = await listReceipts(repo.dir, id);
+      expect(receipts.map((r) => [r.tree, r.passed])).toEqual([
+        [stamp!.tree, true],
+        [stamp!.finalizedTree, true],
+      ]);
+      const checks = (await listGateRecords(repo.dir, id)).filter(
+        (r) => r.gate === "check",
+      );
+      expect(checks.map((r) => [r.result, r.tree])).toEqual([
+        ["pass", stamp!.tree],
+        ["pass", stamp!.finalizedTree],
+      ]);
       // The finalized tree survives gc as well.
       repo.git("gc", "--prune=now", "--quiet");
       expect(repo.git("cat-file", "-t", stamp!.finalizedTree!)).toBe("tree");
@@ -1225,13 +1301,21 @@ describe("the close stamp", () => {
       expect(stamp!.tree).toBe(metadata[WORKGRAPH_RESULT_TREE_KEY]);
       expect(stamp!.tree).toBe(metadata[WORKGRAPH_ACCEPTED_TREE_KEY]);
       expect(stamp).not.toHaveProperty("verdict");
-      expect(stamp!.gates).toEqual({ "tree-binding": "pass" });
+      expect(stamp!.gates).toEqual({ "tree-binding": "pass", check: "pass" });
+      expect(stamp!.check).toBe("passed");
       expect(stamp!.finalizedTree).toBe(metadata[WORKGRAPH_FINALIZED_TREE_KEY]);
       expect(fileAt(repo.dir, stamp!.finalizedTree!, "CHANGELOG.txt")).toBe(
         "released\n",
       );
+      // Checked before the stamp, and again on the tree finalization left.
+      expect((await listReceipts(repo.dir, id)).map((r) => r.tree)).toEqual([
+        stamp!.tree,
+        stamp!.finalizedTree,
+      ]);
       // Low tier observes by default: recorded, would not have blocked.
-      const records = await listGateRecords(repo.dir, id);
+      const records = (await listGateRecords(repo.dir, id)).filter(
+        (r) => r.gate === "tree-binding",
+      );
       expect(records).toHaveLength(1);
       expect(records[0]).toMatchObject({
         gate: "tree-binding",
@@ -1251,7 +1335,9 @@ describe("the close stamp", () => {
     for (const enforce of [false, true]) {
       const graph = makeScratchGraph({ prefix: enforce ? "pboneenf" : "pboneobs", seed: 1 });
       const id = graph.seededIds[0]!;
-      approve(graph, id, { riskTier: "low", workflowClass: "oneshot" });
+      // No check: low-risk work may have none, and outside git none could
+      // be bound to a tree.
+      approve(graph, id, { riskTier: "low", workflowClass: "oneshot", check: null });
       const { mock, coordinator } = makeHarness(
         enforce
           ? { policy: { low: { gates: { "tree-binding": "enforce" } } } }
@@ -1264,7 +1350,9 @@ describe("the close stamp", () => {
       const ectx = makeEventContext(graph.dir);
       try {
         await drive(mock, ectx.ctx);
-        const records = await listGateRecords(graph.dir, id);
+        const records = (await listGateRecords(graph.dir, id)).filter(
+          (r) => r.gate === "tree-binding",
+        );
         expect(records).toHaveLength(1);
         expect(records[0]).toMatchObject({
           gate: "tree-binding",

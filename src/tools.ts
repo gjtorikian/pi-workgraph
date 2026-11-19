@@ -37,6 +37,7 @@ import {
   unsetMetadata,
   update,
 } from "./store.ts";
+import { approvalRefusal, authoredCheck, resolveCheck } from "./check.ts";
 import { resolveConfig, type WorkgraphConfig } from "./config.ts";
 import {
   defaultLeaseActor,
@@ -59,6 +60,8 @@ import {
 } from "./lease.ts";
 import {
   attemptOf,
+  checkOf,
+  checkWaiverOf,
   isLifecycleV1,
   lastVerdictOf,
   phaseOf,
@@ -112,6 +115,8 @@ import {
   StatusParams,
   TiersParams,
   DEFAULT_WORKFLOW_CLASS,
+  WORKGRAPH_CHECK_KEY,
+  WORKGRAPH_CHECK_WAIVER_KEY,
   WORKGRAPH_DECISION_ANSWER_KEY,
   WORKGRAPH_DECISION_QUESTION_KEY,
   WORKGRAPH_EXECUTOR_ID_KEY,
@@ -163,14 +168,32 @@ function gateResultLine(record: GateRecord): string {
   return `Gate ${record.gate}: ${record.result}${effect} (${record.mode}, attempt ${record.attempt})${reason}`;
 }
 
-/** One line of `workgraph_gates`: the issues a gate blocked and would have blocked. */
+/**
+ * One line of `workgraph_gates`: the issues a gate blocked and would have
+ * blocked, then (only when there are any) the issues a human waived it for,
+ * each with its reason. A gate with no waiver keeps the two-column line.
+ */
 function gateReportLine(gate: GateName, summary: GateSummary): string {
   if (summary.records === 0) return `${gate}: no records`;
   const list = (ids: string[]): string => (ids.length > 0 ? ` (${ids.join(", ")})` : "");
+  const waived =
+    summary.waived.length > 0
+      ? `, ${summary.waived.length} not applicable, waived (${summary.waived
+          .map((w) => `${w.issueId}: ${w.reason}`)
+          .join("; ")})`
+      : "";
   return (
     `${gate}: ${summary.blocked.length} blocked${list(summary.blocked)}, ` +
-    `${summary.wouldBlock.length} would block${list(summary.wouldBlock)}`
+    `${summary.wouldBlock.length} would block${list(summary.wouldBlock)}${waived}`
   );
+}
+
+/** The metadata a check or a waiver given at creation is stored as. */
+function checkMetadata(authored: { check?: string; waiver?: string }): Record<string, string> {
+  return {
+    ...(authored.check !== undefined ? { [WORKGRAPH_CHECK_KEY]: authored.check } : {}),
+    ...(authored.waiver !== undefined ? { [WORKGRAPH_CHECK_WAIVER_KEY]: authored.waiver } : {}),
+  };
 }
 
 function textResult<TDetails>(
@@ -395,23 +418,40 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     name: "workgraph_split",
     label: "Split work",
     description:
-      "Split an issue into child issues; the parent is blocked until every child closes",
+      "Split an issue into child issues; the parent is blocked until every child closes. " +
+      "A child created approved at medium or high risk (the default tier is medium) needs its own check command, a repository default, or a checkWaiver; " +
+      "a child does not inherit the parent's.",
     promptSnippet: "Split a work-graph issue into children",
     promptGuidelines: [
       "Use workgraph_split when an issue is too large to claim whole.",
+      "Give each approved child the check command the human named; pass checkWaiver only on explicit human instruction, with the human's reason.",
     ],
     parameters: SplitParams,
     executionMode: "sequential",
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      await prepare(ctx);
+      const config = await prepare(ctx);
       const actor = workerId();
       // Fail before creating anything if the parent doesn't exist.
       const parent = await show(ctx.cwd, params.id);
 
+      // Every child is validated before any is created: a refusal on the
+      // third child must not leave two behind. An approved child with no
+      // tier is medium by policy, so it is held to the medium rule.
+      const authored = params.children.map((child) => {
+        const given = authoredCheck(child);
+        if (child.approved) {
+          const refusal = approvalRefusal(child.riskTier, given, config);
+          if (refusal !== undefined) {
+            throw new Error(`Cannot split ${params.id}: child "${child.title}": ${refusal}`);
+          }
+        }
+        return given;
+      });
+
       // Create children first, deps second; on partial failure report exactly
       // what exists so no orphan is silently left behind.
       const created: WorkIssue[] = [];
-      for (const child of params.children) {
+      for (const [index, child] of params.children.entries()) {
         try {
           created.push(
             await createIssue(
@@ -428,6 +468,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
                   | "planned"
                   | undefined,
                 approved: child.approved,
+                metadata: checkMetadata(authored[index]!),
               },
               actor,
             ),
@@ -471,18 +512,21 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     name: "workgraph_approve",
     label: "Approve work",
     description:
-      "Approve a draft or legacy issue for dispatch: records acceptance criteria, " +
+      "Approve a draft or legacy issue for dispatch: records acceptance criteria and the check command, " +
       "stamps lifecycle v1 with a risk tier and workflow class, and transitions the issue to phase ready. " +
       "Also re-approves escalated work (back to ready, reopened). " +
-      "The coordinator only dispatches approved ready work.",
+      "The coordinator only dispatches approved ready work, and runs the check itself before any review. " +
+      "Medium- and high-risk work is refused without a check (here, already on the issue, or the repository default in Pi settings) " +
+      "unless checkWaiver records why no check applies; waived work closes stamped waived.",
     promptSnippet: "Approve a work-graph issue for dispatch",
     promptGuidelines: [
-      "Use workgraph_approve to move a draft, legacy, or escalated issue into the dispatchable ready pool, with acceptance criteria the judgment gate will check.",
+      "Use workgraph_approve to move a draft, legacy, or escalated issue into the dispatchable ready pool, with acceptance criteria the judgment gate will check and the check command the human named.",
+      "Pass checkWaiver only on explicit human instruction, with the human's reason; never invent a waiver to get an approval through.",
     ],
     parameters: ApproveParams,
     executionMode: "sequential",
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      await prepare(ctx);
+      const config = await prepare(ctx);
       const actor = defaultLeaseActor();
       const cur = await show(ctx.cwd, params.id);
       const phase = phaseOf(cur);
@@ -510,11 +554,31 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
         requestedWorkflowClass === "oneshot" && riskTier !== "low"
           ? "reviewed"
           : requestedWorkflowClass;
+      // The check rule, after the two guards above and before any write. A
+      // check or a waiver already on the issue (a draft created with one, a
+      // re-approval) satisfies it; a new one replaces the other kind, so an
+      // issue never carries both.
+      const given = authoredCheck(params);
+      const replaces = given.check !== undefined || given.waiver !== undefined;
+      const check = given.check ?? (replaces ? undefined : checkOf(cur));
+      const waiver = given.waiver ?? (replaces ? undefined : checkWaiverOf(cur));
+      const refusal = approvalRefusal(riskTier, { check, waiver }, config);
+      if (refusal !== undefined) {
+        throw new Error(`Cannot approve ${params.id}: ${refusal}`);
+      }
       const approvalFields = {
         [WORKGRAPH_RISK_TIER_KEY]: riskTier,
         [WORKGRAPH_WORKFLOW_CLASS_KEY]: workflowClass,
         // A re-approved planned issue plans afresh; stale approvals never carry.
         [WORKGRAPH_PLAN_APPROVED_KEY]: false,
+        // Rides the guarded write: an approval that loses the race leaves
+        // the stored check as it was.
+        ...(replaces
+          ? {
+              [WORKGRAPH_CHECK_KEY]: given.check ?? "",
+              [WORKGRAPH_CHECK_WAIVER_KEY]: given.waiver ?? "",
+            }
+          : {}),
       };
       if (phase === "escalated") {
         // The re-approve recovery path (failure-modes table: "escalation is
@@ -555,6 +619,8 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
           workflowClass,
           requestedWorkflowClass,
           acceptanceCriteria: params.acceptanceCriteria ?? null,
+          check: check ?? null,
+          checkWaiver: waiver ?? null,
           actor: identitySnapshot(actor),
         },
         actor.bdActor,
@@ -563,8 +629,16 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
         `Approved ${params.id} for dispatch (workflow ${workflowClass}, risk tier ${riskTier}, phase ready).` +
           (workflowClass !== requestedWorkflowClass
             ? ` Requested ${requestedWorkflowClass} was promoted because only low-risk work may skip independent review.`
-            : ""),
-        { id: params.id, riskTier, workflowClass, requestedWorkflowClass },
+            : "") +
+          (waiver !== undefined ? ` Check waived: ${waiver}` : ""),
+        {
+          id: params.id,
+          riskTier,
+          workflowClass,
+          requestedWorkflowClass,
+          check: check ?? null,
+          checkWaiver: waiver ?? null,
+        },
       );
     },
   });
@@ -709,7 +783,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     name: "workgraph_status",
     label: "Work status",
     description:
-      "Show one issue's full workgraph state: lifecycle phase, acceptance criteria, risk tier, " +
+      "Show one issue's full workgraph state: lifecycle phase, acceptance criteria, the check command or its waiver, risk tier, " +
       "workflow run, attempt, last verdict, the gate modes that apply and each gate's latest result, " +
       "executor, and the lease (holder, epoch, expiry).",
     promptSnippet: "Show a work-graph issue's lifecycle and lease state",
@@ -734,6 +808,18 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
       ];
       if (issue.acceptance_criteria) {
         lines.push(`Acceptance: ${issue.acceptance_criteria}`);
+      }
+      // The check as it would be frozen at the next claim: the issue's own
+      // command, else its waiver, else the repository default.
+      const effectiveCheck = resolveCheck(issue, config);
+      if (effectiveCheck.spec !== undefined) {
+        lines.push(
+          `Check: ${effectiveCheck.spec.command}${
+            effectiveCheck.source === "repository default" ? " (repository default)" : ""
+          }`,
+        );
+      } else if (effectiveCheck.waiver !== undefined) {
+        lines.push(`Check waived: ${effectiveCheck.waiver}`);
       }
       const riskTier = riskTierOf(issue);
       if (riskTier) lines.push(`Risk tier: ${riskTier}`);
@@ -808,6 +894,8 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
         workflowRunId: runId ?? null,
         attempt: attemptOf(issue) ?? null,
         lastVerdict: verdict ?? null,
+        check: effectiveCheck.spec?.command ?? null,
+        checkWaiver: effectiveCheck.waiver ?? null,
         gates: policy.gates,
         gateResults,
       });
@@ -819,7 +907,8 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     label: "Gate report",
     description:
       "Report what the proof gates did: for each gate, the issues it blocked (mode enforce) and the issues it would have blocked (mode observe). " +
-      "A gate that is off records nothing. Pass an id to narrow the report to one issue.",
+      "A gate that is off records nothing. Work whose check was waived is listed under check as not applicable, with the waiver reason. " +
+      "Pass an id to narrow the report to one issue.",
     promptSnippet: "Report which gates blocked work, or would have",
     promptGuidelines: [
       "Use workgraph_gates to see what each gate blocked or would have blocked before changing a gate's mode in the policy.",
@@ -906,7 +995,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     promptSnippet: "Initialize a work-graph workspace here",
     promptGuidelines: [
       "Use workgraph_init once per repository before creating issues; calling it again is harmless.",
-      "When asked to set up workgraph for a feature: call workgraph_init, then workgraph_create with approve: true, workflowClass planned, and acceptance criteria derived from the request; if the request names models for roles, call workgraph_tiers first (otherwise the roster in Pi settings applies).",
+      "When asked to set up workgraph for a feature: call workgraph_init, then workgraph_create with approve: true, workflowClass planned, acceptance criteria derived from the request, and check set to the command that proves the work (the repository's test command, e.g. npm test) unless Pi settings already name a default under workgraph.check; if the request names models for roles, call workgraph_tiers first (otherwise the roster in Pi settings applies).",
     ],
     parameters: InitParams,
     executionMode: "sequential",
@@ -924,19 +1013,30 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     label: "Create work",
     description:
       "Create an issue in the work graph. With approve: true it is dispatchable immediately (phase ready); " +
-      "workflowClass planned makes the coordinator plan first and wait for workgraph_approve_plan before any code is written.",
+      "workflowClass planned makes the coordinator plan first and wait for workgraph_approve_plan before any code is written. " +
+      "check is the shell command the core itself runs against the result before any review. " +
+      "With approve: true, medium- and high-risk work (the default tier is medium) is refused without a check or a repository default " +
+      "unless checkWaiver records why no check applies.",
     promptSnippet: "Create a work-graph issue",
     promptGuidelines: [
-      "Use workgraph_create to add work. Pass approve: true with acceptance criteria to dispatch it; use workflowClass planned when you want to review a plan before implementation.",
+      "Use workgraph_create to add work. Pass approve: true with acceptance criteria and a check command to dispatch it; use workflowClass planned when you want to review a plan before implementation.",
+      "Pass checkWaiver only on explicit human instruction, with the human's reason; never invent a waiver to get work approved.",
     ],
     parameters: CreateParams,
     executionMode: "sequential",
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      await prepare(ctx);
+      const config = await prepare(ctx);
       const actor = defaultLeaseActor();
       const riskTier = params.riskTier ?? (params.approve ? DEFAULT_RISK_TIER : undefined);
       const requestedWorkflowClass =
         params.workflowClass ?? (params.approve ? DEFAULT_WORKFLOW_CLASS : undefined);
+      // A draft may carry a check or a waiver for its later approval; the
+      // rule itself applies only to work created approved.
+      const given = authoredCheck(params);
+      if (params.approve) {
+        const refusal = approvalRefusal(riskTier, given, config);
+        if (refusal !== undefined) throw new Error(`Cannot create approved work: ${refusal}`);
+      }
       const issue = await createIssue(
         ctx.cwd,
         {
@@ -949,6 +1049,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
           workflowClass: requestedWorkflowClass as WorkflowClassT | undefined,
           approved: params.approve,
           dependsOn: params.dependsOn,
+          metadata: checkMetadata(given),
         },
         actor.bdActor,
       );
@@ -962,6 +1063,8 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
             workflowClass: workflowClassOf(issue),
             requestedWorkflowClass,
             acceptanceCriteria: params.acceptanceCriteria ?? null,
+            check: given.check ?? null,
+            checkWaiver: given.waiver ?? null,
             actor: identitySnapshot(actor),
             via: "workgraph_create",
           },

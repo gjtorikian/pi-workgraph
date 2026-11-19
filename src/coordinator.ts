@@ -57,6 +57,19 @@
  *    issue is claimed for a non-isolated executor in that checkout. The
  *    comparison above is against the live checkout, so a second issue's
  *    edits there would read as a change to the first.
+ *  - THE FROZEN BAR (`src/check.ts`): what a run is judged against — risk
+ *    tier, gate policy, acceptance criteria, the check or its waiver — is
+ *    captured once, at claim, and every later decision of that claim reads
+ *    the captured copy. The issue and the settings are still re-read, but
+ *    only to RECORD that they changed (`bar-changed`); a change applies to
+ *    the next claim. A restart rebuilds the bar from the `bar-frozen` event.
+ *  - THE CHECK: unless the `check` gate is `off`, the coordinator runs the
+ *    bar's check command itself against the result tree, before any
+ *    reviewer is selected, and keeps a receipt bound to that tree. One tree
+ *    is checked once. A failed check is a blocking finding the core wrote
+ *    (`author: "code"`) and takes the same revise path a reviewer's would;
+ *    no reviewer is asked about a tree whose check failed. A tree changed
+ *    by finalization is checked again before the close.
  */
 import { existsSync, realpathSync } from "node:fs";
 import type {
@@ -65,9 +78,21 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { recordLeaseEvent } from "./audit.ts";
 import {
+  barDifferences,
+  barDigest,
+  buildBar,
+  commandDigest,
+  runCheck,
+  unstartedRun,
+  type Bar,
+  type CheckRun,
+  type CheckSpec,
+} from "./check.ts";
+import {
   StoreError,
   close,
   ensureWorkspace,
+  proofLogPath,
   ready,
   setMetadata,
   show,
@@ -115,6 +140,7 @@ import {
 import {
   activeExecutionIdOf,
   attemptOf,
+  barDigestOf,
   baseCommitOf,
   baseTreeOf,
   escalate,
@@ -141,18 +167,23 @@ import {
 } from "./plan.ts";
 import {
   checkIndependence,
-  resolvePolicy,
   type GateModeT,
   type GateName,
-  type RiskTier,
 } from "./policy.ts";
 import {
   decideGate,
+  listReceipts,
+  ReceiptWriteError,
+  receiptFor,
   recordGate,
+  recordReceipt,
   recordStamp,
   recordStampAmendment,
   StampWriteError,
+  WAIVED_REASON_PREFIX,
   type GateResult,
+  type RecordedReceipt,
+  type StampCheck,
 } from "./proof.ts";
 import {
   CH,
@@ -173,6 +204,7 @@ import {
   listRunHeldInProgress,
   partitionByExpiry,
   reconstructAuthorCompletion,
+  reconstructBar,
   reconstructBinding,
   requestStatus,
   type RecoveredBinding,
@@ -190,6 +222,7 @@ import {
 import { clearLeaseStatus, showLeaseStatus } from "./status.ts";
 import { reclaimAndLeaveReady } from "./sweep.ts";
 import type {
+  FindingT,
   WorkIssue,
   IdentityProvider,
   Lease,
@@ -207,6 +240,7 @@ import {
   WORKGRAPH_ACTIVE_EXECUTION_ID_KEY,
   WORKGRAPH_ATTEMPT_KEY,
   WORKGRAPH_AUTHOR_PROVENANCE_KEY,
+  WORKGRAPH_BAR_DIGEST_KEY,
   WORKGRAPH_BASE_COMMIT_KEY,
   WORKGRAPH_BASE_TREE_KEY,
   WORKGRAPH_EXECUTOR_ID_KEY,
@@ -292,6 +326,13 @@ export interface CoordinatorDeps {
 export const MAX_REVIEW_RETRIES = 2;
 
 /**
+ * How many times a check is run again because the workspace changed while it
+ * ran (the result is discarded: it describes a tree that is gone). After
+ * that the gate reports `unknown`.
+ */
+export const MAX_CHECK_RETRIES = 2;
+
+/**
  * Default bound on a plan critique: one attempt, then the plan parks without
  * one. A constant for the same reason {@link MAX_REVIEW_RETRIES} is.
  */
@@ -307,14 +348,6 @@ function effectiveWorkflowClass(issue: WorkIssue): WorkflowClassT {
   return workflowClass === "oneshot" && riskTierOf(issue) !== "low"
     ? "reviewed"
     : workflowClass;
-}
-
-/** Protocol-safe form of the same conservative risk fallback policy uses. */
-function effectiveRiskTier(issue: WorkIssue): RiskTier {
-  const riskTier = riskTierOf(issue);
-  return riskTier === "low" || riskTier === "medium" || riskTier === "high"
-    ? riskTier
-    : "medium";
 }
 
 /** One workflow run the coordinator supervises. */
@@ -387,6 +420,23 @@ export interface CoordinatorRun {
   gateResults?: Record<string, GateResult>;
   /** The tree the close stamp accepted (compared again after finalization). */
   stampedTree?: string;
+  /**
+   * THE FROZEN BAR: what this run is judged against, captured at claim (or
+   * rebuilt from the `bar-frozen` event after a restart). Every decision of
+   * the run reads this, never the live issue or settings.
+   */
+  bar: Bar;
+  /** {@link barDigest} of `bar`, also in `workgraph_bar_digest`. */
+  barDigest: string;
+  /** Digests of live bars already reported as differing from the frozen
+   *  one: one `bar-changed` event per distinct change, not one per round. */
+  barChanges?: string[];
+  /**
+   * What the `check` gate last found, for the close stamp. `tree` is the
+   * tree the receipt is bound to (`passed` and `failed` only). Unset while
+   * the gate is `off` or has not been evaluated.
+   */
+  checkOutcome?: { status: StampCheck; tree?: string; logSha256?: string };
   /**
    * A recorded plan that has not parked yet: set by acceptPlan when a
    * critique will run, cleared by parkForPlanReview. While set, the
@@ -586,11 +636,13 @@ export function registerCoordinator(
    *  - `heldConfig()` never throws. For the paths that protect or finish
    *    work ALREADY under a lease — the heartbeat, teardown, completion
    *    handling, an in-flight revision — which read timers and routing.
-   *    Of the policy they read one thing, the `tree-binding` mode, and only
-   *    to learn whether to take a snapshot (and, for one-shot work, which
-   *    has no judgment loop, to decide that gate). It logs the message and keeps the last config that
-   *    resolved, because stopping these over a typo would let a live lease
-   *    lapse or strand an issue between two transitions.
+   *    They read nothing of the policy: every gate mode a held run needs
+   *    is on its frozen bar. (One-shot work, which has no judgment loop,
+   *    also hands this config to the bar comparison, where a stale value
+   *    costs at most a missed `bar-changed` record.) It logs the message
+   *    and keeps the last config that resolved, because stopping these over
+   *    a typo would let a live lease lapse or strand an issue between two
+   *    transitions.
    *
    * `DEFAULT_CONFIG` stands in when nothing has resolved yet. Only the poll
    * timer's start can see it: no run is held before a tick or a
@@ -636,15 +688,12 @@ export function registerCoordinator(
   }
 
   /**
-   * The `tree-binding` mode for an issue under a given config. The gate is
-   * DECIDED in the judgment loop, under `currentConfig()`; the completion
-   * handler and the claim path only ask this to learn whether snapshots are
-   * wanted at all, and they ask it of the config they already hold.
+   * The `tree-binding` mode of a run: the one on its frozen bar. The gate is
+   * DECIDED in the judgment loop; the completion handler and the claim path
+   * ask this to learn whether snapshots are wanted at all.
    */
-  function bindingModeOf(issue: WorkIssue, config: WorkgraphConfig): GateModeT {
-    return resolvePolicy(riskTierOf(issue), config.policy).gates[
-      "tree-binding"
-    ];
+  function bindingModeOf(run: CoordinatorRun): GateModeT {
+    return run.bar.policy.gates["tree-binding"];
   }
 
   /** Why git could not snapshot `path`, in words an escalation can carry. */
@@ -707,10 +756,9 @@ export function registerCoordinator(
   async function recordSharedBase(
     run: CoordinatorRun,
     isolation: IsolationLevelT,
-    config: WorkgraphConfig,
   ): Promise<void> {
     if (isolation !== "none") return;
-    if (bindingModeOf(run.issue, config) === "off") return;
+    if (bindingModeOf(run) === "off") return;
     const storedPath = workspacePathOf(run.issue);
     const storedCommit = baseCommitOf(run.issue);
     const storedTree = baseTreeOf(run.issue);
@@ -949,8 +997,12 @@ export function registerCoordinator(
    * Write the close stamp and `workgraph_accepted_tree`. The stamp is
    * durable like the verdict: if it cannot be written the run escalates
    * from `verifying` and this returns false — the caller stops, nothing
-   * closes. A run with no bound tree (`observe` and `unknown`) is stamped
-   * without the tree fields.
+   * closes. A run with no bound tree (`tree-binding` off, or `observe` and
+   * `unknown`) is stamped without the tree fields.
+   *
+   * The stamp's `check` comes from what the `check` gate found for THIS
+   * tree; nothing runs here. A receipt bound to another tree is not this
+   * tree's proof, so it reads as `none`.
    */
   async function stampAcceptance(
     run: CoordinatorRun,
@@ -958,6 +1010,16 @@ export function registerCoordinator(
     verdict?: { executionId: string; summary: string },
   ): Promise<boolean> {
     const tree = boundTreeOf(run);
+    const checked =
+      run.bar.policy.gates.check !== "off" ? run.checkOutcome : undefined;
+    const receiptBound =
+      checked?.status === "passed" || checked?.status === "failed";
+    const check: StampCheck | undefined =
+      checked === undefined
+        ? undefined
+        : receiptBound && checked.tree !== tree
+          ? "none"
+          : checked.status;
     try {
       await recordStamp(
         run.cwd,
@@ -976,6 +1038,10 @@ export function registerCoordinator(
           attempt,
           ...(verdict !== undefined ? { verdict } : {}),
           gates: { ...run.gateResults },
+          ...(check !== undefined ? { check } : {}),
+          ...(check === "passed" && checked?.logSha256 !== undefined
+            ? { checkLogSha256: checked.logSha256 }
+            : {}),
         },
         run.actor.bdActor,
       );
@@ -1001,17 +1067,22 @@ export function registerCoordinator(
   /**
    * After a finalization that succeeded: if it changed the stamped tree,
    * record the new tree (anchored, in `workgraph_finalized_tree`, and as a
-   * stamp amendment). Never blocks: finalization's external effects have
-   * already happened (decision log).
+   * stamp amendment) and return it; undefined when the tree is what was
+   * stamped, or could not be read. Recording never blocks: finalization's
+   * external effects have already happened (decision log). What the caller
+   * does with the returned tree can: it is checked again
+   * ({@link recheckFinalized}).
    */
-  async function amendAfterFinalization(run: CoordinatorRun): Promise<void> {
+  async function amendAfterFinalization(
+    run: CoordinatorRun,
+  ): Promise<string | undefined> {
     const stamped = run.stampedTree;
     const path = run.workspacePath;
-    if (stamped === undefined || path === undefined) return;
+    if (stamped === undefined || path === undefined) return undefined;
     let live: string;
     try {
       live = treeOf(path);
-      if (live === stamped) return;
+      if (live === stamped) return undefined;
       anchorTree(
         path,
         live,
@@ -1022,7 +1093,7 @@ export function registerCoordinator(
       logSkipOnce(
         `could not compare ${run.lease.issueId} after finalization: ${gitFailure(path, e)}`,
       );
-      return;
+      return undefined;
     }
     await setMetadata(
       run.cwd,
@@ -1036,6 +1107,395 @@ export function registerCoordinator(
       { finalizedTree: live, workflowRunId: run.workflowRunId },
       run.actor.bdActor,
     );
+    return live;
+  }
+
+  // -------------------------------------------------------------------------
+  // The frozen bar and the check gate. The runner and the bar's shape live
+  // in src/check.ts, the receipt in src/proof.ts; everything here decides
+  // when a check runs, what its result does, and what gets recorded.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Compare the frozen bar with what the issue and the configuration say
+   * NOW, and record a `bar-changed` event naming what differs. The run
+   * keeps its frozen bar either way. One event per distinct change: the
+   * judgment loop calls this every round, and a change that stays would
+   * otherwise be reported once per round.
+   */
+  async function noteBarDrift(
+    run: CoordinatorRun,
+    issue: WorkIssue,
+    config: WorkgraphConfig,
+  ): Promise<void> {
+    const current = buildBar(issue, config);
+    const digest = barDigest(current);
+    if (digest === run.barDigest || run.barChanges?.includes(digest)) return;
+    run.barChanges = [...(run.barChanges ?? []), digest];
+    await recordLeaseEvent(
+      run.cwd,
+      "bar-changed",
+      run.lease.issueId,
+      {
+        workflowRunId: run.workflowRunId,
+        frozenDigest: run.barDigest,
+        currentDigest: digest,
+        fields: barDifferences(run.bar, current),
+      },
+      run.actor.bdActor,
+    );
+  }
+
+  /**
+   * Whether this process still supervises `run`. A check can take minutes,
+   * and in that time teardown may release the run, a heartbeat may find its
+   * lease reclaimed, or a human may halt it. Nothing is written for a run
+   * that is no longer held.
+   */
+  function stillHeld(run: CoordinatorRun): boolean {
+    if (state.active === run) return true;
+    if (!state.judged.includes(run)) return false;
+    const box = state.inboxes.get(run.workflowRunId);
+    return box !== undefined && !box.closed;
+  }
+
+  /** Checks in flight, so the paths that let go of a run can stop its check. */
+  const checksInFlight = new Map<CoordinatorRun, AbortController>();
+
+  /**
+   * Stop a run's check, if one is running. The check's process group is
+   * detached, so nothing else would end it when the run is let go; its
+   * result is discarded by {@link stillHeld}.
+   */
+  function abortCheck(run: CoordinatorRun): void {
+    checksInFlight.get(run)?.abort();
+  }
+
+  /** Receipts already read or written this session, by run, tree and command. */
+  const receipts = new Map<string, RecordedReceipt>();
+
+  function receiptKey(run: CoordinatorRun, tree: string, spec: CheckSpec): string {
+    return `${run.workflowRunId}\u0000${tree}\u0000${commandDigest(spec.command)}`;
+  }
+
+  /** Run the check once in the run's workspace. Records nothing. */
+  async function runCheckOnce(
+    run: CoordinatorRun,
+    spec: CheckSpec,
+  ): Promise<CheckRun> {
+    let logPath: string;
+    try {
+      // The log sits beside the database, found from the session's
+      // checkout: an executor's worktree has no store.
+      const taken = (await listReceipts(run.cwd, run.lease.issueId)).length;
+      logPath = proofLogPath(run.cwd, run.lease.issueId, String(taken + 1));
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return unstartedRun(spec, `could not write log: ${msg}`);
+    }
+    const controller = new AbortController();
+    checksInFlight.set(run, controller);
+    try {
+      return await runCheck(spec, run.workspacePath ?? run.cwd, logPath, {
+        signal: controller.signal,
+      });
+    } finally {
+      checksInFlight.delete(run);
+    }
+  }
+
+  /**
+   * The receipt for (tree, command), running the check only when this run
+   * has none: first this session's cache, then the comment trail (so a
+   * restart never repeats a check), then the command itself. A receipt is
+   * reused whether it passed or failed. Only the run's own receipts count:
+   * a new claim checks for itself (see `receiptFor`).
+   *
+   * A fresh run is only kept when the workspace is still at `tree`
+   * afterwards, which `compare` answers: a check that ran while the files
+   * moved describes no tree at all. `moved`: it was not; the result is
+   * discarded. `unreadable`: git could not say. `released`: the run is no
+   * longer held, and nothing was written. Throws `ReceiptWriteError` when
+   * the receipt could not be recorded.
+   */
+  async function ensureReceipt(
+    run: CoordinatorRun,
+    tree: string,
+    spec: CheckSpec,
+    compare: () => Promise<"same" | "changed" | "failed">,
+  ): Promise<RecordedReceipt | "moved" | "unreadable" | "released"> {
+    const key = receiptKey(run, tree, spec);
+    const cached = receipts.get(key);
+    if (cached) return cached;
+    const recorded = await receiptFor(
+      run.cwd,
+      run.lease.issueId,
+      tree,
+      commandDigest(spec.command),
+      run.workflowRunId,
+    );
+    if (recorded) {
+      receipts.set(key, recorded);
+      return recorded;
+    }
+    const checked = await runCheckOnce(run, spec);
+    if (!stillHeld(run) || checked.reason === "aborted") return "released";
+    const where = await compare();
+    if (where === "changed") return "moved";
+    if (where === "failed") return "unreadable";
+    const receipt: RecordedReceipt = {
+      ...checked,
+      tree,
+      workflowRunId: run.workflowRunId,
+      attempt: run.attempt,
+    };
+    await recordReceipt(
+      run.cwd,
+      run.lease.issueId,
+      receipt,
+      run.actor.bdActor,
+    );
+    receipts.set(key, receipt);
+    return receipt;
+  }
+
+  /**
+   * The receipt for the run's CURRENT result tree. When the workspace moved
+   * while the check ran, the run is re-bound to the new tree
+   * (`recheckWorkspace`: anchored, written, audited) and the check runs
+   * again there, at most {@link MAX_CHECK_RETRIES} more times.
+   */
+  async function checkResultTree(
+    run: CoordinatorRun,
+    spec: CheckSpec,
+    attempt: number,
+  ): Promise<
+    | { kind: "receipt"; receipt: RecordedReceipt }
+    | { kind: "unknown"; reason: string }
+    | { kind: "released" }
+  > {
+    for (let retries = 0; ; retries++) {
+      const tree = boundTreeOf(run);
+      if (tree === undefined) {
+        // A receipt names a tree. With none there is nothing to bind the
+        // result to, so the command is not run at all.
+        const why =
+          bindingModeOf(run) === "off"
+            ? "the tree-binding gate is off"
+            : (run.bindingReason ?? "no result tree was recorded");
+        return {
+          kind: "unknown",
+          reason: `the check needs a result tree and there is none (${why}); a check runs only in a git repository with gates.tree-binding at observe or enforce`,
+        };
+      }
+      const outcome = await ensureReceipt(run, tree, spec, () =>
+        recheckWorkspace(run, attempt, "during the check"),
+      );
+      if (outcome === "released") return { kind: "released" };
+      if (outcome === "unreadable") {
+        return {
+          kind: "unknown",
+          reason: `workspace could not be read after the check: ${run.bindingReason ?? "git failed"}`,
+        };
+      }
+      if (outcome !== "moved") return { kind: "receipt", receipt: outcome };
+      if (retries >= MAX_CHECK_RETRIES) {
+        return {
+          kind: "unknown",
+          reason: "workspace keeps changing during the check",
+        };
+      }
+    }
+  }
+
+  /**
+   * Evaluate and record the `check` gate for the run's current result.
+   *
+   *   a receipt that passed            → `pass`
+   *   a receipt that failed            → `violation` (exit, timeout, signal,
+   *                                      could not start, log not written)
+   *   a waiver on the bar              → `not-applicable`, `waived: <reason>`
+   *   no check, low risk               → `not-applicable`, `no check`
+   *   no check and no waiver at medium or high (work that reached the pool
+   *   around the approval rule: a legacy claim, hand-written metadata)
+   *                                    → `unknown`
+   *   a check that could not be bound to a tree → `unknown`
+   *
+   * `continue`: the gate does not stop the run (it passed, does not apply,
+   * or only observes). `violation`: it blocks, and the caller sends the
+   * finding down its failure path. `stop`: the run was escalated from
+   * `phase`, or is no longer held; the caller returns.
+   */
+  async function evaluateCheck(
+    run: CoordinatorRun,
+    mode: GateModeT,
+    attempt: number,
+    phase: "implementing" | "judging",
+  ): Promise<
+    | { kind: "continue" }
+    | { kind: "stop" }
+    | { kind: "violation"; finding: FindingT; reason: string }
+  > {
+    const bar = run.bar;
+    let result: GateResult;
+    let reason: string | undefined;
+    let receipt: RecordedReceipt | undefined;
+    if (bar.check === undefined) {
+      if (bar.checkWaiver !== undefined) {
+        result = "not-applicable";
+        reason = `${WAIVED_REASON_PREFIX}${bar.checkWaiver}`;
+      } else if (bar.riskTier === "low") {
+        result = "not-applicable";
+        reason = "no check";
+      } else {
+        result = "unknown";
+        reason = "no check command; approve with a check or a checkWaiver";
+      }
+    } else {
+      let flow: Awaited<ReturnType<typeof checkResultTree>>;
+      try {
+        flow = await checkResultTree(run, bar.check, attempt);
+      } catch (e) {
+        if (!(e instanceof ReceiptWriteError)) throw e;
+        // Durable like the verdict, under every mode that evaluates.
+        await escalateRun(
+          run,
+          phase,
+          `check receipt could not be written: ${e.detail}`,
+        );
+        return { kind: "stop" };
+      }
+      if (flow.kind === "released") return { kind: "stop" };
+      if (flow.kind === "unknown") {
+        result = "unknown";
+        reason = flow.reason;
+      } else {
+        receipt = flow.receipt;
+        result = receipt.passed ? "pass" : "violation";
+        if (!receipt.passed) reason = receipt.reason ?? "check failed";
+      }
+    }
+
+    const tree = receipt?.tree ?? boundTreeOf(run);
+    run.checkOutcome = {
+      status:
+        result === "pass"
+          ? "passed"
+          : result === "violation"
+            ? "failed"
+            : bar.check === undefined && bar.checkWaiver !== undefined
+              ? "waived"
+              : "none",
+      ...(receipt !== undefined ? { tree: receipt.tree } : {}),
+      ...(receipt?.passed ? { logSha256: receipt.log.sha256 } : {}),
+    };
+    const decision = decideGate("check", mode, result);
+    noteGate(run, "check", result);
+    await recordGate(
+      run.cwd,
+      run.lease.issueId,
+      {
+        gate: "check",
+        mode,
+        result,
+        ...decision,
+        ...(reason !== undefined ? { reason } : {}),
+        ...(tree !== undefined ? { tree } : {}),
+        workflowRunId: run.workflowRunId,
+        attempt,
+      },
+      run.actor.bdActor,
+    );
+    if (!decision.blocked) return { kind: "continue" };
+    if (result === "violation" && receipt !== undefined) {
+      const why = reason ?? "check failed";
+      return {
+        kind: "violation",
+        reason: why,
+        finding: {
+          criterion: "check",
+          severity: "blocking",
+          author: "code",
+          note: why,
+          ...(receipt.log.tail !== "" ? { evidence: receipt.log.tail } : {}),
+        },
+      };
+    }
+    await escalateRun(run, phase, `check: ${reason}`);
+    return { kind: "stop" };
+  }
+
+  /**
+   * Finalization changed the tree, so the receipt the close rests on no
+   * longer describes what is in the workspace: check the finalized tree.
+   * True when the close may go on. A failure escalates from `verifying`.
+   * Finalization's external effects have already happened by then and are
+   * left as recorded, which is the cost of not closing on an unchecked
+   * tree.
+   */
+  async function recheckFinalized(
+    run: CoordinatorRun,
+    finalizedTree: string,
+    attempt: number,
+  ): Promise<boolean> {
+    const mode = run.bar.policy.gates.check;
+    const spec = run.bar.check;
+    const path = run.workspacePath;
+    if (mode === "off" || spec === undefined || path === undefined) return true;
+    let outcome: Awaited<ReturnType<typeof ensureReceipt>>;
+    try {
+      outcome = await ensureReceipt(run, finalizedTree, spec, async () => {
+        try {
+          return treeOf(path) === finalizedTree ? "same" : "changed";
+        } catch {
+          return "failed";
+        }
+      });
+    } catch (e) {
+      if (!(e instanceof ReceiptWriteError)) throw e;
+      await escalateRun(
+        run,
+        "verifying",
+        `check receipt for the tree finalization produced could not be written: ${e.detail}; finalization already ran`,
+      );
+      return false;
+    }
+    if (outcome === "released") return false;
+    let result: GateResult;
+    let reason: string | undefined;
+    if (outcome === "moved") {
+      result = "unknown";
+      reason = "the workspace changed again while the check ran";
+    } else if (outcome === "unreadable") {
+      result = "unknown";
+      reason = "the workspace could not be read after the check";
+    } else {
+      result = outcome.passed ? "pass" : "violation";
+      if (!outcome.passed) reason = outcome.reason ?? "check failed";
+    }
+    const decision = decideGate("check", mode, result);
+    await recordGate(
+      run.cwd,
+      run.lease.issueId,
+      {
+        gate: "check",
+        mode,
+        result,
+        ...decision,
+        ...(reason !== undefined ? { reason } : {}),
+        tree: finalizedTree,
+        workflowRunId: run.workflowRunId,
+        attempt,
+      },
+      run.actor.bdActor,
+    );
+    if (!decision.blocked) return true;
+    await escalateRun(
+      run,
+      "verifying",
+      `check failed on the tree finalization produced: ${reason}; finalization already ran, and its status is left as recorded`,
+    );
+    return false;
   }
 
   /** Put what recovery rebuilt about a run's workspace and trees onto it. */
@@ -1118,6 +1578,7 @@ export function registerCoordinator(
       if (state.active === run) state.active = null;
       untrackLease(run.cwd, run.issue.id);
       dropJudgedRun(run);
+      abortCheck(run);
     }
     if (heldRuns().length === 0) stopHeartbeat();
   });
@@ -1336,7 +1797,10 @@ export function registerCoordinator(
    * Finish a one-shot implementation. Success follows the explicit
    * verification/acceptance tail and closes; failure promotes the issue to
    * the reviewed workflow and returns it to the ready pool for a stronger
-   * implementation + independent judgment pass.
+   * implementation + independent judgment pass. A reported success whose
+   * CHECK fails is a failure: the check is the one gate that enforces at low
+   * risk, and it runs here, before the issue leaves `implementing`, so the
+   * failure branch still starts from the phase it expects.
    */
   async function finishOneshot(
     run: CoordinatorRun,
@@ -1345,11 +1809,62 @@ export function registerCoordinator(
   ): Promise<void> {
     run.executionId = msg.executionId;
     run.evidence = [...msg.evidence];
-    if (msg.outcome !== "success") {
+    const checkMode = run.bar.policy.gates.check;
+    /** Why a reported success is not one, and what to write with it. */
+    let checkFailure: string | undefined;
+    if (msg.outcome === "success") {
+      // One-shot work has no judgment loop, so the bar is compared once,
+      // here. Best effort: a read that fails costs the record, not the run.
+      try {
+        await noteBarDrift(
+          run,
+          await show(run.cwd, run.lease.issueId),
+          heldConfig(),
+        );
+      } catch (e) {
+        const detail = e instanceof Error ? e.message : String(e);
+        logSkipOnce(
+          `could not compare the bar of ${run.lease.issueId}: ${detail}`,
+        );
+      }
+      if (checkMode !== "off") {
+        const checked = await evaluateCheck(
+          run,
+          checkMode,
+          run.attempt,
+          "implementing",
+        );
+        if (checked.kind === "stop") {
+          // Escalated from `implementing`, or no longer held.
+          if (state.active === run) state.active = null;
+          if (heldRuns().length === 0) stopHeartbeat();
+          return;
+        }
+        // The check may have re-bound the run to a tree the workspace moved
+        // to while it ran; the fields about to be written must say so.
+        if (WORKGRAPH_RESULT_TREE_KEY in bindingFields) {
+          bindingFields = {
+            ...bindingFields,
+            [WORKGRAPH_RESULT_COMMIT_KEY]: run.resultCommit ?? "",
+            [WORKGRAPH_RESULT_TREE_KEY]: run.resultTree ?? "",
+          };
+        }
+        if (checked.kind === "violation") checkFailure = checked.reason;
+      }
+    }
+    if (msg.outcome !== "success" || checkFailure !== undefined) {
+      const why =
+        checkFailure !== undefined
+          ? `check failed (${checkFailure})`
+          : msg.outcome;
       await setMetadata(
         run.cwd,
         run.lease.issueId,
         {
+          // A check failure leaves from `implementing` without the
+          // transition that would have written the binding: write it here,
+          // so the tree the receipt names is on the issue.
+          ...(checkFailure !== undefined ? bindingFields : {}),
           [WORKGRAPH_PHASE_KEY]: "ready",
           [WORKGRAPH_WORKFLOW_CLASS_KEY]: "reviewed",
           [WORKGRAPH_ACTIVE_EXECUTION_ID_KEY]: "",
@@ -1366,6 +1881,9 @@ export function registerCoordinator(
           to: "reviewed",
           outcome: msg.outcome,
           executionId: msg.executionId,
+          ...(checkFailure !== undefined
+            ? { reason: `check failed: ${checkFailure}` }
+            : {}),
         },
         run.actor.bdActor,
       );
@@ -1375,7 +1893,7 @@ export function registerCoordinator(
         phase: "ready",
         workflowRunId: run.workflowRunId,
         actor: run.actor.bdActor,
-        summary: `one-shot ${msg.outcome}; promoted to reviewed`,
+        summary: `one-shot ${why}; promoted to reviewed`,
       });
       state.active = null;
       if (heldRuns().length === 0) stopHeartbeat();
@@ -1405,11 +1923,15 @@ export function registerCoordinator(
     });
     // TREE BINDING for one-shot work. There is no judging phase and no
     // judgment loop here, so the gate is decided where the work lands: in
-    // `verifying`, on the policy of the config this handler holds. Then the
-    // stamp, BEFORE finalization, exactly as on the reviewed path.
-    const bindingMode = bindingModeOf(run.issue, heldConfig());
-    if (bindingMode !== "off") {
-      const blocked = await evaluateBinding(run, bindingMode, run.attempt);
+    // `verifying`, on the frozen bar. Then the stamp, BEFORE finalization,
+    // exactly as on the reviewed path: written whenever a gate that feeds
+    // it (`tree-binding` or `check`) was evaluated.
+    const bindingMode = bindingModeOf(run);
+    if (bindingMode !== "off" || checkMode !== "off") {
+      const blocked =
+        bindingMode !== "off"
+          ? await evaluateBinding(run, bindingMode, run.attempt)
+          : undefined;
       let stopped: boolean;
       if (blocked !== undefined) {
         await escalateRun(run, "verifying", blocked);
@@ -1433,7 +1955,15 @@ export function registerCoordinator(
         closed: false,
       });
       if (!(await finalize(run, msg))) return;
-      if (bindingMode !== "off") await amendAfterFinalization(run);
+      if (bindingMode !== "off") {
+        const finalized = await amendAfterFinalization(run);
+        if (
+          finalized !== undefined &&
+          !(await recheckFinalized(run, finalized, run.attempt))
+        ) {
+          return; // escalated from verifying; nothing closes
+        }
+      }
     }
     await transition(run.cwd, run.lease.issueId, "verifying", "accepted", {
       actor: run.actor.bdActor,
@@ -1598,7 +2128,7 @@ export function registerCoordinator(
           msg,
           run.attempt,
           run.isolation,
-          bindingModeOf(run.issue, heldConfig()),
+          bindingModeOf(run),
         );
       }
 
@@ -1872,7 +2402,7 @@ export function registerCoordinator(
   function wantsPlanCritique(run: CoordinatorRun): boolean {
     return (
       heldConfig().planCritique === "high-risk" &&
-      effectiveRiskTier(run.issue) === "high"
+      run.bar.riskTier === "high"
     );
   }
 
@@ -2020,7 +2550,7 @@ export function registerCoordinator(
     );
     // The planner tier reaches its implementer here, not through the claim
     // path, so the shared-checkout base is taken here too.
-    await recordSharedBase(run, implementer.isolation, config);
+    await recordSharedBase(run, implementer.isolation);
     if (state.active !== run) return; // halted while the base was recorded
 
     const request: RunRequestT = {
@@ -2030,12 +2560,12 @@ export function registerCoordinator(
         id: run.issue.id,
         title: run.issue.title,
         workflowClass: effectiveWorkflowClass(run.issue),
-        riskTier: effectiveRiskTier(run.issue),
+        riskTier: run.bar.riskTier,
         ...(run.issue.description !== undefined
           ? { description: run.issue.description }
           : {}),
-        ...(run.issue.acceptance_criteria !== undefined
-          ? { acceptanceCriteria: run.issue.acceptance_criteria }
+        ...(run.bar.criteria !== undefined
+          ? { acceptanceCriteria: run.bar.criteria }
           : {}),
       },
       workflowRunId: run.workflowRunId,
@@ -2234,12 +2764,12 @@ export function registerCoordinator(
         id: run.issue.id,
         title: run.issue.title,
         workflowClass: effectiveWorkflowClass(run.issue),
-        riskTier: effectiveRiskTier(run.issue),
+        riskTier: run.bar.riskTier,
         ...(run.issue.description !== undefined
           ? { description: run.issue.description }
           : {}),
-        ...(run.issue.acceptance_criteria !== undefined
-          ? { acceptanceCriteria: run.issue.acceptance_criteria }
+        ...(run.bar.criteria !== undefined
+          ? { acceptanceCriteria: run.bar.criteria }
           : {}),
       },
       role: "plan_critic",
@@ -2742,9 +3272,109 @@ export function registerCoordinator(
   }
 
   /**
+   * The blocking path: what happens once a gate that enforces found
+   * blocking findings on the result under judgment. Shared by the `review`
+   * gate (a reviewer's verdict) and the `check` gate (a verdict the core
+   * built around one finding of its own), so both are bounded the same way:
+   *
+   *  - the same findings on the same content (`digest`: the result tree, or
+   *    the artifact list when nothing is bound) is a repeat, and a repeat
+   *    never relaunches a revision: reviewed work is promoted to planned,
+   *    planned work escalates;
+   *  - `maxRevisions` (from the frozen bar) bounds the rounds the same way;
+   *  - otherwise judging → revising, and one revision run.
+   *
+   * Returns the revision's completion with the run back in `judging`, or
+   * undefined when the run stopped (promoted, escalated, parked, aborted).
+   */
+  async function reviseAfterBlock(
+    run: CoordinatorRun,
+    box: JudgmentInbox,
+    issue: WorkIssue,
+    attempt: number,
+    verdict: VerdictT,
+    summary: string,
+    digest: string,
+  ): Promise<RunCompletedT | undefined> {
+    const maxRevisions = run.bar.policy.maxRevisions;
+    const fingerprint = failureFingerprint(blockingFindings(verdict), digest);
+    if (failureFingerprintOf(issue) === fingerprint) {
+      if (effectiveWorkflowClass(issue) === "reviewed") {
+        await promoteReviewedToPlanned(
+          run,
+          "repeated blocking-finding fingerprint on an unchanged artifact digest",
+          { [WORKGRAPH_LAST_VERDICT_KEY]: summary },
+        );
+        return undefined;
+      }
+      await escalateRun(
+        run,
+        "judging",
+        "repeated blocking-finding fingerprint on an unchanged artifact digest",
+        { [WORKGRAPH_LAST_VERDICT_KEY]: summary },
+      );
+      return undefined;
+    }
+    if (attempt - 1 >= maxRevisions) {
+      if (effectiveWorkflowClass(issue) === "reviewed") {
+        await promoteReviewedToPlanned(
+          run,
+          `maxRevisions (${maxRevisions}) exhausted`,
+          { [WORKGRAPH_LAST_VERDICT_KEY]: summary },
+        );
+        return undefined;
+      }
+      await escalateRun(
+        run,
+        "judging",
+        `maxRevisions (${maxRevisions}) exhausted`,
+        {
+          [WORKGRAPH_LAST_VERDICT_KEY]: summary,
+          [WORKGRAPH_FAILURE_FINGERPRINT_KEY]: fingerprint,
+        },
+      );
+      return undefined;
+    }
+    try {
+      await transition(run.cwd, run.lease.issueId, "judging", "revising", {
+        fields: {
+          [WORKGRAPH_ATTEMPT_KEY]: String(attempt + 1),
+          [WORKGRAPH_FAILURE_FINGERPRINT_KEY]: fingerprint,
+          [WORKGRAPH_LAST_VERDICT_KEY]: summary,
+        },
+        actor: run.actor.bdActor,
+      });
+    } catch (e) {
+      if (e instanceof LifecycleError) {
+        logSkipOnce(e.message);
+        await abandonJudgedRun(run);
+        return undefined;
+      }
+      throw e;
+    }
+    // POST-COMMIT: the findings-driven judging→revising resolved.
+    emitActivity({
+      kind: "verdict",
+      issueId: run.lease.issueId,
+      phase: "revising",
+      workflowRunId: run.workflowRunId,
+      actor: run.actor.bdActor,
+      summary,
+    });
+    run.phase = "revising";
+    run.attempt = attempt + 1;
+    const revision = await runRevision(run, box, verdict, attempt + 1);
+    if (revision === "aborted" || revision === "parked") return undefined;
+    run.phase = "judging";
+    return revision;
+  }
+
+  /**
    * Request one revision run (role `revision`, priorFindings = the verdict
    * serialized one canonical-JSON finding per entry — the protocol field is
-   * frozen as Array<string>) and await its fenced completion. Returns the
+   * frozen as Array<string>) and await its fenced completion. The verdict is
+   * a reviewer's, or one the core built around a failed check; the criteria
+   * and the `tree-binding` mode come from the run's frozen bar. Returns the
    * completion, `"parked"` (no capable executor / not accepted — the issue
    * stays in `revising` with the lease heartbeating), or `"aborted"`.
    */
@@ -2753,10 +3383,10 @@ export function registerCoordinator(
     box: JudgmentInbox,
     verdict: VerdictT,
     attempt: number,
-    acceptanceCriteria: string | undefined,
-    bindingMode: GateModeT,
   ): Promise<RunCompletedT | "parked" | "aborted"> {
     const config = heldConfig();
+    const acceptanceCriteria = run.bar.criteria;
+    const bindingMode = bindingModeOf(run);
     if (box.closed) return "aborted";
 
     const offers = await discoverExecutors(pi.events, {
@@ -2790,7 +3420,7 @@ export function registerCoordinator(
         id: run.issue.id,
         title: run.issue.title,
         workflowClass: effectiveWorkflowClass(run.issue),
-        riskTier: effectiveRiskTier(run.issue),
+        riskTier: run.bar.riskTier,
         ...(run.issue.description !== undefined
           ? { description: run.issue.description }
           : {}),
@@ -3026,9 +3656,9 @@ export function registerCoordinator(
         id: run.issue.id,
         title: run.issue.title,
         workflowClass: effectiveWorkflowClass(run.issue),
-        riskTier: effectiveRiskTier(run.issue),
+        riskTier: run.bar.riskTier,
         description: run.issue.description,
-        acceptanceCriteria: run.issue.acceptance_criteria,
+        acceptanceCriteria: run.bar.criteria,
       },
       role: "finalizer",
       attempt: run.attempt,
@@ -3179,19 +3809,23 @@ export function registerCoordinator(
    * close is attributed to: the review's, or the implementation's when
    * there was no review.
    *
-   * `proof` carries what the close stamp needs: the `tree-binding` mode
-   * (`off` writes no stamp — nothing was evaluated), the attempt, and
-   * whether a verdict exists. The stamp is written once the issue is in
-   * `verifying` and BEFORE finalization; a tree finalization changes is
-   * recorded afterwards as an amendment and does not block.
+   * `proof` carries what the close stamp needs: the attempt and whether a
+   * verdict exists. The stamp is written once the issue is in `verifying`
+   * and BEFORE finalization, whenever a gate that feeds it (`tree-binding`
+   * or `check`) was evaluated; with both `off` there is nothing to stamp. A
+   * tree finalization changes is recorded afterwards as an amendment, and
+   * checked again: a check that fails there escalates instead of closing.
    */
   async function acceptAndClose(
     run: CoordinatorRun,
     author: RunCompletedT,
     summary: string,
     executionId: string,
-    proof: { bindingMode: GateModeT; attempt: number; reviewed: boolean },
+    proof: { attempt: number; reviewed: boolean },
   ): Promise<void> {
+    const bindingMode = bindingModeOf(run);
+    const stamps =
+      bindingMode !== "off" || run.bar.policy.gates.check !== "off";
     try {
       await transition(run.cwd, run.lease.issueId, "judging", "verifying", {
         fields: { [WORKGRAPH_LAST_VERDICT_KEY]: summary },
@@ -3209,7 +3843,7 @@ export function registerCoordinator(
         actor: run.actor.bdActor,
         summary,
       });
-      if (proof.bindingMode !== "off") {
+      if (stamps) {
         const stamped = await stampAcceptance(
           run,
           proof.attempt,
@@ -3219,8 +3853,14 @@ export function registerCoordinator(
       }
       const finalizes = heldConfig().finalization !== undefined;
       if (!(await finalize(run, author))) return;
-      if (finalizes && proof.bindingMode !== "off") {
-        await amendAfterFinalization(run);
+      if (finalizes && bindingMode !== "off") {
+        const finalized = await amendAfterFinalization(run);
+        if (
+          finalized !== undefined &&
+          !(await recheckFinalized(run, finalized, proof.attempt))
+        ) {
+          return; // escalated from verifying; nothing closes
+        }
       }
       await transition(run.cwd, run.lease.issueId, "verifying", "accepted", {
         actor: run.actor.bdActor,
@@ -3315,17 +3955,30 @@ export function registerCoordinator(
     // The result the `tree-binding` gate was last recorded for: one gate
     // record per result, not one per review round.
     let bindingRecordedFor: string | undefined;
+    // The same for the `check` gate. Cleared after every revision: a
+    // revision that changed nothing leaves the same tree, and it must be
+    // found failing again, not waved through to review.
+    let checkRecordedFor: string | undefined;
+    /** What a gate was recorded for: the bound tree, or why there is none. */
+    const resultKey = (): string =>
+      boundTreeOf(run) ?? `unknown: ${run.bindingReason ?? ""}`;
 
     for (;;) {
       if (box.closed) return; // teardown
       // Throws on an invalid policy: judge() logs the message and the run
-      // stays parked in judging under its lease. Work is never judged on a
-      // policy that did not validate.
+      // stays parked in judging under its lease. Work is never judged while
+      // the configuration does not validate, even though every decision
+      // below reads the FROZEN bar and not this config.
       const config = currentConfig();
       const issue = await show(run.cwd, run.lease.issueId);
-      const policy = resolvePolicy(riskTierOf(issue), config.policy);
+      // The bar: frozen at claim. The live issue and config are read above
+      // for what is not part of it (the attempt, the failure fingerprint,
+      // the workflow class, timers), and to record that the bar moved.
+      await noteBarDrift(run, issue, config);
+      const policy = run.bar.policy;
       const mode = policy.gates.review;
       const bindingMode = policy.gates["tree-binding"];
+      const checkMode = policy.gates.check;
       const attempt = attemptOf(issue) ?? 1;
 
       // ---- the tree-binding gate. Decided here, under the validated
@@ -3344,7 +3997,7 @@ export function registerCoordinator(
             run.actor.bdActor,
           );
         }
-        const key = boundTreeOf(run) ?? `unknown: ${run.bindingReason ?? ""}`;
+        const key = resultKey();
         if (bindingRecordedFor !== key) {
           bindingRecordedFor = key;
           const blocked = await evaluateBinding(run, bindingMode, attempt);
@@ -3352,6 +4005,43 @@ export function registerCoordinator(
             await escalateRun(run, "judging", blocked);
             return;
           }
+        }
+      }
+
+      // ---- the check gate. Before the review-off branch, so work with no
+      // review is still checked, and before reviewer selection, so a tree
+      // whose check failed costs no review. Once per result tree. ----
+      if (checkMode !== "off" && checkRecordedFor !== resultKey()) {
+        const before = boundTreeOf(run);
+        const checked = await evaluateCheck(run, checkMode, attempt, "judging");
+        if (checked.kind === "stop") return; // escalated, or no longer held
+        if (box.closed) return;
+        checkRecordedFor = resultKey();
+        if (checked.kind === "violation") {
+          // The check failed and the gate enforces: the finding the core
+          // wrote takes the path a reviewer's blocking finding takes. No
+          // verdict record exists for this round, and none is requested.
+          const failed: VerdictT = { findings: [checked.finding] };
+          const revision = await reviseAfterBlock(
+            run,
+            box,
+            issue,
+            attempt,
+            failed,
+            verdictSummary(failed),
+            // A failed check always has the tree its receipt names.
+            boundTreeOf(run) ?? artifactDigest(author.artifacts),
+          );
+          if (revision === undefined) return;
+          author = revision;
+          checkRecordedFor = undefined;
+          continue; // check the revised tree
+        }
+        if (boundTreeOf(run) !== before) {
+          // The workspace moved while the check ran and the run is bound to
+          // the new tree: go round, so the tree-binding gate is recorded
+          // for it too. The check gate is already recorded for it.
+          continue;
         }
       }
       // The tree every record of this round names; undefined = unbound.
@@ -3405,7 +4095,6 @@ export function registerCoordinator(
         if (next === "stop") return;
         if (next === "again") continue;
         await acceptAndClose(run, author, "review off", author.executionId, {
-          bindingMode,
           attempt,
           reviewed: false,
         });
@@ -3459,12 +4148,12 @@ export function registerCoordinator(
           id: run.issue.id,
           title: run.issue.title,
           workflowClass: effectiveWorkflowClass(run.issue),
-          riskTier: effectiveRiskTier(issue),
+          riskTier: run.bar.riskTier,
           ...(run.issue.description !== undefined
             ? { description: run.issue.description }
             : {}),
-          ...(issue.acceptance_criteria !== undefined
-            ? { acceptanceCriteria: issue.acceptance_criteria }
+          ...(run.bar.criteria !== undefined
+            ? { acceptanceCriteria: run.bar.criteria }
             : {}),
         },
         workflowRunId: run.workflowRunId,
@@ -3707,85 +4396,19 @@ export function registerCoordinator(
       if (decision.blocked) {
         // The tree when there is one: the fingerprint then follows file
         // content. The artifact list is the fallback when nothing is bound.
-        const digest = tree ?? artifactDigest(author.artifacts);
-        const fingerprint = failureFingerprint(blocking, digest);
-        if (failureFingerprintOf(issue) === fingerprint) {
-          if (effectiveWorkflowClass(issue) === "reviewed") {
-            await promoteReviewedToPlanned(
-              run,
-              "repeated blocking-finding fingerprint on an unchanged artifact digest",
-              { [WORKGRAPH_LAST_VERDICT_KEY]: summary },
-            );
-            return;
-          }
-          await escalateRun(
-            run,
-            "judging",
-            "repeated blocking-finding fingerprint on an unchanged artifact digest",
-            { [WORKGRAPH_LAST_VERDICT_KEY]: summary },
-          );
-          return;
-        }
-        if (attempt - 1 >= policy.maxRevisions) {
-          if (effectiveWorkflowClass(issue) === "reviewed") {
-            await promoteReviewedToPlanned(
-              run,
-              `maxRevisions (${policy.maxRevisions}) exhausted`,
-              { [WORKGRAPH_LAST_VERDICT_KEY]: summary },
-            );
-            return;
-          }
-          await escalateRun(
-            run,
-            "judging",
-            `maxRevisions (${policy.maxRevisions}) exhausted`,
-            {
-              [WORKGRAPH_LAST_VERDICT_KEY]: summary,
-              [WORKGRAPH_FAILURE_FINGERPRINT_KEY]: fingerprint,
-            },
-          );
-          return;
-        }
-        try {
-          await transition(run.cwd, run.lease.issueId, "judging", "revising", {
-            fields: {
-              [WORKGRAPH_ATTEMPT_KEY]: String(attempt + 1),
-              [WORKGRAPH_FAILURE_FINGERPRINT_KEY]: fingerprint,
-              [WORKGRAPH_LAST_VERDICT_KEY]: summary,
-            },
-            actor: run.actor.bdActor,
-          });
-        } catch (e) {
-          if (e instanceof LifecycleError) {
-            logSkipOnce(e.message);
-            await abandonJudgedRun(run);
-            return;
-          }
-          throw e;
-        }
-        // POST-COMMIT: the verdict-driven judging→revising resolved.
-        emitActivity({
-          kind: "verdict",
-          issueId: run.lease.issueId,
-          phase: "revising",
-          workflowRunId: run.workflowRunId,
-          actor: run.actor.bdActor,
-          summary,
-        });
-        run.phase = "revising";
-        run.attempt = attempt + 1;
-        const revision = await runRevision(
+        const revision = await reviseAfterBlock(
           run,
           box,
+          issue,
+          attempt,
           verdict,
-          attempt + 1,
-          issue.acceptance_criteria,
-          bindingMode,
+          summary,
+          tree ?? artifactDigest(author.artifacts),
         );
-        if (revision === "aborted" || revision === "parked") return;
+        if (revision === undefined) return;
         author = revision;
-        run.phase = "judging";
-        continue; // re-review the revised implementation
+        checkRecordedFor = undefined;
+        continue; // check and re-review the revised implementation
       }
 
       // ---- gate passed (clean, advisory findings, or observe mode) ----
@@ -3793,7 +4416,6 @@ export function registerCoordinator(
       if (next === "stop") return;
       if (next === "again") continue; // the new tree goes back through review
       await acceptAndClose(run, author, summary, completion.executionId, {
-        bindingMode,
         attempt,
         reviewed: true,
       });
@@ -4066,6 +4688,12 @@ export function registerCoordinator(
       return;
     }
 
+    // FREEZE THE BAR: what this claim is judged against, from the issue as
+    // claimed and the config this tick validated. Nothing the implementer
+    // does to the issue or to a settings file after this point changes it.
+    const bar = buildBar(outcome.issue, config);
+    const frozenDigest = barDigest(bar);
+
     const run: CoordinatorRun = {
       cwd: ctx.cwd,
       issue: outcome.issue,
@@ -4079,6 +4707,8 @@ export function registerCoordinator(
       attempt: 1,
       isolation: selected.isolation,
       supportsCancellation: selected.supportsCancellation,
+      bar,
+      barDigest: frozenDigest,
     };
     state.active = run;
     startHeartbeat(ctx, config.heartbeatMs);
@@ -4102,6 +4732,7 @@ export function registerCoordinator(
             [WORKGRAPH_WORKFLOW_RUN_ID_KEY]: workflowRunId,
             [WORKGRAPH_EXECUTOR_ID_KEY]: selected.executorId,
             [WORKGRAPH_ATTEMPT_KEY]: "1",
+            [WORKGRAPH_BAR_DIGEST_KEY]: frozenDigest,
           },
           actor: actor.bdActor,
         },
@@ -4132,12 +4763,22 @@ export function registerCoordinator(
       actor: actor.bdActor,
       summary: `claimed for ${selected.executorId} (${role})`,
     });
+    // The bar itself is an object, so it lives on the trail; a restart
+    // rebuilds the run's bar from this event.
+    await recordLeaseEvent(
+      ctx.cwd,
+      "bar-frozen",
+      run.issue.id,
+      { workflowRunId, digest: frozenDigest, bar },
+      actor.bdActor,
+    );
+    if (state.active !== run) return; // halted while the bar was recorded
 
     // The shared-checkout base, taken just before the implementer request.
     // (A planner run takes it later, in dispatchImplementation.) A failed
     // snapshot never aborts the claim: the gate reports it at judgment.
     if (role === "implementer") {
-      await recordSharedBase(run, selected.isolation, config);
+      await recordSharedBase(run, selected.isolation);
       if (state.active !== run) return; // halted while the base was recorded
     }
 
@@ -4148,12 +4789,12 @@ export function registerCoordinator(
         id: run.issue.id,
         title: run.issue.title,
         workflowClass: effectiveWorkflowClass(run.issue),
-        riskTier: effectiveRiskTier(outcome.issue),
+        riskTier: run.bar.riskTier,
         ...(run.issue.description !== undefined
           ? { description: run.issue.description }
           : {}),
-        ...(outcome.issue.acceptance_criteria !== undefined
-          ? { acceptanceCriteria: outcome.issue.acceptance_criteria }
+        ...(run.bar.criteria !== undefined
+          ? { acceptanceCriteria: run.bar.criteria }
           : {}),
       },
       workflowRunId,
@@ -4261,6 +4902,7 @@ export function registerCoordinator(
           // untracked): drop it, cancel the now-stale execution (phase 4 —
           // the executor may still be running under the lost lease), audit.
           publishCancel(run, "lease lost (fencing)");
+          abortCheck(run); // its result would be discarded anyway
           if (state.active === run) {
             state.active = null;
             clearLeaseStatus(ctx);
@@ -4328,6 +4970,9 @@ export function registerCoordinator(
     const runs = heldRuns();
     state.active = null;
     state.judged = [];
+    // A check is a detached process group: nothing but this stops it once
+    // the session is gone. Its result is discarded (the run is not held).
+    for (const run of runs) abortCheck(run);
     if (ctx) clearLeaseStatus(ctx);
     for (const run of runs) {
       const held = getHeldLease(run.cwd, run.lease.issueId);
@@ -4597,7 +5242,56 @@ export function registerCoordinator(
         const executionId = activeExecutionIdOf(cur);
         const offer =
           executorId !== undefined ? offersById.get(executorId) : undefined;
+        /**
+         * The bar the adopted run is judged against: the one frozen at its
+         * claim, read back from the `bar-frozen` event. A run with none
+         * (claimed before the bar existed, or whose event write was lost)
+         * freezes one now, from the issue and config as they are, and the
+         * trail says so. If the claim did record a digest and the new bar
+         * does not match it, something moved while nobody was watching:
+         * that is a `bar-changed`.
+         */
+        const adoptBar = async (): Promise<{ bar: Bar; digest: string }> => {
+          const frozen = await reconstructBar(ctx.cwd, cur);
+          if (frozen !== undefined) {
+            return { bar: frozen, digest: barDigest(frozen) };
+          }
+          const bar = buildBar(cur, config);
+          const digest = barDigest(bar);
+          const claimed = barDigestOf(cur);
+          await recordLeaseEvent(
+            ctx.cwd,
+            "bar-frozen",
+            issue.id,
+            { workflowRunId, digest, bar, via: "recovery" },
+            actor.bdActor,
+          );
+          await setMetadata(
+            ctx.cwd,
+            issue.id,
+            { [WORKGRAPH_BAR_DIGEST_KEY]: digest },
+            actor.bdActor,
+          );
+          if (claimed !== undefined && claimed !== digest) {
+            await recordLeaseEvent(
+              ctx.cwd,
+              "bar-changed",
+              issue.id,
+              {
+                workflowRunId,
+                frozenDigest: claimed,
+                currentDigest: digest,
+                fields: [],
+                reason:
+                  "the bar frozen at claim could not be read back; the run continues on a bar frozen at re-adoption",
+              },
+              actor.bdActor,
+            );
+          }
+          return { bar, digest };
+        };
         const makeRun = (
+          frozen: { bar: Bar; digest: string },
           runPhase: CoordinatorRun["phase"],
           runRole: CoordinatorRun["role"] = "implementer",
         ): CoordinatorRun => ({
@@ -4613,6 +5307,8 @@ export function registerCoordinator(
           attempt: attemptOf(cur) ?? 1,
           isolation: offer?.isolation ?? "worktree",
           supportsCancellation: offer?.supportsCancellation ?? false,
+          bar: frozen.bar,
+          barDigest: frozen.digest,
         });
 
         if (phase === "planning") {
@@ -4667,7 +5363,7 @@ export function registerCoordinator(
           if (status?.status === "active" && state.active === null) {
             // Re-adopt: heartbeat resumes ONLY on a positive `active` —
             // a timeout is not evidence of life.
-            const run = makeRun("accepted");
+            const run = makeRun(await adoptBar(), "accepted");
             trackLease(ctx.cwd, lease, actor);
             state.active = run;
             startHeartbeat(ctx, config.heartbeatMs);
@@ -4684,7 +5380,7 @@ export function registerCoordinator(
             // completion through the NORMAL fenced handler — one code
             // path, no recovery special-casing. The handler owns all
             // further state (judging transition, judgment gate, drops).
-            const run = makeRun("accepted");
+            const run = makeRun(await adoptBar(), "accepted");
             trackLease(ctx.cwd, lease, actor);
             state.active = run;
             startHeartbeat(ctx, config.heartbeatMs);
@@ -4725,7 +5421,7 @@ export function registerCoordinator(
             lease,
             nowFn,
           );
-          const run = makeRun("judging");
+          const run = makeRun(await adoptBar(), "judging");
           // Workspace path, base and result tree, rebuilt from the trail:
           // the claim-wait rule needs the path, the gate needs the trees.
           applyBinding(run, await reconstructBinding(ctx.cwd, cur));
@@ -4755,7 +5451,7 @@ export function registerCoordinator(
             // If it no longer matches the recorded result tree, bind the run
             // to what is there now; the resumed loop then reviews THAT. (A
             // run with no recorded tree is snapshotted by the loop itself.)
-            if (bindingModeOf(cur, config) !== "off") {
+            if (bindingModeOf(run) !== "off") {
               await recheckWorkspace(
                 run,
                 run.attempt,
@@ -4769,7 +5465,7 @@ export function registerCoordinator(
           // a verification pass) cannot be rebuilt from memory: park with
           // the heartbeat so the lease survives; the gate resolves via
           // human override / re-approve or a later phase's reconnection.
-          const run = makeRun(phase);
+          const run = makeRun(await adoptBar(), phase);
           // Parked, but still occupying its workspace: the claim-wait rule
           // reads the path from here.
           applyBinding(run, await reconstructBinding(ctx.cwd, cur));

@@ -76,12 +76,42 @@ export class VerdictWriteError extends Error {
  * judgment gate never infers a verdict from silence.
  */
 export function parseVerdict(raw: unknown): VerdictT {
-  if (Value.Check(Verdict, raw)) return raw;
-  const detail = [...Value.Errors(Verdict, raw)]
+  const reported = withoutAuthors(raw);
+  if (Value.Check(Verdict, reported)) return reported;
+  const detail = [...Value.Errors(Verdict, reported)]
     .slice(0, 3)
     .map((e) => `${e.instancePath || "/"} ${e.message}`)
     .join("; ");
   throw new VerdictError(detail || "schema mismatch");
+}
+
+/**
+ * A reported verdict with `author` removed from every finding. `author:
+ * "code"` marks a finding the core wrote itself, and later gates trust such
+ * a finding more than a reviewer's; a reviewer must not be able to claim
+ * it, so the field never survives a reported verdict, whatever it held.
+ * Anything that is not verdict-shaped is returned as it came, for the
+ * schema check to reject.
+ */
+function withoutAuthors(raw: unknown): unknown {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const findings = (raw as { findings?: unknown }).findings;
+  if (!Array.isArray(findings)) return raw;
+  return {
+    ...(raw as Record<string, unknown>),
+    findings: findings.map((finding: unknown) => {
+      if (
+        finding === null ||
+        typeof finding !== "object" ||
+        Array.isArray(finding) ||
+        !("author" in finding)
+      ) {
+        return finding;
+      }
+      const { author: _author, ...rest } = finding as Record<string, unknown>;
+      return rest;
+    }),
+  };
 }
 
 /** The blocking findings of a verdict. */
@@ -104,6 +134,7 @@ function capFinding(finding: FindingT): FindingT {
     ...(finding.evidence !== undefined
       ? { evidence: truncate(finding.evidence, MAX_EVIDENCE_CHARS) }
       : {}),
+    ...(finding.author !== undefined ? { author: finding.author } : {}),
   };
 }
 
@@ -157,6 +188,8 @@ export function failureFingerprint(
     severity: f.severity,
     ...(f.note !== undefined ? { note: f.note } : {}),
     ...(f.evidence !== undefined ? { evidence: f.evidence } : {}),
+    // Only when set, so a reviewer finding hashes as it always did.
+    ...(f.author !== undefined ? { author: f.author } : {}),
   }));
   return createHash("sha256")
     .update(JSON.stringify(canonical))

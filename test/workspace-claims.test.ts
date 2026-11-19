@@ -112,6 +112,10 @@ function approve(
     "workgraph_lifecycle_version=1",
     "--set-metadata",
     "workgraph_phase=ready",
+    // The check the core runs before any review: the shell builtin, which
+    // passes. Medium- and high-risk work with none does not reach review.
+    "--set-metadata",
+    "workgraph_check=true",
     "--set-metadata",
     `workgraph_risk_tier=${opts.riskTier ?? "medium"}`,
     "--set-metadata",

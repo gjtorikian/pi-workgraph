@@ -160,7 +160,7 @@ describe("legacy visibility and compat dispatch", () => {
     try {
       const legacyId = graph.createIssue("legacy artifact");
       const approvedId = graph.createIssue("approved work");
-      await runTool(mock, "workgraph_approve", { id: approvedId }, graph.dir);
+      await runTool(mock, "workgraph_approve", { id: approvedId, check: "npm test" }, graph.dir);
 
       const byDefault = await runTool(mock, "workgraph_ready", {}, graph.dir);
       const defaultText = JSON.stringify(byDefault.content);
@@ -296,7 +296,7 @@ describe("legacy initialization via workgraph_approve", () => {
       await runTool(
         mock,
         "workgraph_approve",
-        { id, acceptanceCriteria: "all tests green" },
+        { id, acceptanceCriteria: "all tests green", check: "npm test" },
         graph.dir,
       );
 
@@ -321,7 +321,7 @@ describe("legacy initialization via workgraph_approve", () => {
     const mock = makeToolsMock();
     try {
       const id = graph.createIssue("stamp me once");
-      await runTool(mock, "workgraph_approve", { id }, graph.dir);
+      await runTool(mock, "workgraph_approve", { id, check: "npm test" }, graph.dir);
       expect(phaseOf(graph.showIssue(id))).toBe("ready");
 
       // Direct re-entry from <legacy>: the phase changed underneath

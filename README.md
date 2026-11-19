@@ -69,6 +69,10 @@ sessions, harnesses, and machines. Everything else is delegated:
   default policy; set `gates.tree-binding` to `"observe"` to close without
   a tree. The [pi-subagents bridge](#6-optional-executor-the-pi-subagents-bridge)
   needs more: a repository with at least one commit, whatever the policy.
+- A check command for medium- and high-risk work: a shell command that
+  exits 0 when the work is good, such as your test command. The coordinator
+  runs it itself before any review (see [The check](#the-check)). Set it
+  once per repository (below) or per issue.
 
 ## Install
 
@@ -77,6 +81,15 @@ pi install npm:pi-workgraph
 ```
 
 ## Quickstart
+
+Tell workgraph how to check work in this repository, once, in
+`.pi/settings.json`:
+
+```json
+{ "workgraph": { "check": { "command": "npm test" } } }
+```
+
+Then:
 
 ```bash
 pi
@@ -92,7 +105,9 @@ settings (see [Model tiers](#model-tiers)). The agent calls `workgraph_init`
 (creates `.workgraph/workgraph.db` with its own `.gitignore`) and `workgraph_create`
 with `approve: true` and `workflowClass: "planned"`, which stamps lifecycle
 metadata, a risk tier, and the workflow class, and puts the issue in phase
-`ready`. On the next
+`ready`. The issue is checked with the repository's command; without one
+in settings, the agent passes `check` on the call, and without either the
+call is refused (see [The check](#the-check)). On the next
 idle tick the coordinator discovers an executor that offers the planner
 role, claims the issue under a workflow-run lease, and asks for a plan.
 
@@ -401,20 +416,20 @@ assignee writes are how leases get corrupted.
 | Tool                        | What it does                                                                                                  |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------- |
 | `workgraph_init`            | Create the workspace (`.workgraph/workgraph.db`, gitignored); idempotent                                      |
-| `workgraph_create`          | Create an issue — optionally approved, with acceptance criteria, risk tier, workflow class, and dependencies  |
+| `workgraph_create`          | Create an issue — optionally approved, with acceptance criteria, a check command, risk tier, workflow class, and dependencies |
 | `workgraph_ready`           | List approved claimable issues (dependency-unblocked, unassigned); `legacy: true` lists unapproved            |
 | `workgraph_claim`           | Atomically claim an issue by id, or the next ready one; stamps a lease                                        |
 | `workgraph_release`         | Voluntarily hand a claimed issue back to the pool (fenced; clears assignee, reopens)                          |
 | `workgraph_close`           | Close an issue (fenced; lifecycle-v1 work must be phase `accepted` — the judgment gate's output)              |
-| `workgraph_split`           | Split an issue into child issues; the parent is blocked until every child closes                              |
+| `workgraph_split`           | Split an issue into child issues, each with its own check; the parent is blocked until every child closes     |
 | `workgraph_heartbeat`       | Renew the leases this worker holds (verifies the fencing epoch, pushes `lease_expires_at` forward)            |
-| `workgraph_approve`         | Approve a draft/legacy/escalated issue: acceptance criteria, workflow class, risk tier, phase `ready`         |
+| `workgraph_approve`         | Approve a draft/legacy/escalated issue: acceptance criteria, check command or waiver, workflow class, risk tier, phase `ready` |
 | `workgraph_approve_plan`    | Approve a recorded plan (implement it next) or reject it with feedback (plan again)                           |
 | `workgraph_answer_decision` | Answer the question a run parked for a human; re-approve, and every later run of the issue carries the answer |
 | `workgraph_tiers`           | Set or show per-role model tiers for this repository (a role → model table, or clear)                         |
 | `workgraph_override`        | Explicit human override: force-close or force-release, bypassing guards — always audited                      |
-| `workgraph_status`          | One issue's full control-plane state: phase, plan, lease, attempt, verdict, gate modes and results, criteria  |
-| `workgraph_gates`           | Per gate, the issues it blocked and the issues it would have blocked; `id` narrows the report to one issue    |
+| `workgraph_status`          | One issue's full control-plane state: phase, plan, lease, attempt, verdict, gate modes and results, criteria, check |
+| `workgraph_gates`           | Per gate, the issues it blocked, would have blocked, and was waived for; `id` narrows the report to one issue |
 
 The in-session executor adds `workgraph_submit_plan`, valid only during a
 planning turn. `/workgraph init [prefix]` and `/workgraph tiers` are the
@@ -457,16 +472,16 @@ of seven gates a mode, per risk tier.
 | ------------------- | ------------------------------------------------------------------------------------- |
 | `review`            | The reviewer's verdict has no blocking findings                                       |
 | `tree-binding`      | The work has a base tree and a result tree, and the verdict and the close name the result |
-| `check`             | The issue's check command passed on the accepted tree                                 |
+| `check`             | The check command, run by the coordinator itself, exited 0 on the result tree         |
 | `criteria-evidence` | The verdict answers every acceptance criterion, with evidence for each one marked met |
 | `weakened-tests`    | The change deletes no tests and skips none                                            |
 | `unproven-tests`    | Every new test fails without the change                                               |
 | `scope`             | The change stays inside the approved plan's path targets                              |
 
-`review` and `tree-binding` are evaluated in this release. The other five
-are already part of the policy, so a policy written today keeps working as
-each gate gains its check. Until then they record nothing, whatever their
-mode.
+`review`, `tree-binding` and `check` are evaluated in this release. The
+other four are already part of the policy, so a policy written today keeps
+working as each gate gains its evaluation. Until then they record nothing,
+whatever their mode.
 
 Each gate has one of three modes:
 
@@ -509,7 +524,9 @@ policy is fixed the coordinator claims nothing and judges nothing, logs
 the message once, and the [tools](#tools) fail with the same message
 (all fifteen except `workgraph_init`). Leases the coordinator already
 holds keep renewing, and a run already in flight proceeds as far as
-judgment and waits there.
+judgment and waits there. An invalid `check` settings block
+([The check](#the-check)) does the same, for the same reason: dropping it
+would leave work unchecked without a word.
 
 **`gateMode` was removed.** It is now the `review` gate's mode:
 `"advisory"` is `"observe"` and `"blocking"` is `"enforce"`. A policy that
@@ -523,12 +540,15 @@ graph, one line per gate:
 
 ```text
 review: 1 blocked (bdx-003), 2 would block (bdx-001, bdx-004)
-check: no records
+check: 1 blocked (bdx-005), 0 would block, 1 not applicable, waived (bdx-007: docs only, nothing to run)
+scope: no records
 ```
 
 An issue counts as blocked if the gate ever blocked it, even when a later
-revision passed. `workgraph_status` prints the modes that apply to one
-issue and each gate's latest result on it.
+revision passed. Work whose check was waived is listed under `check` with
+the waiver's reason; a gate nobody waived shows only the first two
+columns. `workgraph_status` prints the modes that apply to one issue and
+each gate's latest result on it.
 
 **The verdict record has no mode.** If a reviewer's verdict cannot be
 written to the issue, the run escalates with the write failure as the
@@ -591,7 +611,7 @@ With trees in hand:
    (`review-rejected`, reason `workspace changed during review`) and the
    tree that is there now is reviewed instead.
 3. Before the close, the workspace is compared once more. A change sends
-   the new tree back through review.
+   the new tree back through the check and the review.
 4. Steps 2 and 3 share one bound with unparseable verdicts: after two
    retries the issue escalates.
 5. The failure fingerprint uses the result tree, so identical findings on
@@ -600,13 +620,25 @@ With trees in hand:
 **The close stamp.** Once the gates have passed and the issue is in
 `verifying`, the coordinator writes one `workgraph-proof stamp {json}`
 comment: the accepted tree, its base tree, the snapshot commit, the
-workflow run, the attempt, the verdict it rests on, and the latest result
-of each evaluated gate. The stamp is written **before** finalization. If
-it cannot be written the issue escalates and does not close. If
-finalization then changes the tree, the new tree is recorded as a
-`workgraph-proof stamp-amended {json}` comment and in
-`workgraph_finalized_tree`; this does not block the close, because
-finalization's external effects have already happened.
+workflow run, the attempt, the verdict it rests on, the latest result of
+each evaluated gate, and `check`, which says what the close rests on from
+the check gate:
+
+| `check`  | Meaning                                                                             |
+| -------- | ----------------------------------------------------------------------------------- |
+| `passed` | A receipt for the stamped tree; `checkLogSha256` is the hash of the check's log      |
+| `waived` | A human recorded that no check applies                                               |
+| `none`   | No check ran: none was set, or none could be bound to a tree                         |
+| `failed` | The check failed and the gate only observes                                          |
+
+The stamp is written **before** finalization, whenever `tree-binding` or
+`check` was evaluated; with both `off` there is no stamp. A stamp with no
+tree (tree binding `off`, or `observe` with no repository) leaves the tree
+fields out. If the stamp cannot be written the issue escalates and does
+not close. If finalization then changes the tree, the new tree is recorded
+as a `workgraph-proof stamp-amended {json}` comment and in
+`workgraph_finalized_tree`. Recording it never blocks. The check is then
+run again on that tree, and that can: see [The check](#the-check).
 
 **One issue under review per shared checkout.** While an issue whose work
 sits in a non-isolated checkout is in `judging` or `verifying`, the
@@ -631,6 +663,165 @@ automatically. To delete them all:
 ```bash
 git for-each-ref refs/workgraph --format='%(refname)' | xargs -n1 git update-ref -d
 ```
+
+### The check
+
+A reviewer is a model, and so is the implementer it reviews. The check is
+the one proof that does not rest on a model's word: a shell command the
+coordinator runs **itself**, whose exit code decides. The core still never
+executes model work; a shell command with an exit code is not model work.
+
+**Setting it.** A human sets the check, in one of two places:
+
+- Per issue: `check` on `workgraph_create`, `workgraph_approve`, or a child
+  of `workgraph_split`. Stored on the issue as `workgraph_check`.
+- Per repository: `"workgraph": { "check": { "command": "npm test" } }` in
+  `.pi/settings.json` (or `~/.pi/agent/settings.json`). It applies to every
+  issue with no check of its own. `timeoutMs` in the same block bounds any
+  check (default 600000, ten minutes). There is no flag for it. `setup` is
+  accepted and reserved for a later release. An unknown key or a bad value
+  in the block is an error that stops dispatch, as an invalid policy does.
+
+An issue's own check wins over the repository's. `workgraph_status` prints
+`Check: <command>`, with `(repository default)` when that is where it
+comes from.
+
+**Approval needs a check or a waiver.** Medium- and high-risk work cannot
+be approved, created approved, or split into approved children without a
+check on the issue or a repository default. The call is refused:
+
+```text
+medium-risk work needs a check command (check: "npm test") or an explicit waiver (checkWaiver: "<why no check applies>").
+```
+
+The way out for work that has nothing to run is `checkWaiver`, with the
+reason. It is for a human to give: the tools tell the agent to pass it
+only on explicit instruction, as they do for `workgraph_override`. Waived
+work is recorded as waived at every step: `workgraph_status` prints `Check
+waived: <reason>`, the gate record says `not-applicable`, `waived:
+<reason>`, the close stamp says `check: "waived"`, and `workgraph_gates`
+lists the issue. A waiver on an issue wins over the repository default,
+and `check` and `checkWaiver` in one call is an error. A split child takes
+neither from its parent. Low-risk work may have no check. With the `check`
+gate at `observe` or `off` for a tier, approval at that tier is never
+refused.
+
+**What runs, and when.** After the implementer hands work back, the
+coordinator snapshots the result tree and runs the command in the
+workspace the work is in, through the shell, before any reviewer is
+selected. So a failing check costs no review. The run **passes** only when
+the command exits 0 by itself. Each of these is a failure with a reason:
+
+| What happened                          | Reason                        |
+| -------------------------------------- | ----------------------------- |
+| Non-zero exit                          | `exited 1`                    |
+| Ran past the timeout                   | `timed out after 600s`        |
+| Killed by a signal                     | `killed by SIGKILL`           |
+| The process could not start            | `could not start: ...`        |
+| Its log could not be written           | `could not write log: ...`    |
+
+On a timeout the command's whole process group is killed. A command that
+exits 0 and leaves a background process behind has passed, and that
+process is left alone. Output goes to
+`<store directory>/proof/<issue>/<n>.log`, hashed as it is written. The
+log keeps the first 10 MB and says where it cut; `proof/` ignores itself,
+so a log never becomes part of the tree it describes. The command needs a
+POSIX shell.
+
+A fresh worktree may lack what the command needs (installed dependencies,
+for one). The implementer works in that worktree and is expected to leave
+it able to pass; the failure reason and the end of the log go back to it.
+
+**The receipt.** Each run the coordinator keeps is one `workgraph-proof
+receipt {json}` comment: the tree, the command's sha256, the exit code or
+signal, whether it timed out, the reason, start and end times, and the
+log's path, size, sha256 and last 400 characters. A workflow run checks a
+tree once: a second look at the same tree, after a restart included,
+reads the receipt. A new claim checks for itself, so releasing and
+re-approving an issue is how to retry a check that failed for a reason
+outside the tree. If the workspace changes while the command runs, the
+result describes a tree that is gone: it is discarded and the check runs
+again on the new tree, at most twice more. A check that writes files git
+does not ignore therefore settles when its output is stable, and that
+output is then part of the tree the reviewer sees. A receipt that cannot
+be written escalates the issue, like a verdict that cannot.
+
+**What the gate does with it:**
+
+| Situation                                                   | `check` result                                   |
+| ----------------------------------------------------------- | ------------------------------------------------ |
+| The receipt passed                                          | `pass`                                           |
+| The receipt failed                                          | `violation`                                      |
+| Waived                                                      | `not-applicable`, `waived: <reason>`             |
+| No check, low risk                                          | `not-applicable`, `no check`                     |
+| No check and no waiver at medium or high risk               | `unknown`, `no check command; approve with a check or a checkWaiver` |
+| A check, but no result tree to bind the receipt to          | `unknown`                                        |
+
+The fifth row is work that reached the pool around the approval rule: a
+legacy issue dispatched with `compatLegacyIssues`, or hand-written
+metadata. The sixth is why a check needs `tree-binding` at `observe` or
+`enforce` in a git repository: a receipt names a tree. Outside git, or
+with tree binding `off`, waive the check or the issue escalates.
+
+Under `enforce`, which is the default at every tier including low:
+
+- A `violation` becomes a blocking finding the core wrote itself
+  (`criterion: "check"`, `author: "code"`, the reason, the end of the log)
+  and takes the path a reviewer's blocking finding takes: a revision, then
+  a new tree, a new check, and only then a review. `workgraph_last_verdict`
+  reads `reject blocking=1 advisory=0: check`. The same bounds apply:
+  the same failure on an unchanged tree, or `maxRevisions` exhausted,
+  promotes reviewed work to planned and escalates planned work. A
+  reviewer cannot mark its own finding `author: "code"`; the field is
+  removed from every reported verdict.
+- An `unknown` escalates the issue with the reason.
+- A one-shot issue (always low risk) whose check fails is not closed: it
+  is promoted to the reviewed workflow and returned to the pool, with the
+  reason on the `workflow-promoted` event.
+
+Under `observe` the result is recorded with its would-block and the run
+goes on; a close on a failed check is stamped `check: "failed"`. Under
+`off` nothing runs. A running check is stopped when the session shuts
+down or the issue's lease is lost, and its result is discarded.
+
+**After finalization.** A [finalization](#caller-defined-finalization) step that changes
+the tree leaves the workspace on content no check has seen. The check runs
+again on that tree. If it fails under `enforce`, the issue escalates from
+`verifying` with `check failed on the tree finalization produced` instead
+of closing. Finalization has already run by then, and its recorded status
+is left as it is: whatever it published is yours to follow up.
+
+### The frozen bar
+
+Pi settings are read from a file inside the checkout on every lookup, and
+the issue's metadata sits in a database an agent with a shell can reach.
+So that an implementer cannot edit what it is judged against, the
+coordinator captures **the bar** when it claims an issue and uses only
+that copy until the claim ends:
+
+- the risk tier,
+- the gate modes, `maxRevisions` and `requireAuthorIndependence` for it,
+- the acceptance criteria,
+- the check command and its timeout, or the waiver.
+
+The bar is recorded as a `bar-frozen` audit event, with its sha256 in
+`workgraph_bar_digest`. A restarted coordinator rebuilds the bar from that
+event. On every round of judgment the coordinator compares the frozen bar
+with what the issue and the settings say now. A difference is recorded
+once as a `bar-changed` event naming the fields (`check`, `criteria`,
+`gates.check`, ...), and changes nothing for the run in progress.
+
+A change takes effect at the next claim. To apply a corrected check to
+work in flight, release the issue with `workgraph_override` and approve it
+again. A planned issue that waits for plan approval is released while it
+waits, so the claim that implements the approved plan freezes a new bar.
+
+This narrows the window; it does not move the bar out of reach. In the
+default store layout the event and the digest live in the same database
+as the issue, inside the checkout, where an agent with a shell can edit
+them too. Keeping the database out of the checkout
+([Where the store lives](#where-the-store-lives)) puts it one step
+further away.
 
 ## How it works
 
@@ -856,8 +1047,10 @@ against a plan), `plan-critique-unavailable` (a critique was attempted and
 the plan parked without one, with the reason), `plan-review` (a plan was
 parked for a human), `plan-approved`, `plan-rejected`,
 `revision-requested`, `workspace-changed` (the workspace no longer matched
-the recorded result tree and was snapshotted again), `escalated`, and
-`judgment-closed`. A `run-completed` event for an implementation or a
+the recorded result tree and was snapshotted again), `bar-frozen` (the bar
+a run is judged against, captured at claim), `bar-changed` (the issue or
+the settings no longer match it; the run keeps the frozen bar),
+`escalated`, and `judgment-closed`. A `run-completed` event for an implementation or a
 revision carries `workspacePath` and, when a snapshot was taken, its
 `tree`; a restarted coordinator rebuilds the run from it.
 Audit writes never block lease operations: the protocol stays correct
@@ -868,8 +1061,9 @@ Two more trails ride the same comments under their own prefixes.
 `workgraph-verdict` holds each reviewer verdict, and is the one write
 judgment waits on: a verdict that cannot be recorded escalates the run.
 `workgraph-proof` holds each gate result (see [Gates](#gates)), which like
-the audit trail never blocks, and the close stamp (see
-[Tree binding](#tree-binding)), which does: a stamp that cannot be
+the audit trail never blocks, and two records that do: the check receipt
+(see [The check](#the-check)) and the close stamp (see
+[Tree binding](#tree-binding)). A receipt or a stamp that cannot be
 recorded escalates the run.
 
 ## Experimental: Control-Plane Protocol v1
@@ -921,9 +1115,12 @@ issue metadata:
 | `workgraph_result_tree`         | The tree of `workgraph_result_commit`: what the verdict judges                                                              |
 | `workgraph_accepted_tree`       | The tree the close stamp accepted                                                                                           |
 | `workgraph_finalized_tree`      | The tree after finalization, written only when finalization changed it                                                      |
+| `workgraph_check`               | The issue's check command, a string (see [The check](#the-check))                                                           |
+| `workgraph_check_waiver`        | Why no check applies to the issue, in the approver's words; never set together with `workgraph_check`                       |
+| `workgraph_bar_digest`          | The sha256 of the bar frozen at the latest claim (see [The frozen bar](#the-frozen-bar))                                    |
 
-The seven tree keys are scalar strings (see [Tree binding](#tree-binding)).
-A cleared key holds an empty string.
+The seven tree keys and the three check keys are scalar strings (see
+[Tree binding](#tree-binding)). A cleared key holds an empty string.
 
 ### 2. State transitions
 

@@ -148,6 +148,19 @@ export const WORKGRAPH_TREE_BINDING_KEYS: readonly string[] = [
 ];
 
 /**
+ * Check keys (`src/check.ts`). The check command and the waiver are set by a
+ * human through create, approve or split and are mutually exclusive; a
+ * cleared key holds "". The command is always stored as a string, so `true`
+ * (the shell builtin) stays a command and never becomes a boolean.
+ */
+/** The shell command the core runs against the result tree. */
+export const WORKGRAPH_CHECK_KEY = "workgraph_check";
+/** Why no check applies to this issue, in the approver's words. */
+export const WORKGRAPH_CHECK_WAIVER_KEY = "workgraph_check_waiver";
+/** Digest of the bar frozen at the latest claim (the bar itself is in the `bar-frozen` event). */
+export const WORKGRAPH_BAR_DIGEST_KEY = "workgraph_bar_digest";
+
+/**
  * The lifecycle phase union (README "Durable lifecycle metadata"). the store'
  * four native statuses stay untouched; this is workgraph semantics stored in
  * `workgraph_phase`. Legal edges live in `src/lifecycle.ts`'s LEGAL table.
@@ -280,7 +293,15 @@ export type LeaseEvent =
    *  lease left INTACT for TTL reclaim (never released under a live mutator). */
   | "abandoned-unacked-cancel"
   /** Phase 4: best-effort run:cancel published for a recorded execution. */
-  | "cancel-published";
+  | "cancel-published"
+  /** The bar a run is judged against (risk tier, gate policy, criteria, check
+   *  or waiver) was captured at claim. Carries the bar and its digest; a
+   *  restart rebuilds the run's bar from it. */
+  | "bar-frozen"
+  /** The issue or the configuration no longer matches the frozen bar. Names
+   *  the fields that differ. The run keeps the frozen bar; the change
+   *  applies to the next claim. */
+  | "bar-changed";
 
 // ---------------------------------------------------------------------------
 // Verdict shapes (phase 3). A reviewer completion carries a `verdict` field
@@ -297,6 +318,12 @@ export const Finding = Type.Object({
   severity: StringEnum(["blocking", "advisory"]),
   note: Type.Optional(Type.String()),
   evidence: Type.Optional(Type.String()),
+  /**
+   * Who wrote the finding. `code` marks a finding the core produced itself
+   * (a failed check). Never taken from a reviewer: `parseVerdict` removes
+   * the field from every reported finding, so a reviewer cannot claim it.
+   */
+  author: Type.Optional(StringEnum(["reviewer", "code"])),
 });
 export type FindingT = Static<typeof Finding>;
 
@@ -438,6 +465,12 @@ export const SplitParams = Type.Object({
             "Create the child already approved (lifecycle v1, phase ready) instead of draft",
         }),
       ),
+      check: Type.Optional(
+        Type.String({ minLength: 1, description: "Shell command the core runs against the result before review, e.g. npm test; it must exit 0. Comes from the human" }),
+      ),
+      checkWaiver: Type.Optional(
+        Type.String({ minLength: 1, description: "Why no check applies to this work. Only on explicit human instruction, with the human's reason" }),
+      ),
     }),
     { minItems: 1, maxItems: 20, description: "Child issues to create" },
   ),
@@ -463,6 +496,12 @@ export const ApproveParams = Type.Object({
     }),
   ),
   workflowClass: Type.Optional(WorkflowClass),
+  check: Type.Optional(
+    Type.String({ minLength: 1, description: "Shell command the core runs against the result before review, e.g. npm test; it must exit 0. Comes from the human" }),
+  ),
+  checkWaiver: Type.Optional(
+    Type.String({ minLength: 1, description: "Why no check applies to this work. Only on explicit human instruction, with the human's reason" }),
+  ),
 });
 export type ApproveParamsT = Static<typeof ApproveParams>;
 
@@ -545,6 +584,12 @@ export const CreateParams = Type.Object({
     Type.Array(Type.String(), {
       description: "Issue ids this one is blocked by",
     }),
+  ),
+  check: Type.Optional(
+    Type.String({ minLength: 1, description: "Shell command the core runs against the result before review, e.g. npm test; it must exit 0. Comes from the human" }),
+  ),
+  checkWaiver: Type.Optional(
+    Type.String({ minLength: 1, description: "Why no check applies to this work. Only on explicit human instruction, with the human's reason" }),
   ),
 });
 export type CreateParamsT = Static<typeof CreateParams>;

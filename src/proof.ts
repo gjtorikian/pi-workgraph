@@ -37,12 +37,22 @@
  * append-only, so a tree changed by finalization is recorded as a second
  * comment, `workgraph-proof stamp-amended {json}`, which
  * {@link latestStamp} folds into the stamp it returns.
+ *
+ * THE RECEIPT is the third record: `workgraph-proof receipt {json}`, one per
+ * check run the core kept (`src/check.ts`). It names the tree the command
+ * ran against, the command's digest, how the process ended and the hash of
+ * its log. A close rests on it exactly as it rests on the verdict, so
+ * {@link recordReceipt} rejects with {@link ReceiptWriteError} when the
+ * write fails. {@link receiptFor} reads one back by run, tree and command,
+ * which is what makes a tree checked once per run: a restart finds the
+ * receipt on the trail instead of running the command again.
  */
 import {
   addComment,
   listComments,
   listCommentsByPrefix,
 } from "./store.ts";
+import type { CheckReceipt } from "./check.ts";
 import { GATES, type GateModeT, type GateName } from "./policy.ts";
 import { TRUNCATION_MARKER } from "./verdict.ts";
 
@@ -57,6 +67,12 @@ const STAMP_MARKER = `${PROOF_PREFIX} stamp `;
 
 /** Marker opening a stamp amendment (finalization changed the tree). */
 const STAMP_AMENDED_MARKER = `${PROOF_PREFIX} stamp-amended `;
+
+/** Marker opening a check receipt. */
+const RECEIPT_MARKER = `${PROOF_PREFIX} receipt `;
+
+/** What opens the reason of a `check` gate record for waived work. */
+export const WAIVED_REASON_PREFIX = "waived: ";
 
 /** Cap on a record's `reason`, truncation marker included. */
 export const MAX_REASON_CHARS = 400;
@@ -229,6 +245,9 @@ export interface GateSummary {
   blocked: string[];
   /** Issues the gate would have blocked at least once, in the same order. */
   wouldBlock: string[];
+  /** Issues a human waived the gate for (recorded `not-applicable`), each
+   *  once, with the latest waiver reason. */
+  waived: Array<{ issueId: string; reason: string }>;
 }
 
 /**
@@ -243,7 +262,7 @@ export function summarizeGates(
 ): Record<GateName, GateSummary> {
   const summary = {} as Record<GateName, GateSummary>;
   for (const gate of GATES) {
-    summary[gate] = { records: 0, blocked: [], wouldBlock: [] };
+    summary[gate] = { records: 0, blocked: [], wouldBlock: [], waived: [] };
   }
   for (const record of records) {
     const entry = summary[record.gate];
@@ -253,6 +272,15 @@ export function summarizeGates(
     }
     if (record.wouldBlock && !entry.wouldBlock.includes(record.issueId)) {
       entry.wouldBlock.push(record.issueId);
+    }
+    if (
+      record.result === "not-applicable" &&
+      record.reason?.startsWith(WAIVED_REASON_PREFIX)
+    ) {
+      const reason = record.reason.slice(WAIVED_REASON_PREFIX.length);
+      const seen = entry.waived.find((w) => w.issueId === record.issueId);
+      if (seen) seen.reason = reason;
+      else entry.waived.push({ issueId: record.issueId, reason });
     }
   }
   return summary;
@@ -293,9 +321,22 @@ export interface Stamp {
   verdict?: { executionId: string; summary: string };
   /** Latest result per gate evaluated for this run. */
   gates: Record<string, GateResult>;
+  /**
+   * What the close rests on from the `check` gate. `passed`: a receipt for
+   * the stamped tree. `waived`: a human said no check applies. `none`: no
+   * check ran (none was set, or none could run). `failed`: the check failed
+   * and the gate only observed. Absent when the gate is `off`.
+   */
+  check?: StampCheck;
+  /** sha256 of the passing check's log (`check: "passed"` only). */
+  checkLogSha256?: string;
   /** Set only when finalization changed the tree (folded in by {@link latestStamp}). */
   finalizedTree?: string;
 }
+
+export type StampCheck = "passed" | "waived" | "none" | "failed";
+
+const STAMP_CHECKS: readonly StampCheck[] = ["passed", "waived", "none", "failed"];
 
 /** Thrown when a close stamp could not be written to the comment trail. */
 export class StampWriteError extends Error {
@@ -337,6 +378,10 @@ export async function recordStamp(
         }
       : {}),
     gates: { ...stamp.gates },
+    ...(stamp.check !== undefined ? { check: stamp.check } : {}),
+    ...(stamp.checkLogSha256 !== undefined
+      ? { checkLogSha256: stamp.checkLogSha256 }
+      : {}),
   };
   const text = `${STAMP_MARKER}${JSON.stringify(payload)}`;
   try {
@@ -353,7 +398,9 @@ export async function recordStamp(
  * Record that finalization changed the stamped tree, as
  * `workgraph-proof stamp-amended {json}`. Resolves even when the write
  * fails: finalization's external effects have already happened, so nothing
- * is gained by blocking the close on this record (decision log).
+ * is gained by blocking the close on this RECORD (decision log). What can
+ * still stop the close is the check itself, which the coordinator runs
+ * again on the tree named here.
  */
 export async function recordStampAmendment(
   cwd: string,
@@ -431,6 +478,12 @@ function parseStamp(json: string): Stamp | undefined {
         }
       : {}),
     gates,
+    ...(STAMP_CHECKS.includes(payload.check as StampCheck)
+      ? { check: payload.check as StampCheck }
+      : {}),
+    ...(typeof payload.checkLogSha256 === "string"
+      ? { checkLogSha256: payload.checkLogSha256 }
+      : {}),
   };
 }
 
@@ -470,6 +523,166 @@ export async function latestStamp(
       finalizedBy.workflowRunId === stamp.workflowRunId
       ? { ...stamp, finalizedTree: finalizedBy.finalizedTree }
       : stamp;
+  }
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Check receipts
+// ---------------------------------------------------------------------------
+
+/** A receipt as recorded: the run, its tree, and the run that asked for it. */
+export interface RecordedReceipt extends CheckReceipt {
+  workflowRunId: string;
+  attempt: number;
+}
+
+/** Thrown when a check receipt could not be written to the comment trail. */
+export class ReceiptWriteError extends Error {
+  readonly issueId: string;
+  /** The underlying write failure. */
+  readonly detail: string;
+
+  constructor(issueId: string, detail: string) {
+    super(`Check receipt for ${issueId} could not be written: ${detail}`);
+    this.name = "ReceiptWriteError";
+    this.issueId = issueId;
+    this.detail = detail;
+  }
+}
+
+/**
+ * Persist one check receipt as `workgraph-proof receipt {json}`. REJECTS
+ * with {@link ReceiptWriteError} when the write fails, like
+ * {@link recordStamp}: a check nobody can read back proves nothing.
+ */
+export async function recordReceipt(
+  cwd: string,
+  issueId: string,
+  receipt: RecordedReceipt,
+  actor?: string,
+): Promise<void> {
+  const payload: RecordedReceipt = {
+    tree: receipt.tree,
+    commandDigest: receipt.commandDigest,
+    exitCode: receipt.exitCode,
+    ...(receipt.signal !== undefined ? { signal: receipt.signal } : {}),
+    timedOut: receipt.timedOut,
+    passed: receipt.passed,
+    ...(receipt.reason !== undefined
+      ? { reason: capReason(receipt.reason) }
+      : {}),
+    startedAt: receipt.startedAt,
+    endedAt: receipt.endedAt,
+    log: {
+      path: receipt.log.path,
+      bytes: receipt.log.bytes,
+      sha256: receipt.log.sha256,
+      tail: receipt.log.tail,
+    },
+    workflowRunId: receipt.workflowRunId,
+    attempt: receipt.attempt,
+  };
+  const text = `${RECEIPT_MARKER}${JSON.stringify(payload)}`;
+  try {
+    await addComment(cwd, issueId, text, actor);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // Loud AND blocking — the gate must not act on a receipt that is not there.
+    console.error(`[pi-workgraph] RECEIPT WRITE FAILED (${issueId}): ${msg}`);
+    throw new ReceiptWriteError(issueId, msg);
+  }
+}
+
+function parseReceipt(json: string): RecordedReceipt | undefined {
+  const payload = jsonObject(json);
+  if (!payload) return undefined;
+  const log = payload.log as Record<string, unknown> | null | undefined;
+  if (
+    typeof payload.tree !== "string" ||
+    typeof payload.commandDigest !== "string" ||
+    (payload.exitCode !== null && typeof payload.exitCode !== "number") ||
+    typeof payload.timedOut !== "boolean" ||
+    typeof payload.passed !== "boolean" ||
+    typeof payload.startedAt !== "string" ||
+    typeof payload.endedAt !== "string" ||
+    typeof payload.workflowRunId !== "string" ||
+    typeof payload.attempt !== "number" ||
+    log === null ||
+    typeof log !== "object" ||
+    typeof log.path !== "string" ||
+    typeof log.bytes !== "number" ||
+    typeof log.sha256 !== "string" ||
+    typeof log.tail !== "string"
+  ) {
+    return undefined;
+  }
+  return {
+    tree: payload.tree,
+    commandDigest: payload.commandDigest,
+    exitCode: payload.exitCode,
+    ...(typeof payload.signal === "string" ? { signal: payload.signal } : {}),
+    timedOut: payload.timedOut,
+    passed: payload.passed,
+    ...(typeof payload.reason === "string" ? { reason: payload.reason } : {}),
+    startedAt: payload.startedAt,
+    endedAt: payload.endedAt,
+    log: {
+      path: log.path,
+      bytes: log.bytes,
+      sha256: log.sha256,
+      tail: log.tail,
+    },
+    workflowRunId: payload.workflowRunId,
+    attempt: payload.attempt,
+  };
+}
+
+/**
+ * Every check receipt on an issue, oldest first. A comment under the marker
+ * that does not parse is skipped, never thrown.
+ */
+export async function listReceipts(
+  cwd: string,
+  issueId: string,
+): Promise<RecordedReceipt[]> {
+  const receipts: RecordedReceipt[] = [];
+  for (const comment of await listComments(cwd, issueId)) {
+    if (!comment.text.startsWith(RECEIPT_MARKER)) continue;
+    const receipt = parseReceipt(comment.text.slice(RECEIPT_MARKER.length));
+    if (receipt) receipts.push(receipt);
+  }
+  return receipts;
+}
+
+/**
+ * The newest receipt one workflow run recorded for one tree and one command,
+ * passed or failed, or undefined when that run never checked that tree with
+ * that command.
+ *
+ * Scoped to the RUN on purpose. A run keeps its id across a restart, so a
+ * restarted coordinator finds its own receipt and does not check the tree
+ * again. A new claim is a new run: it checks for itself, which is what lets
+ * a human retry a check that failed for a reason outside the tree (release,
+ * approve again), and keeps an old pass from standing in for a new run.
+ */
+export async function receiptFor(
+  cwd: string,
+  issueId: string,
+  tree: string,
+  commandDigest: string,
+  workflowRunId: string,
+): Promise<RecordedReceipt | undefined> {
+  const receipts = await listReceipts(cwd, issueId);
+  for (let i = receipts.length - 1; i >= 0; i--) {
+    const receipt = receipts[i]!;
+    if (
+      receipt.tree === tree &&
+      receipt.commandDigest === commandDigest &&
+      receipt.workflowRunId === workflowRunId
+    ) {
+      return receipt;
+    }
   }
   return undefined;
 }

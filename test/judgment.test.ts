@@ -1087,7 +1087,8 @@ describe("executor failure diagnostics", () => {
       expect(metadataOf(graph, id).workgraph_decision_answer).toBe("Yes, bump the major.");
       expect(await auditCount(graph.dir, id, "decision-answered")).toBe(1);
 
-      await runTool("workgraph_approve", { id }, graph.dir);
+      // Tools read the shipped policy, where medium-risk work needs a check.
+      await runTool("workgraph_approve", { id, check: "npm test" }, graph.dir);
       expect(phaseOf(graph.showIssue(id))).toBe("ready");
       await settle(mock, ectx.ctx);
       await mock.flushEvents();

@@ -342,7 +342,7 @@ describe("workgraph_approve", () => {
       const id = local.createIssue("needs approval");
       const result = await run(
         "workgraph_approve",
-        { id, acceptanceCriteria: "renders the widget", riskTier: "high" },
+        { id, acceptanceCriteria: "renders the widget", riskTier: "high", check: "npm test" },
         local.dir,
       );
       expect(resultText(result)).toContain("risk tier high");
@@ -378,7 +378,7 @@ describe("workgraph_approve", () => {
       const high = local.createIssue("sensitive rename");
       const result = await run(
         "workgraph_approve",
-        { id: high, riskTier: "high", workflowClass: "oneshot" },
+        { id: high, riskTier: "high", workflowClass: "oneshot", check: "npm test" },
         local.dir,
       );
       expect(resultText(result)).toContain("promoted");
@@ -587,7 +587,7 @@ describe("workgraph_override", () => {
       expect(overrides).toHaveLength(1);
       expect(overrides[0]!.text).toContain("judging -> draft"); // audited reset
       // The documented recovery path exists end to end: draft re-approves.
-      await run("workgraph_approve", { id }, local.dir);
+      await run("workgraph_approve", { id, check: "npm test" }, local.dir);
       expect((local.showIssue(id).metadata ?? {}).workgraph_phase).toBe(
         "ready",
       );
@@ -662,7 +662,7 @@ describe("workgraph_ready lifecycle filter", () => {
     try {
       const legacyId = local.createIssue("legacy issue");
       const approvedId = local.createIssue("approved issue");
-      await run("workgraph_approve", { id: approvedId }, local.dir);
+      await run("workgraph_approve", { id: approvedId, check: "npm test" }, local.dir);
 
       const approved = await run("workgraph_ready", {}, local.dir);
       const approvedText = resultText(approved);

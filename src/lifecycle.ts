@@ -31,8 +31,11 @@ import {
   WORKGRAPH_ACCEPTED_TREE_KEY,
   WORKGRAPH_ACTIVE_EXECUTION_ID_KEY,
   WORKGRAPH_ATTEMPT_KEY,
+  WORKGRAPH_BAR_DIGEST_KEY,
   WORKGRAPH_BASE_COMMIT_KEY,
   WORKGRAPH_BASE_TREE_KEY,
+  WORKGRAPH_CHECK_KEY,
+  WORKGRAPH_CHECK_WAIVER_KEY,
   WORKGRAPH_EXECUTOR_ID_KEY,
   WORKGRAPH_FAILURE_FINGERPRINT_KEY,
   WORKGRAPH_FINALIZED_TREE_KEY,
@@ -280,6 +283,26 @@ export function acceptedTreeOf(issue: WorkIssue): string | undefined {
 /** The tree after finalization, set only when finalization changed it. */
 export function finalizedTreeOf(issue: WorkIssue): string | undefined {
   return bindingValue(issue, WORKGRAPH_FINALIZED_TREE_KEY);
+}
+
+/** The issue's own check command, trimmed; "" and whitespace read as unset. */
+export function checkOf(issue: WorkIssue): string | undefined {
+  const raw = issue.metadata?.[WORKGRAPH_CHECK_KEY];
+  // A command is stored as a string, but a hand-written `true` may have
+  // landed as a boolean: it is still the shell builtin.
+  const text = typeof raw === "boolean" ? String(raw) : raw;
+  return typeof text === "string" && text.trim() !== "" ? text.trim() : undefined;
+}
+
+/** Why no check applies to the issue, trimmed; "" and whitespace read as unset. */
+export function checkWaiverOf(issue: WorkIssue): string | undefined {
+  const raw = issue.metadata?.[WORKGRAPH_CHECK_WAIVER_KEY];
+  return typeof raw === "string" && raw.trim() !== "" ? raw.trim() : undefined;
+}
+
+/** The digest of the bar frozen at the latest claim, if recorded. */
+export function barDigestOf(issue: WorkIssue): string | undefined {
+  return bindingValue(issue, WORKGRAPH_BAR_DIGEST_KEY);
 }
 
 // ---------------------------------------------------------------------------

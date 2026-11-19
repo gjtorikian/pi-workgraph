@@ -104,6 +104,10 @@ function approve(graph: ScratchGraph, id: string): void {
     "workgraph_lifecycle_version=1",
     "--set-metadata",
     "workgraph_phase=ready",
+    // The check the core runs before any review: the shell builtin, which
+    // passes. Medium- and high-risk work with none does not reach review.
+    "--set-metadata",
+    "workgraph_check=true",
     "--set-metadata",
     "workgraph_risk_tier=medium",
     "--set-metadata",
@@ -236,12 +240,14 @@ describe("a failed verdict write never closes", () => {
         expect(await commentsStarting(graph.dir, id, VERDICT_MARKER)).toEqual([]);
         expect(await commentsStarting(graph.dir, id, "workgraph-lease judgment-closed ")).toEqual([]);
         // The review gate was never applied: its result is recorded only
-        // once the verdict it rests on is durable. (The tree-binding gate
-        // is evaluated before the review and has its own record.)
+        // once the verdict it rests on is durable. (The tree-binding and
+        // check gates are evaluated before the review and have their own
+        // records.)
         const records = await listGateRecords(graph.dir, id);
         expect(records.filter((r) => r.gate === "review")).toEqual([]);
         expect(records.map((r) => [r.gate, r.result])).toEqual([
           ["tree-binding", "pass"],
+          ["check", "pass"],
         ]);
         expect(heldLeases(graph.dir)).toHaveLength(0);
       } finally {
