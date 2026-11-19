@@ -70,6 +70,18 @@
  *    (`author: "code"`) and takes the same revise path a reviewer's would;
  *    no reviewer is asked about a tree whose check failed. A tree changed
  *    by finalization is checked again before the close.
+ *  - A PASS IS POSITIVE (`src/criteria.ts`): unless the `criteria-evidence`
+ *    gate is `off`, the bar's acceptance criteria go to the reviewer as a
+ *    numbered list and the verdict must answer each one. An `unmet`
+ *    criterion is a blocking finding and takes the revise path; a criterion
+ *    left unanswered (or `met` with no evidence) is not a pass, and the
+ *    review is asked again within the review-retry bound, then escalated.
+ *  - A REVIEWER'S BLOCKER IS CHECKED BEFORE IT COUNTS (`src/verdict.ts`):
+ *    it must cite a file and line that exist in the reviewed tree, and then
+ *    the reviewer executor gets one bounded follow-up run to keep or
+ *    downgrade what is left. Both steps can only take a blocker away, and a
+ *    recheck that cannot be obtained leaves every blocker standing. Neither
+ *    step has a gate mode, and neither touches a finding the core wrote.
  */
 import { existsSync, realpathSync } from "node:fs";
 import type {
@@ -100,6 +112,13 @@ import {
   type MetadataValue,
 } from "./store.ts";
 import { DEFAULT_CONFIG, type WorkgraphConfig } from "./config.ts";
+import {
+  criteriaIds,
+  evaluateCriteria,
+  parseCriteria,
+  unmetFindings,
+  type Criterion,
+} from "./criteria.ts";
 import {
   critiqueSummary,
   MAX_GAPS,
@@ -194,6 +213,7 @@ import {
   RunCompleted,
   SeenMessages,
   type ActivityT,
+  type ExecutorOfferT,
   type IsolationLevelT,
   type RunCancelT,
   type RunCompletedT,
@@ -212,7 +232,9 @@ import {
 } from "./recovery.ts";
 import {
   anchorTree,
+  fileAt,
   isGitWorkspace,
+  pathInTree,
   proofRef,
   runKey,
   snapshotWorkspace,
@@ -222,6 +244,7 @@ import {
 import { clearLeaseStatus, showLeaseStatus } from "./status.ts";
 import { reclaimAndLeaveReady } from "./sweep.ts";
 import type {
+  BlockerRecheckT,
   FindingT,
   WorkIssue,
   IdentityProvider,
@@ -233,6 +256,7 @@ import type {
   VerdictT,
 } from "./types.ts";
 import {
+  BlockerRecheck,
   Plan,
   PlanCritique,
   Verdict,
@@ -260,15 +284,22 @@ import {
   WORKGRAPH_WORKSPACE_PATH_KEY,
 } from "./types.ts";
 import {
+  applyRecheck,
   artifactDigest,
   blockingFindings,
   canonicalFindings,
+  checkCitations,
   failureFingerprint,
+  parseRecheck,
   parseVerdict,
+  recheckBlockers,
+  RecheckError,
+  recordRecheck,
   recordVerdict,
   VerdictError,
   verdictSummary,
   VerdictWriteError,
+  type NumberedBlocker,
 } from "./verdict.ts";
 
 /**
@@ -304,6 +335,12 @@ export interface CoordinatorDeps {
    */
   planCritiqueWaitMs?: number;
   /**
+   * TEST SEAM. How long an accepted blocker recheck may run before its
+   * blockers stand without an answer. Default {@link RECHECK_WAIT_MS}. Not
+   * a user setting, for the same reason.
+   */
+  recheckWaitMs?: number;
+  /**
    * TEST SEAM. Called on every pass through the judgment gate's tail, after
    * the verdict was recorded (or the review gate was found `off`) and
    * immediately before the last comparison of the workspace against the
@@ -318,10 +355,11 @@ export interface CoordinatorDeps {
 }
 
 /**
- * Bounded retries for a review whose completion carried no parseable
- * verdict (the attempt is discarded and audited; counts against THIS bound,
- * never against `maxRevisions`). A knob with one exercised value is a
- * constant (decision log).
+ * Bounded retries for a review round that is thrown away: its completion
+ * carried no parseable verdict, its verdict left an acceptance criterion
+ * unanswered, or the workspace changed under it (the attempt is discarded
+ * and audited; counts against THIS bound, never against `maxRevisions`). A
+ * knob with one exercised value is a constant (decision log).
  */
 export const MAX_REVIEW_RETRIES = 2;
 
@@ -337,6 +375,12 @@ export const MAX_CHECK_RETRIES = 2;
  * one. A constant for the same reason {@link MAX_REVIEW_RETRIES} is.
  */
 export const PLAN_CRITIQUE_WAIT_MS = 600_000;
+
+/**
+ * Default bound on a blocker recheck once the reviewer accepted it: one
+ * attempt, then the blockers stand as the verdict reported them.
+ */
+export const RECHECK_WAIT_MS = 600_000;
 
 /**
  * Resolve topology defensively. Approval already promotes non-low one-shot
@@ -472,6 +516,18 @@ type CritiqueOutcome =
   | { kind: "abandon" }
   /** The lease is gone: the run is dropped without parking. */
   | { kind: "lost" };
+
+/** How one bounded attempt to recheck a verdict's blockers ended. */
+type RecheckOutcome =
+  | {
+      kind: "answers";
+      answers: BlockerRecheckT["answers"];
+      executionId: string;
+    }
+  /** No usable answer: every blocker stands. */
+  | { kind: "failed"; reason: string; executionId?: string }
+  /** The inbox closed, or the lease is gone: the run is no longer judged here. */
+  | { kind: "stop" };
 
 /** Handle returned by {@link registerCoordinator}; tests drive ticks directly. */
 export interface CoordinatorController {
@@ -3584,6 +3640,174 @@ export function registerCoordinator(
     return completion;
   }
 
+  /**
+   * One bounded follow-up run to the executor that produced a verdict: keep
+   * or downgrade each of its numbered blockers. Role `reviewer`, the same
+   * workspace and trees as the review, the blockers as a tolerated extra
+   * `recheck` field, and `BlockerRecheck` as the output schema; the answer
+   * rides the completion as `recheck`.
+   *
+   * It degrades instead of escalating, like the plan critique and unlike
+   * the review: a request that is rejected or not accepted in time, a run
+   * that does not finish inside the bound, a question, a failed or
+   * non-independent completion and an invalid answer are all `failed`, and
+   * the caller leaves every blocker standing. Only a closed inbox or a lost
+   * lease is `stop`. A recheck left running is canceled with
+   * `publishCancel`, never `cancelAndAwaitAck`: nothing waits on it, and the
+   * workspace is compared with the reviewed tree afterwards either way.
+   *
+   * The run is rebound to the reviewer with `reviewInFlight` set for the
+   * wait, exactly as for a review, so teardown and the executor's in-flight
+   * count both see the execution. No new executor selection: the question is
+   * about this reviewer's own findings.
+   */
+  async function requestRecheck(
+    run: CoordinatorRun,
+    box: JudgmentInbox,
+    reviewer: Pick<
+      ExecutorOfferT,
+      "executorId" | "isolation" | "supportsCancellation"
+    >,
+    blockers: NumberedBlocker[],
+    author: RunCompletedT,
+    attempt: number,
+  ): Promise<RecheckOutcome> {
+    const config = heldConfig();
+    if (box.closed) return { kind: "stop" };
+    const request: RunRequestT & {
+      artifacts: string[];
+      recheck: { blockers: NumberedBlocker[] };
+    } = {
+      ...newEnvelope(nowFn),
+      executorId: reviewer.executorId,
+      issue: {
+        id: run.issue.id,
+        title: run.issue.title,
+        workflowClass: effectiveWorkflowClass(run.issue),
+        riskTier: run.bar.riskTier,
+        ...(run.issue.description !== undefined
+          ? { description: run.issue.description }
+          : {}),
+        ...(run.bar.criteria !== undefined
+          ? { acceptanceCriteria: run.bar.criteria }
+          : {}),
+      },
+      workflowRunId: run.workflowRunId,
+      leaseEpoch: run.lease.epoch,
+      role: "reviewer",
+      attempt,
+      ...decisionAnswer(run.issue.metadata),
+      workspace: requestWorkspace(run),
+      outputSchema: BlockerRecheck,
+      // v1-tolerated extra fields, like the review's `artifacts`.
+      artifacts: [...author.artifacts],
+      recheck: { blockers },
+      ...(run.plan !== undefined ? { plan: run.plan } : {}),
+    };
+    run.executorId = reviewer.executorId;
+    run.executionId = undefined;
+    run.isolation = reviewer.isolation;
+    run.supportsCancellation = reviewer.supportsCancellation;
+    run.reviewInFlight = true;
+    const result = await requestRun(pi.events, request, {
+      timeoutMs: config.acceptTimeoutMs,
+      onInvalid,
+    });
+    if (result.kind === "accepted")
+      run.executionId = result.message.executionId;
+    if (box.closed) {
+      if (result.kind !== "rejected")
+        publishCancel(run, "coordinator stopped during the blocker recheck");
+      return { kind: "stop" };
+    }
+    if (result.kind === "rejected") {
+      run.reviewInFlight = false;
+      return {
+        kind: "failed",
+        reason: `reviewer rejected the recheck: ${result.message.reason}`,
+      };
+    }
+    if (result.kind === "timeout") {
+      publishCancel(run, "blocker recheck was not accepted in time");
+      run.reviewInFlight = false;
+      return {
+        kind: "failed",
+        reason: "reviewer did not accept the recheck in time",
+      };
+    }
+    const executionId = result.message.executionId;
+
+    const waitMs = deps.recheckWaitMs ?? RECHECK_WAIT_MS;
+    const completion = await awaitCompletion(box, executionId, waitMs);
+    if (box.closed) return { kind: "stop" }; // teardown owns the run now
+    run.reviewInFlight = false;
+    if (!completion) {
+      publishCancel(run, "blocker recheck timed out");
+      return {
+        kind: "failed",
+        reason: `no recheck answer within ${waitMs / 1000} s`,
+        executionId,
+      };
+    }
+    if (!(await fencedForJudgment(run, completion))) {
+      // Our lease is gone — the whole run is stale; drop it.
+      untrackLease(run.cwd, run.lease.issueId);
+      dropJudgedRun(run);
+      return { kind: "stop" };
+    }
+    if (box.closed) return { kind: "stop" };
+
+    // A recheck may not ask the human anything, and its failure costs the
+    // author one second look, not the run: never requestDecision, never
+    // escalateRun. A pending worker is canceled so it holds no slot.
+    if (completion.decisionQuestion || completion.outcome === "blocked") {
+      publishCancel(run, "a blocker recheck cannot ask for a decision");
+      return {
+        kind: "failed",
+        reason: "reviewer asked a question instead of answering the recheck",
+        executionId,
+      };
+    }
+    if (completion.outcome !== "success" || completion.executionError) {
+      return {
+        kind: "failed",
+        reason: completionFailure("reviewer", completion),
+        executionId,
+      };
+    }
+    // A downgrade favors the author, so the answer must come from a run as
+    // independent of the author as the review was.
+    const independence = checkIndependence(
+      {
+        author: author.provenance,
+        reviewer: completion.provenance,
+        authorExecutionId: author.executionId,
+        reviewerExecutionId: completion.executionId,
+      },
+      run.bar.policy,
+    );
+    if (!independence.independent) {
+      return {
+        kind: "failed",
+        reason: `recheck was not independent: ${independence.reason}`,
+        executionId,
+      };
+    }
+    try {
+      const recheck = parseRecheck(
+        (completion as RunCompletedT & { recheck?: unknown }).recheck,
+      );
+      return { kind: "answers", answers: recheck.answers, executionId };
+    } catch (e) {
+      if (!(e instanceof RecheckError)) throw e;
+      return {
+        kind: "failed",
+        reason: `invalid recheck: ${e.detail}`,
+        executionId,
+      };
+    }
+  }
+
   function completionFailure(role: string, completion: RunCompletedT): string {
     const detail = completion.executionError || completion.evidence.join("; ");
     return `${role} execution failed (${completion.outcome})${detail ? `: ${detail.slice(0, 1500)}` : ""}`;
@@ -3946,7 +4170,8 @@ export function registerCoordinator(
     // revision replaces it (fresh artifacts + provenance).
     let author = implementation;
     // Shared by every reason a review round is thrown away: no parseable
-    // verdict, a workspace that changed during the review, a workspace that
+    // verdict, a workspace that changed during the review or the blocker
+    // recheck, a verdict that left a criterion unanswered, a workspace that
     // changed after the verdict. One bound, so the loop cannot spin.
     let reviewRetries = 0;
     // Executors whose reviews were rejected (non-independent) or who did
@@ -3962,6 +4187,13 @@ export function registerCoordinator(
     /** What a gate was recorded for: the bound tree, or why there is none. */
     const resultKey = (): string =>
       boundTreeOf(run) ?? `unknown: ${run.bindingReason ?? ""}`;
+    // The frozen criteria as numbered items. Positional ids, so they are the
+    // same on every request of this run and after a restart.
+    const criteria = parseCriteria(run.bar.criteria);
+    // What the NEXT review request must address: the criteria the last
+    // verdict left unanswered. Outlives the loop's `continue`, because the
+    // request is rebuilt every round.
+    let reviewFeedback: string | undefined;
 
     for (;;) {
       if (box.closed) return; // teardown
@@ -3979,6 +4211,10 @@ export function registerCoordinator(
       const mode = policy.gates.review;
       const bindingMode = policy.gates["tree-binding"];
       const checkMode = policy.gates.check;
+      const criteriaMode = policy.gates["criteria-evidence"];
+      // `off`: the reviewer is not asked for answers and nothing counts
+      // them, so the review reads exactly as it did before the gate existed.
+      const numbered: Criterion[] = criteriaMode !== "off" ? criteria : [];
       const attempt = attemptOf(issue) ?? 1;
 
       // ---- the tree-binding gate. Decided here, under the validated
@@ -4075,10 +4311,60 @@ export function registerCoordinator(
         return "again";
       };
 
+      /**
+       * A reviewer-role run just finished: is the workspace still the tree
+       * it was shown? `same`: yes (or nothing is bound). Otherwise the round
+       * is thrown away, because a verdict on a tree that is no longer in the
+       * workspace judges nothing: `again` — the run is bound to the new tree
+       * and the caller reviews that; `stop` — the retry bound is spent and
+       * the run was escalated. The reviewer is NOT excluded (unlike a
+       * non-independent one): with a single reviewer that would escalate for
+       * want of a reviewer instead of reviewing the new tree.
+       */
+      const discardIfMoved = async (
+        when: string,
+        executorId: string,
+        executionId: string | undefined,
+      ): Promise<"same" | "again" | "stop"> => {
+        if (tree === undefined) return "same";
+        const moved = await recheckWorkspace(run, attempt, when);
+        if (moved === "same") return "same";
+        reviewRetries += 1;
+        const reason =
+          moved === "changed"
+            ? `workspace changed ${when}`
+            : `workspace could not be read ${when}: ${run.bindingReason ?? "git failed"}`;
+        await recordLeaseEvent(
+          run.cwd,
+          "review-rejected",
+          run.lease.issueId,
+          {
+            workflowRunId: run.workflowRunId,
+            ...(executionId !== undefined ? { executionId } : {}),
+            executorId,
+            reason,
+            reviewedTree: tree,
+            ...(run.resultTree !== undefined ? { tree: run.resultTree } : {}),
+            retry: reviewRetries,
+          },
+          run.actor.bdActor,
+        );
+        if (reviewRetries > MAX_REVIEW_RETRIES) {
+          await escalateRun(
+            run,
+            "judging",
+            `review retries exhausted (${MAX_REVIEW_RETRIES}): ${reason}`,
+          );
+          return "stop";
+        }
+        return "again";
+      };
+
       // ---- review gate off: not evaluated, so no reviewer is selected, no
-      // verdict exists, and no gate result is recorded. The work is accepted
-      // on the implementation alone — which also means an off tier never
-      // parks for want of a reviewer-capable executor. ----
+      // verdict exists, and no gate result is recorded (`criteria-evidence`
+      // included: it reads a verdict's answers, and there is no verdict).
+      // The work is accepted on the implementation alone — which also means
+      // an off tier never parks for want of a reviewer-capable executor. ----
       if (mode === "off") {
         if (author.outcome !== "success") {
           // Everywhere else "any outcome is judged": the reviewer decides
@@ -4141,7 +4427,10 @@ export function registerCoordinator(
 
       // ---- request the review ----
       if (box.closed) return;
-      const reviewRequest: RunRequestT & { artifacts: string[] } = {
+      const reviewRequest: RunRequestT & {
+        artifacts: string[];
+        criteria?: Criterion[];
+      } = {
         ...newEnvelope(nowFn),
         executorId: reviewer.executorId,
         issue: {
@@ -4168,6 +4457,11 @@ export function registerCoordinator(
         // v1-tolerated extra field: the artifacts under review (non-strict
         // schemas carry fields this version's envelope does not name).
         artifacts: [...author.artifacts],
+        // The same transport: the criteria the verdict must answer by id.
+        // Sent whenever the `criteria-evidence` gate is evaluated, empty for
+        // an issue that has none.
+        ...(criteriaMode !== "off" ? { criteria: numbered } : {}),
+        ...(reviewFeedback !== undefined ? { feedback: reviewFeedback } : {}),
         ...(run.plan !== undefined ? { plan: run.plan } : {}),
       };
       run.executorId = reviewer.executorId;
@@ -4273,43 +4567,14 @@ export function registerCoordinator(
       }
 
       // ---- the workspace must still be the tree that was reviewed ----
-      // A verdict on a tree that is no longer in the workspace judges
-      // nothing: discard it and review again. The reviewer is NOT excluded
-      // (unlike a non-independent one) — with a single reviewer that would
-      // escalate for want of a reviewer instead of reviewing the new tree.
-      if (tree !== undefined) {
-        const moved = await recheckWorkspace(run, attempt, "during review");
-        if (moved !== "same") {
-          reviewRetries += 1;
-          const reason =
-            moved === "changed"
-              ? "workspace changed during review"
-              : `workspace could not be read during review: ${run.bindingReason ?? "git failed"}`;
-          await recordLeaseEvent(
-            run.cwd,
-            "review-rejected",
-            run.lease.issueId,
-            {
-              workflowRunId: run.workflowRunId,
-              executionId: completion.executionId,
-              executorId: reviewer.executorId,
-              reason,
-              reviewedTree: tree,
-              ...(run.resultTree !== undefined ? { tree: run.resultTree } : {}),
-              retry: reviewRetries,
-            },
-            run.actor.bdActor,
-          );
-          if (reviewRetries > MAX_REVIEW_RETRIES) {
-            await escalateRun(
-              run,
-              "judging",
-              `review retries exhausted (${MAX_REVIEW_RETRIES}): ${reason}`,
-            );
-            return;
-          }
-          continue; // review the tree that is there now
-        }
+      {
+        const next = await discardIfMoved(
+          "during review",
+          reviewer.executorId,
+          completion.executionId,
+        );
+        if (next === "stop") return;
+        if (next === "again") continue; // review the tree that is there now
       }
 
       // ---- author independence (fail closed) ----
@@ -4357,6 +4622,7 @@ export function registerCoordinator(
             ...(tree !== undefined ? { tree } : {}),
           },
           run.actor.bdActor,
+          numbered,
         );
       } catch (e) {
         if (!(e instanceof VerdictWriteError)) throw e;
@@ -4367,13 +4633,202 @@ export function registerCoordinator(
         );
         return;
       }
-      const summary = verdictSummary(verdict);
+      // Everything from here works on the verdict record just written: that
+      // comment is the reviewer's first reply, as it reported it.
+
+      // ---- the criteria-evidence gate: a pass has to be positive ----
+      // Code decides what the reviewer's answers add up to. `unmet` is a
+      // violation: each unmet criterion becomes a blocking finding, added
+      // AFTER the blocker checks below (what is wrong is an absence, so it
+      // has no line to cite and nothing for a second look to weigh).
+      // `unknown` — a criterion nobody answered — is not a pass either: the
+      // review is asked again below, within the review-retry bound. Under
+      // observe both are recorded and the review counts as it would have.
+      let unmet: FindingT[] = [];
+      let unanswered: Criterion[] = [];
+      reviewFeedback = undefined;
+      if (criteriaMode !== "off") {
+        const evaluation = evaluateCriteria(numbered, verdict);
+        const criteriaDecision = decideGate(
+          "criteria-evidence",
+          criteriaMode,
+          evaluation.result,
+        );
+        const gaps = [
+          ...(evaluation.unmet.length > 0
+            ? [`unmet: ${criteriaIds(evaluation.unmet)}`]
+            : []),
+          ...(evaluation.unanswered.length > 0
+            ? [`unanswered: ${criteriaIds(evaluation.unanswered)}`]
+            : []),
+        ];
+        const why =
+          evaluation.result === "not-applicable"
+            ? "no acceptance criteria"
+            : gaps.length > 0
+              ? gaps.join("; ")
+              : undefined;
+        noteGate(run, "criteria-evidence", evaluation.result);
+        await recordGate(
+          run.cwd,
+          run.lease.issueId,
+          {
+            gate: "criteria-evidence",
+            mode: criteriaMode,
+            result: evaluation.result,
+            ...criteriaDecision,
+            ...(why !== undefined ? { reason: why } : {}),
+            ...(tree !== undefined ? { tree } : {}),
+            workflowRunId: run.workflowRunId,
+            attempt,
+          },
+          run.actor.bdActor,
+        );
+        if (criteriaDecision.blocked) {
+          if (evaluation.result === "violation") {
+            unmet = unmetFindings(evaluation, verdict);
+          } else {
+            unanswered = evaluation.unanswered;
+          }
+        }
+      }
+
+      // ---- the reviewer's blockers, checked before they count ----
+      // 1. Each must cite a file and line that exist in the reviewed tree;
+      //    one that does not becomes advisory. Skipped with no bound tree.
+      // 2. What is left goes back to the same reviewer executor once, to
+      //    keep or downgrade. No blocker left: no request.
+      // Neither step has a mode, and neither can add a blocker.
+      const workspace = run.workspacePath ?? run.cwd;
+      const cited =
+        tree !== undefined
+          ? checkCitations(verdict, tree, (path) => {
+              const file = pathInTree(workspace, path);
+              return file !== undefined
+                ? fileAt(workspace, tree, file)
+                : undefined;
+            })
+          : verdict;
+      const citationDowngrades =
+        blockingFindings(verdict).length - blockingFindings(cited).length;
+      let processed = cited;
+      const asked = recheckBlockers(cited);
+      let recheck: RecheckOutcome | undefined;
+      if (asked.length > 0) {
+        recheck = await requestRecheck(
+          run,
+          box,
+          reviewer,
+          asked,
+          author,
+          attempt,
+        );
+        if (recheck.kind === "stop") return;
+        // The recheck ran in the workspace too: the same rule as a review.
+        const next = await discardIfMoved(
+          "during the blocker recheck",
+          reviewer.executorId,
+          recheck.executionId,
+        );
+        if (next === "stop") return;
+        if (next === "again") continue; // the verdict is discarded with it
+        if (recheck.kind === "answers") {
+          processed = applyRecheck(cited, recheck.answers);
+        } else {
+          await recordLeaseEvent(
+            run.cwd,
+            "recheck-failed",
+            run.lease.issueId,
+            {
+              workflowRunId: run.workflowRunId,
+              executorId: reviewer.executorId,
+              ...(recheck.executionId !== undefined
+                ? { executionId: recheck.executionId }
+                : {}),
+              reason: recheck.reason,
+              blockers: asked.length,
+            },
+            run.actor.bdActor,
+          );
+        }
+      }
+      const downgrades =
+        blockingFindings(verdict).length - blockingFindings(processed).length;
+      if (asked.length > 0 || citationDowngrades > 0) {
+        // The second comment of the round: what the checks made of the
+        // first reply. A downgrade can let the work close, so a record that
+        // carries one is as durable as the verdict; with nothing taken away
+        // the verdict record already says what stands, and a lost write
+        // costs only the note that a recheck was tried.
+        try {
+          await recordRecheck(
+            run.cwd,
+            run.lease.issueId,
+            processed,
+            {
+              workflowRunId: run.workflowRunId,
+              // The review this processes, by its verdict record's id.
+              executionId: completion.executionId,
+              executorId: reviewer.executorId,
+              attempt,
+              ...(tree !== undefined ? { tree } : {}),
+              citationDowngrades,
+              ...(recheck !== undefined && recheck.kind !== "stop"
+                ? {
+                    recheck: {
+                      outcome: recheck.kind,
+                      blockers: asked.length,
+                      ...(recheck.executionId !== undefined
+                        ? { executionId: recheck.executionId }
+                        : {}),
+                      ...(recheck.kind === "answers"
+                        ? {
+                            answers: recheck.answers
+                              .slice(0, asked.length)
+                              .map((answer) => ({
+                                n: answer.n,
+                                decision: answer.decision,
+                                reason: answer.reason.slice(0, 400),
+                              })),
+                          }
+                        : { reason: recheck.reason.slice(0, 400) }),
+                    },
+                  }
+                : {}),
+            },
+            run.actor.bdActor,
+            numbered,
+          );
+        } catch (e) {
+          if (!(e instanceof VerdictWriteError)) throw e;
+          if (downgrades > 0) {
+            await escalateRun(
+              run,
+              "judging",
+              `recheck record could not be written: ${e.detail}`,
+            );
+            return;
+          }
+        }
+      }
+
+      // The verdict as judged: the reviewer's findings after both checks,
+      // plus one blocking finding per unmet criterion. The summary, the
+      // revision's prior findings and the failure fingerprint all read this
+      // one, never the first reply.
+      const judged: VerdictT =
+        unmet.length > 0
+          ? { ...processed, findings: [...processed.findings, ...unmet] }
+          : processed;
+      const summary = verdictSummary(judged, numbered);
 
       // ---- apply the review gate ----
-      // Blocking findings are a violation; the gate's mode decides whether
-      // that blocks (enforce) or is only recorded (observe). One gate record
-      // per iteration, so a revision loop leaves a violation, then a pass.
-      const blocking = blockingFindings(verdict);
+      // The reviewer's own blockers that are left are a violation (findings
+      // built from unmet criteria are the criteria gate's, recorded above);
+      // the gate's mode decides whether that blocks (enforce) or is only
+      // recorded (observe). One gate record per iteration, so a revision
+      // loop leaves a violation, then a pass.
+      const blocking = blockingFindings(processed);
       const gateResult: GateResult =
         blocking.length > 0 ? "violation" : "pass";
       const decision = decideGate("review", mode, gateResult);
@@ -4393,15 +4848,19 @@ export function registerCoordinator(
         },
         run.actor.bdActor,
       );
-      if (decision.blocked) {
-        // The tree when there is one: the fingerprint then follows file
-        // content. The artifact list is the fallback when nothing is bound.
+      if (decision.blocked || unmet.length > 0) {
+        // Either gate blocks: a reviewer blocker under an enforcing review
+        // gate, or an unmet criterion under an enforcing criteria gate. (An
+        // unanswered criterion on top is left for the review of the revised
+        // work to answer.) The tree when there is one: the fingerprint then
+        // follows file content. The artifact list is the fallback when
+        // nothing is bound.
         const revision = await reviseAfterBlock(
           run,
           box,
           issue,
           attempt,
-          verdict,
+          judged,
           summary,
           tree ?? artifactDigest(author.artifacts),
         );
@@ -4409,6 +4868,37 @@ export function registerCoordinator(
         author = revision;
         checkRecordedFor = undefined;
         continue; // check and re-review the revised implementation
+      }
+      if (unanswered.length > 0) {
+        // No blocker, and criteria nobody answered: not a pass. Ask the
+        // review again, naming them. Shares the review-retry bound, so it
+        // never counts against `maxRevisions` and cannot spin.
+        const ids = criteriaIds(unanswered);
+        reviewRetries += 1;
+        await recordLeaseEvent(
+          run.cwd,
+          "review-rejected",
+          run.lease.issueId,
+          {
+            workflowRunId: run.workflowRunId,
+            executionId: completion.executionId,
+            executorId: reviewer.executorId,
+            reason: `criteria unanswered: ${ids}`,
+            retry: reviewRetries,
+          },
+          run.actor.bdActor,
+        );
+        if (reviewRetries > MAX_REVIEW_RETRIES) {
+          await escalateRun(
+            run,
+            "judging",
+            `criteria unanswered after ${reviewRetries} reviews: ${ids}; set gates.criteria-evidence to observe to close without the answers`,
+            { [WORKGRAPH_LAST_VERDICT_KEY]: summary },
+          );
+          return;
+        }
+        reviewFeedback = `Your previous verdict did not answer these acceptance criteria: ${ids}. A criterion counts as answered only as met with evidence, or as unmet with what is missing.`;
+        continue; // bounded review retry
       }
 
       // ---- gate passed (clean, advisory findings, or observe mode) ----

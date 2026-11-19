@@ -301,13 +301,20 @@ export type LeaseEvent =
   /** The issue or the configuration no longer matches the frozen bar. Names
    *  the fields that differ. The run keeps the frozen bar; the change
    *  applies to the next claim. */
-  | "bar-changed";
+  | "bar-changed"
+  /** Judgment: the second look at a reviewer's blocking findings could not
+   *  be obtained (rejected, not accepted or not finished in time, a failed
+   *  or non-independent completion, an invalid answer). The blockers stand. */
+  | "recheck-failed";
 
 // ---------------------------------------------------------------------------
-// Verdict shapes (phase 3). A reviewer completion carries a `verdict` field
+// Verdict shapes. A reviewer completion carries a `verdict` field
 // (protocol-v1 schemas are non-strict, so the extra field rides RunCompleted
 // untouched); `src/verdict.ts` validates it against these schemas before the
-// judgment gate acts on it.
+// judgment gate acts on it. A verdict is two lists: `findings`, what the
+// reviewer objects to, and `criteria`, one answer per numbered acceptance
+// criterion (`src/criteria.ts`). An empty `findings` list is not a pass by
+// itself: the `criteria-evidence` gate reads the answers.
 // ---------------------------------------------------------------------------
 
 export const Finding = Type.Object({
@@ -319,19 +326,63 @@ export const Finding = Type.Object({
   note: Type.Optional(Type.String()),
   evidence: Type.Optional(Type.String()),
   /**
+   * The file and 1-based line the finding points at. A reviewer's blocking
+   * finding needs one that exists in the reviewed tree (here, or as the
+   * first `path:line` in `evidence`); without it the core downgrades the
+   * finding to advisory (`checkCitations` in `src/verdict.ts`).
+   */
+  citation: Type.Optional(
+    Type.Object({ path: Type.String(), line: Type.Integer({ minimum: 1 }) }),
+  ),
+  /**
    * Who wrote the finding. `code` marks a finding the core produced itself
    * (a failed check). Never taken from a reviewer: `parseVerdict` removes
    * the field from every reported finding, so a reviewer cannot claim it.
+   * `reviewer` is set by the core too, on a finding it builds from a
+   * reviewer's `unmet` criterion answer.
    */
   author: Type.Optional(StringEnum(["reviewer", "code"])),
 });
 export type FindingT = Static<typeof Finding>;
 
+/** A reviewer's answer to one numbered acceptance criterion. */
+export const CriterionAnswer = Type.Object({
+  /** The criterion's id: `C1`, `C2`, ... */
+  id: Type.String(),
+  /** `met` counts only with non-empty `evidence`. */
+  status: StringEnum(["met", "unmet", "unanswered"]),
+  /** `met`: what proves it. `unmet`: what is missing. */
+  evidence: Type.Optional(Type.String()),
+});
+export type CriterionAnswerT = Static<typeof CriterionAnswer>;
+
 export const Verdict = Type.Object({
   findings: Type.Array(Finding),
+  /** Optional in the schema so a verdict without it still parses; a
+   *  criterion with no answer is `unanswered`, never a pass. */
+  criteria: Type.Optional(Type.Array(CriterionAnswer)),
   summary: Type.Optional(Type.String()),
 });
 export type VerdictT = Static<typeof Verdict>;
+
+/**
+ * The answer to a blocker recheck: the reviewer executor's second look at
+ * the blocking findings of its own verdict, numbered as the request listed
+ * them. Rides a reviewer completion as an extra `recheck` field, the way
+ * the verdict rides as `verdict`.
+ */
+export const BlockerRecheck = Type.Object({
+  answers: Type.Array(
+    Type.Object({
+      /** The blocker's number in the request. */
+      n: Type.Integer({ minimum: 1 }),
+      /** `keep`: it stands. `downgrade`: it becomes advisory. */
+      decision: StringEnum(["keep", "downgrade"]),
+      reason: Type.String(),
+    }),
+  ),
+});
+export type BlockerRecheckT = Static<typeof BlockerRecheck>;
 
 // ---------------------------------------------------------------------------
 // Plan shapes (planner role). Same TRANSPORT trick as the verdict: a planner
@@ -451,7 +502,10 @@ export const SplitParams = Type.Object({
         }),
       ),
       acceptanceCriteria: Type.Optional(
-        Type.String({ description: "Acceptance criteria for the child issue" }),
+        Type.String({
+          description:
+            "Acceptance criteria for the child issue, one criterion per line",
+        }),
       ),
       riskTier: Type.Optional(
         StringEnum(["low", "medium", "high"], {
@@ -486,7 +540,8 @@ export const ApproveParams = Type.Object({
   }),
   acceptanceCriteria: Type.Optional(
     Type.String({
-      description: "Acceptance criteria recorded on the issue",
+      description:
+        "Acceptance criteria recorded on the issue, one criterion per line (each line is numbered, and the reviewer must answer every one with evidence)",
     }),
   ),
   riskTier: Type.Optional(
@@ -561,7 +616,10 @@ export const CreateParams = Type.Object({
     Type.String({ description: "task (default), bug, feature, chore, ..." }),
   ),
   acceptanceCriteria: Type.Optional(
-    Type.String({ description: "What the judgment gate checks the result against" }),
+    Type.String({
+      description:
+        "What the judgment gate checks the result against, one criterion per line (each line is numbered, and the reviewer must answer every one with evidence)",
+    }),
   ),
   riskTier: Type.Optional(
     StringEnum(["low", "medium", "high"], {

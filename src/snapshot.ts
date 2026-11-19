@@ -32,9 +32,15 @@
  */
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 
 /** A working tree captured as an anchored commit. */
 export interface Snapshot {
@@ -265,7 +271,9 @@ export function changedFiles(
 
 /**
  * The content of `file` at `tree`, byte for byte. Undefined when the tree
- * has no such file, the file is larger than 16 MiB, or git fails.
+ * has no such file (a directory is not a file), the file is larger than
+ * 16 MiB, or git fails. `file` is a path from the tree's root, as
+ * {@link pathInTree} returns it.
  */
 export function fileAt(
   path: string,
@@ -274,8 +282,10 @@ export function fileAt(
 ): string | undefined {
   try {
     assertWorkspacePath(path);
-    // Not through the trimming helper: trimming would change the content.
-    return execFileSync("git", ["show", `${tree}:${file}`], {
+    // `cat-file blob`, not `show`: `show` prints a listing for a directory,
+    // and a directory must read as "no such file". Not through the trimming
+    // helper either: trimming would change the content.
+    return execFileSync("git", ["cat-file", "blob", `${tree}:${file}`], {
       cwd: path,
       encoding: "utf8",
       timeout: GIT_TIMEOUT_MS,
@@ -286,6 +296,44 @@ export function fileAt(
   } catch {
     return undefined;
   }
+}
+
+function realOr(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
+}
+
+/**
+ * A path as someone cited it, as a path from the root of the workspace's
+ * tree: a leading `./` is dropped, and an absolute path inside `workspace`
+ * is made relative to it (`/var/...` and `/private/var/...` name one
+ * directory on macOS, so both spellings are tried). Undefined when the path
+ * is empty, is the workspace itself, or points outside it.
+ */
+export function pathInTree(workspace: string, cited: string): string | undefined {
+  const raw = cited.trim();
+  if (raw === "") return undefined;
+  let inside: string | undefined = raw;
+  if (isAbsolute(raw)) {
+    inside = undefined;
+    for (const root of [workspace, realOr(workspace)]) {
+      for (const target of [raw, realOr(raw)]) {
+        const candidate = relative(root, target);
+        if (candidate !== "" && !candidate.startsWith("..") && !isAbsolute(candidate)) {
+          inside ??= candidate;
+        }
+      }
+    }
+    if (inside === undefined) return undefined;
+  }
+  const normal = normalize(inside);
+  if (normal === "." || normal.startsWith("..") || isAbsolute(normal)) {
+    return undefined;
+  }
+  return normal.split(sep).join("/");
 }
 
 /** One ref path component git accepts, whatever the input was. */

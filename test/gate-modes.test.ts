@@ -96,11 +96,36 @@ const REV_PROV = { harness: "fake", model: "rev-model", provider: "prov-rev" };
 
 const CLEAN_VERDICT: VerdictT = { findings: [] };
 
+/** The file every blocking fixture cites. The implementer writes it. */
+const CITED_FILE = "thing.ts";
+
+/** An implementer `onRequest` that leaves {@link CITED_FILE} in the result tree. */
+function writesCitedFile(repo: ScratchRepo): () => void {
+  return () => writeFileSync(join(repo.dir, CITED_FILE), "export const thing = 1;\n");
+}
+
+/**
+ * One blocking finding the core lets stand: it cites a line that exists in
+ * the reviewed tree. A blocker that cited nothing would be downgraded to
+ * advisory before the review gate ever saw it.
+ */
 function blockingVerdict(criterion: string): VerdictT {
   return {
-    findings: [{ criterion, severity: "blocking", note: "does not hold" }],
+    findings: [
+      {
+        criterion,
+        severity: "blocking",
+        note: "does not hold",
+        citation: { path: CITED_FILE, line: 1 },
+      },
+    ],
   };
 }
+
+/** The reviewer's answer to the recheck every blocking verdict gets: it keeps its one blocker. */
+const KEEP_BLOCKER = {
+  answers: [{ n: 1, decision: "keep", reason: "line 1 still does it" }],
+};
 
 const MODES: readonly GateModeT[] = ["off", "observe", "enforce"];
 const RESULTS: readonly GateResult[] = [
@@ -718,14 +743,26 @@ describe("proof record trail", () => {
 // ---------------------------------------------------------------------------
 
 describe("the review gate", () => {
-  /** An implementer and a reviewer that returns one blocking finding. */
+  /**
+   * An implementer and a reviewer that returns one blocking finding, and
+   * keeps it when asked to look again. One reviewer script serves both
+   * requests: the review reads `verdict`, the recheck reads `recheck`.
+   */
   function blockingReview(mock: MockPi, graph: ScratchRepo) {
     return installFakeExecutor(mock.events, {
       workspace: isolatedIn(graph),
       roles: ["implementer", "reviewer"],
       roleScripts: {
-        implementer: { provenance: IMPL_PROV, artifacts: ["src/thing.ts"] },
-        reviewer: { provenance: REV_PROV, verdict: blockingVerdict("criterion-x") },
+        implementer: {
+          provenance: IMPL_PROV,
+          artifacts: [CITED_FILE],
+          onRequest: writesCitedFile(graph),
+        },
+        reviewer: {
+          provenance: REV_PROV,
+          verdict: blockingVerdict("criterion-x"),
+          recheck: KEEP_BLOCKER,
+        },
       },
     });
   }
@@ -787,7 +824,10 @@ describe("the review gate", () => {
       // the gate does with it, not what was found.
       expect(String(metadata[WORKGRAPH_LAST_VERDICT_KEY])).toMatch(/^reject blocking=1/);
       expect(await verdictCount(graph.dir, id)).toBe(1);
-      expect(fake.requests.filter((r) => r.role === "reviewer")).toHaveLength(1);
+      // One review, then the one recheck its blocker gets: the blocker is
+      // checked the same way whether or not the gate will act on it.
+      const reviews = fake.requests.filter((r) => r.role === "reviewer");
+      expect(reviews.map((r) => "recheck" in r)).toEqual([false, true]);
 
       const records = await reviewRecords(graph.dir, id);
       expect(records).toHaveLength(1);
@@ -915,8 +955,9 @@ describe("the review gate", () => {
       expect(graph.showIssue(low).status).toBe("closed");
       expect(metadataOf(graph, low)[WORKGRAPH_PHASE_KEY]).toBe("accepted");
 
+      // The review and its recheck, both for the high issue.
       const reviewed = fake.requests.filter((r) => r.role === "reviewer").map((r) => r.issue.id);
-      expect(reviewed).toEqual([high]);
+      expect(reviewed).toEqual([high, high]);
       expect((await reviewRecords(graph.dir, high)).map((r) => [r.mode, r.blocked])).toEqual([
         ["enforce", true],
       ]);
@@ -965,10 +1006,13 @@ describe("the review gate", () => {
       workspace: isolatedIn(graph),
       roles: ["implementer", "reviewer", "revision"],
       roleScripts: {
-        implementer: { provenance: IMPL_PROV },
+        implementer: { provenance: IMPL_PROV, onRequest: writesCitedFile(graph) },
         revision: { provenance: IMPL_PROV, artifacts: ["src/fixed.ts"] },
+        // In request order: the review, the recheck of its blocker, then
+        // the review of the revised work.
         reviewer: [
           { provenance: REV_PROV, verdict: blockingVerdict("criterion-x") },
+          { provenance: REV_PROV, recheck: KEEP_BLOCKER },
           { provenance: REV_PROV, verdict: CLEAN_VERDICT },
         ],
       },
@@ -1048,8 +1092,12 @@ describe("gate report", () => {
       workspace: isolatedIn(graph),
       roles: ["implementer", "reviewer"],
       roleScripts: {
-        implementer: { provenance: IMPL_PROV },
-        reviewer: { provenance: REV_PROV, verdict: blockingVerdict("criterion-x") },
+        implementer: { provenance: IMPL_PROV, onRequest: writesCitedFile(graph) },
+        reviewer: {
+          provenance: REV_PROV,
+          verdict: blockingVerdict("criterion-x"),
+          recheck: KEEP_BLOCKER,
+        },
       },
     });
     const ectx = makeEventContext(graph.dir);
@@ -1064,7 +1112,8 @@ describe("gate report", () => {
         "tree-binding: 0 blocked, 0 would block",
         // The fixture's check (`true`) ran once per issue and passed.
         "check: 0 blocked, 0 would block",
-        "criteria-evidence: no records",
+        // Evaluated for both, and it applies to neither: no criteria.
+        "criteria-evidence: 0 blocked, 0 would block",
         "weakened-tests: no records",
         "unproven-tests: no records",
         "scope: no records",
@@ -1093,8 +1142,12 @@ describe("gate report", () => {
       workspace: isolatedIn(graph),
       roles: ["implementer", "reviewer"],
       roleScripts: {
-        implementer: { provenance: IMPL_PROV },
-        reviewer: { provenance: REV_PROV, verdict: blockingVerdict("criterion-x") },
+        implementer: { provenance: IMPL_PROV, onRequest: writesCitedFile(graph) },
+        reviewer: {
+          provenance: REV_PROV,
+          verdict: blockingVerdict("criterion-x"),
+          recheck: KEEP_BLOCKER,
+        },
       },
     });
     const ectx = makeEventContext(graph.dir);

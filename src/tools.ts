@@ -98,6 +98,7 @@ import {
   type TierConfig,
 } from "./tiers.ts";
 import type { WorkIssue, WorkflowClassT } from "./types.ts";
+import { latestVerdictRecord, reviewContextOf } from "./verdict.ts";
 import {
   AnswerDecisionParams,
   ApproveParams,
@@ -784,7 +785,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     label: "Work status",
     description:
       "Show one issue's full workgraph state: lifecycle phase, acceptance criteria, the check command or its waiver, risk tier, " +
-      "workflow run, attempt, last verdict, the gate modes that apply and each gate's latest result, " +
+      "workflow run, attempt, last verdict and the context its review ran in, the gate modes that apply and each gate's latest result, " +
       "executor, and the lease (holder, epoch, expiry).",
     promptSnippet: "Show a work-graph issue's lifecycle and lease state",
     promptGuidelines: [
@@ -859,6 +860,14 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
       }
       const verdict = lastVerdictOf(issue);
       if (verdict) lines.push(`Last verdict: ${verdict}`);
+      // The context the latest recorded review ran in, as its executor
+      // reported it (`fresh`: launched with no memory of the implementation).
+      // Read from the verdict record: the summary above is metadata and
+      // carries no provenance.
+      const reviewContext = reviewContextOf(
+        await latestVerdictRecord(ctx.cwd, params.id),
+      );
+      if (reviewContext) lines.push(`Review context: ${reviewContext}`);
       // The gate modes in force for this issue's tier (a missing or unknown
       // tier resolves to medium, as it does for the gate itself), then what
       // each gate last found. Kept below the plan block: readers of a parked
@@ -894,6 +903,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
         workflowRunId: runId ?? null,
         attempt: attemptOf(issue) ?? null,
         lastVerdict: verdict ?? null,
+        reviewContext: reviewContext ?? null,
         check: effectiveCheck.spec?.command ?? null,
         checkWaiver: effectiveCheck.waiver ?? null,
         gates: policy.gates,

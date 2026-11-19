@@ -94,6 +94,16 @@ function blockingVerdict(criterion: string): VerdictT {
   };
 }
 
+/**
+ * The reviewer's answer to the recheck every blocking verdict gets: it keeps
+ * its one blocker. (These suites run with tree binding off, so no citation
+ * is checked; the recheck is asked for either way.) A recheck is a reviewer
+ * request, so it takes the next entry of a reviewer array.
+ */
+const KEEP_BLOCKER = {
+  answers: [{ n: 1, decision: "keep", reason: "it still does not hold" }],
+};
+
 function advisoryVerdict(criterion: string): VerdictT {
   return {
     findings: [{ criterion, severity: "advisory", note: "could be tighter" }],
@@ -554,10 +564,12 @@ describe("judgment gate flows", () => {
       roleScripts: {
         implementer: { provenance: IMPL_PROV },
         revision: { provenance: IMPL_PROV }, // artifacts stay [] — same digest
-        // A single script repeats: byte-identical blocking verdict each round.
+        // A single script repeats: byte-identical blocking verdict each
+        // round, kept on each recheck.
         reviewer: {
           provenance: REV_PROV,
           verdict: blockingVerdict("criterion-x"),
+          recheck: KEEP_BLOCKER,
         },
       },
     });
@@ -597,8 +609,10 @@ describe("judgment gate flows", () => {
       roleScripts: {
         implementer: { provenance: IMPL_PROV },
         revision: { provenance: IMPL_PROV, artifacts: ["src/fixed.ts"] },
+        // The review, the recheck of its blocker, the second review.
         reviewer: [
           { provenance: REV_PROV, verdict: blockingVerdict("criterion-x") },
+          { provenance: REV_PROV, recheck: KEEP_BLOCKER },
           { provenance: REV_PROV, verdict: CLEAN_VERDICT },
         ],
       },
@@ -649,7 +663,9 @@ describe("judgment gate flows", () => {
         // revision BOUND (not the fingerprint) is what escalates.
         reviewer: [
           { provenance: REV_PROV, verdict: blockingVerdict("criterion-a") },
+          { provenance: REV_PROV, recheck: KEEP_BLOCKER },
           { provenance: REV_PROV, verdict: blockingVerdict("criterion-b") },
+          { provenance: REV_PROV, recheck: KEEP_BLOCKER },
         ],
       },
     });
@@ -1026,6 +1042,7 @@ describe("executor failure diagnostics", () => {
         reviewer: {
           provenance: REV_PROV,
           verdict: blockingVerdict("compatibility"),
+          recheck: KEEP_BLOCKER,
         },
         revision: {
           outcome: "blocked",
@@ -1037,8 +1054,10 @@ describe("executor failure diagnostics", () => {
     try {
       await settle(mock, ectx.ctx);
       await mock.flushEvents();
+      // The review, the recheck of its blocker, then the revision.
       expect(fake.requests.map((r) => r.role)).toEqual([
         "implementer",
+        "reviewer",
         "reviewer",
         "revision",
       ]);

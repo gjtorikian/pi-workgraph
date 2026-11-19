@@ -660,7 +660,12 @@ describe("the check gate, default config", () => {
         tree,
         check: "passed",
         checkLogSha256: receipt!.log.sha256,
-        gates: { "tree-binding": "pass", check: "pass", review: "pass" },
+        gates: {
+          "tree-binding": "pass",
+          check: "pass",
+          "criteria-evidence": "not-applicable",
+          review: "pass",
+        },
       });
       expect(lines(marks.file("runs"))).toHaveLength(1);
       expect(heldLeases(repo.dir)).toHaveLength(0);
@@ -1050,7 +1055,11 @@ describe("the check gate, other modes and edges", () => {
       expect(await listReceipts(repo.dir, id)).toEqual([]);
       const stamp = await latestStamp(repo.dir, id);
       expect(stamp).not.toHaveProperty("check");
-      expect(stamp!.gates).toEqual({ "tree-binding": "pass", review: "pass" });
+      expect(stamp!.gates).toEqual({
+        "tree-binding": "pass",
+        "criteria-evidence": "not-applicable",
+        review: "pass",
+      });
     } finally {
       fake.uninstall();
       await coordinator.teardown(ectx.ctx);
@@ -1253,7 +1262,11 @@ describe("the check gate, other modes and edges", () => {
       const stamp = await latestStamp(repo.dir, waived);
       expect(stamp).toMatchObject({ check: "waived" });
       expect(stamp).not.toHaveProperty("tree");
-      expect(stamp!.gates).toEqual({ check: "not-applicable", review: "pass" });
+      expect(stamp!.gates).toEqual({
+        check: "not-applicable",
+        "criteria-evidence": "not-applicable",
+        review: "pass",
+      });
     } finally {
       fake.uninstall();
       await coordinator.teardown(ectx.ctx);

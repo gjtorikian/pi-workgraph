@@ -84,10 +84,23 @@ const IMPL_PROV = { harness: "fake", model: "impl-model", provider: "prov-impl" 
 const REV_PROV = { harness: "fake", model: "rev-model", provider: "prov-rev" };
 
 const CLEAN_VERDICT: VerdictT = { findings: [] };
+/**
+ * A blocker the core lets stand: it cites a line of the file the implementer
+ * writes, so the citation resolves in the result tree, and the reviewer
+ * keeps it on the second look ({@link KEEP_BLOCKER}).
+ */
 const BLOCKING_VERDICT: VerdictT = {
   findings: [
-    { criterion: "criterion-x", severity: "blocking", note: "does not hold" },
+    {
+      criterion: "criterion-x",
+      severity: "blocking",
+      note: "does not hold",
+      citation: { path: "feature.txt", line: 1 },
+    },
   ],
+};
+const KEEP_BLOCKER = {
+  answers: [{ n: 1, decision: "keep", reason: "line 1 still does it" }],
 };
 
 const SHA = /^[0-9a-f]{40}$/;
@@ -533,8 +546,9 @@ describe("the tree-binding gate", () => {
       });
 
       // The stamp: one, naming the same tree, its base, the anchored commit,
-      // the verdict it rests on, the three evaluated gates and the check
-      // receipt's log.
+      // the verdict it rests on, the four evaluated gates and the check
+      // receipt's log. The issue has no acceptance criteria, so the
+      // criteria gate does not apply.
       expect(await payloads(repo.dir, id, STAMP_MARKER)).toHaveLength(1);
       const stamp = await latestStamp(repo.dir, id);
       expect(stamp).toEqual({
@@ -547,18 +561,24 @@ describe("the tree-binding gate", () => {
           executionId: fake.completions[1]!.executionId,
           summary: "pass blocking=0 advisory=0",
         },
-        gates: { "tree-binding": "pass", check: "pass", review: "pass" },
+        gates: {
+          "tree-binding": "pass",
+          check: "pass",
+          "criteria-evidence": "not-applicable",
+          review: "pass",
+        },
         check: "passed",
         checkLogSha256: receipts[0]!.log.sha256,
       });
       expect(repo.git("rev-parse", `${stamp!.commit}^{tree}`)).toBe(tree);
 
-      // All three gate records carry the tree, and the check ran before the
+      // Every gate record carries the tree, and the check ran before the
       // reviewer was asked.
       const records = await listGateRecords(repo.dir, id);
       expect(records.map((r) => [r.gate, r.result, r.blocked, r.tree])).toEqual([
         ["tree-binding", "pass", false, tree],
         ["check", "pass", false, tree],
+        ["criteria-evidence", "not-applicable", false, tree],
         ["review", "pass", false, tree],
       ]);
       // The check's log is not in the tree it checked, or in the checkout's
@@ -695,6 +715,7 @@ describe("the tree-binding gate", () => {
       expect(stamp!.gates).toEqual({
         "tree-binding": "unknown",
         check: "not-applicable",
+        "criteria-evidence": "not-applicable",
         review: "pass",
       });
       expect(stamp!.check).toBe("waived");
@@ -838,6 +859,7 @@ describe("the tree-binding gate", () => {
       }
       expect(await latestStamp(repo.dir, id)).toBeUndefined();
       expect((await listGateRecords(repo.dir, id)).map((r) => r.gate)).toEqual([
+        "criteria-evidence",
         "review",
       ]);
       expect(repo.git("for-each-ref", "refs/workgraph")).toBe("");
@@ -1409,7 +1431,13 @@ describe("the failure fingerprint follows the tree", () => {
           artifacts: ["feature.txt"],
           onRequest: () => write(repo, "feature.txt", "v1\n"),
         },
-        reviewer: { provenance: REV_PROV, verdict: BLOCKING_VERDICT },
+        // One script for both reviewer requests of a round: the review
+        // reads `verdict`, the recheck that follows reads `recheck`.
+        reviewer: {
+          provenance: REV_PROV,
+          verdict: BLOCKING_VERDICT,
+          recheck: KEEP_BLOCKER,
+        },
         revision: {
           provenance: IMPL_PROV,
           artifacts: ["feature.txt"],

@@ -205,8 +205,10 @@ export const RunRequest = Type.Object({
    */
   plan: Type.Optional(Type.String()),
   /**
-   * Human feedback from a rejected plan, attached to the NEXT planner run of
-   * the same issue (planner role only). Optional and v1-safe.
+   * What the previous run of this role left undone, for the NEXT run to
+   * address. Planner: the human's feedback on a rejected plan. Reviewer:
+   * the acceptance criteria its last verdict left unanswered. Optional and
+   * v1-safe.
    */
   feedback: Type.Optional(Type.String()),
   /**
@@ -301,6 +303,14 @@ export const RunCompleted = Type.Object({
     profile: Type.Optional(Type.String()),
     model: Type.Optional(Type.String()),
     provider: Type.Optional(Type.String()),
+    /**
+     * The context the run was launched in, as the adapter knows it: `fresh`
+     * for a run that started with no memory of earlier runs of the issue.
+     * Recorded on a review's verdict record; no policy reads it. Optional
+     * and v1-safe, but VALIDATED when present: a `context` that is not a
+     * string fails the whole message.
+     */
+    context: Type.Optional(Type.String()),
   }),
   /**
    * Where the work is. An implementer reports the directory it wrote in, so

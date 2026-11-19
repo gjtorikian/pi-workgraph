@@ -1097,6 +1097,10 @@ describe("graceful shutdown", () => {
               },
             ],
           },
+          // Kept on the recheck, so the revision below is requested.
+          recheck: {
+            answers: [{ n: 1, decision: "keep", reason: "still does not hold" }],
+          },
         },
         // The revision is accepted, then stalls: an ISOLATED revision
         // execution is in flight when teardown arrives.

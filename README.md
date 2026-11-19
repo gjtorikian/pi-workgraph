@@ -134,6 +134,11 @@ Choose workflow depth at creation (or approval) time:
 > create "..." as planned, risk high, with acceptance criteria "..."
 ```
 
+Write acceptance criteria **one per line**. Each line becomes a numbered
+criterion (`C1`, `C2`, ...) that the reviewer has to answer by id, with
+evidence, before the issue can close; see
+[Criteria and blockers](#criteria-and-blockers).
+
 `workflowClass` and `riskTier` are separate axes. Workflow class selects
 the execution topology; risk controls judgment strictness. Because a
 one-shot skips independent judgment, a medium/high-risk one-shot request is
@@ -428,7 +433,7 @@ assignee writes are how leases get corrupted.
 | `workgraph_answer_decision` | Answer the question a run parked for a human; re-approve, and every later run of the issue carries the answer |
 | `workgraph_tiers`           | Set or show per-role model tiers for this repository (a role → model table, or clear)                         |
 | `workgraph_override`        | Explicit human override: force-close or force-release, bypassing guards — always audited                      |
-| `workgraph_status`          | One issue's full control-plane state: phase, plan, lease, attempt, verdict, gate modes and results, criteria, check |
+| `workgraph_status`          | One issue's full control-plane state: phase, plan, lease, attempt, verdict and its review context, gate modes and results, criteria, check |
 | `workgraph_gates`           | Per gate, the issues it blocked, would have blocked, and was waived for; `id` narrows the report to one issue |
 
 The in-session executor adds `workgraph_submit_plan`, valid only during a
@@ -470,18 +475,18 @@ of seven gates a mode, per risk tier.
 
 | Gate                | Passes when                                                                           |
 | ------------------- | ------------------------------------------------------------------------------------- |
-| `review`            | The reviewer's verdict has no blocking findings                                       |
+| `review`            | No blocking finding of the reviewer's is left after the citation check and the recheck |
 | `tree-binding`      | The work has a base tree and a result tree, and the verdict and the close name the result |
 | `check`             | The check command, run by the coordinator itself, exited 0 on the result tree         |
-| `criteria-evidence` | The verdict answers every acceptance criterion, with evidence for each one marked met |
+| `criteria-evidence` | The verdict answers every numbered acceptance criterion as met, with evidence         |
 | `weakened-tests`    | The change deletes no tests and skips none                                            |
 | `unproven-tests`    | Every new test fails without the change                                               |
 | `scope`             | The change stays inside the approved plan's path targets                              |
 
-`review`, `tree-binding` and `check` are evaluated in this release. The
-other four are already part of the policy, so a policy written today keeps
-working as each gate gains its evaluation. Until then they record nothing,
-whatever their mode.
+`review`, `tree-binding`, `check` and `criteria-evidence` are evaluated in
+this release. The other three are already part of the policy, so a policy
+written today keeps working as each gate gains its evaluation. Until then
+they record nothing, whatever their mode.
 
 Each gate has one of three modes:
 
@@ -516,6 +521,8 @@ medium and high).
 
 With `review` set to `off`, no reviewer is asked and reviewed work closes
 on the implementer's reported success alone; a reported failure escalates.
+`criteria-evidence` is not evaluated either, whatever its mode: it reads a
+verdict's answers, and there is no verdict.
 `workgraph_status` shows `review=off` on every issue the mode applies to.
 
 **An invalid policy stops dispatch.** An unknown tier, key, gate, or mode
@@ -553,7 +560,8 @@ each gate's latest result on it.
 **The verdict record has no mode.** If a reviewer's verdict cannot be
 written to the issue, the run escalates with the write failure as the
 reason. It does not close under `observe` either. The same holds for the
-close stamp described below.
+close stamp described below, and for a recheck record that takes a
+blocking finding away ([Criteria and blockers](#criteria-and-blockers)).
 
 ### Tree binding
 
@@ -609,11 +617,13 @@ With trees in hand:
 2. After each review, the workspace is snapshotted again. If it no longer
    matches the tree that was reviewed, the verdict is discarded
    (`review-rejected`, reason `workspace changed during review`) and the
-   tree that is there now is reviewed instead.
+   tree that is there now is reviewed instead. The same comparison follows
+   a blocker recheck (`workspace changed during the blocker recheck`).
 3. Before the close, the workspace is compared once more. A change sends
    the new tree back through the check and the review.
-4. Steps 2 and 3 share one bound with unparseable verdicts: after two
-   retries the issue escalates.
+4. Steps 2 and 3 share one bound with unparseable verdicts and verdicts
+   that leave a criterion unanswered: after two retries the issue
+   escalates.
 5. The failure fingerprint uses the result tree, so identical findings on
    changed content count as a new failure, not a repeat.
 
@@ -791,6 +801,141 @@ again on that tree. If it fails under `enforce`, the issue escalates from
 of closing. Finalization has already run by then, and its recorded status
 is left as it is: whatever it published is yours to follow up.
 
+### Criteria and blockers
+
+A verdict used to be a list of complaints, and an empty list was a pass. A
+reviewer that looked at nothing passed everything. Two rules close that,
+one in each direction: a pass has to be positive, and a blocker has to be
+backed by the code.
+
+**The verdict.** A reviewer reports structured output of this shape:
+
+```json
+{
+  "findings": [
+    {
+      "criterion": "retries back off",
+      "severity": "blocking",
+      "note": "the delay is constant",
+      "citation": { "path": "src/retry.ts", "line": 41 }
+    }
+  ],
+  "criteria": [
+    { "id": "C1", "status": "unmet", "evidence": "the delay never grows" },
+    { "id": "C2", "status": "met", "evidence": "src/retry.ts:12 caps at five" }
+  ]
+}
+```
+
+`findings` is what the reviewer objects to; `severity` is `blocking` or
+`advisory`. `criteria` is one answer per numbered acceptance criterion:
+`met`, `unmet` or `unanswered`, with `evidence`.
+
+**Numbered criteria.** The acceptance criteria stay one string on the
+issue. The coordinator splits the string [frozen at claim](#the-frozen-bar)
+into one criterion per non-blank line and numbers them `C1`, `C2`, ... in
+order. A leading bullet (`-`, `*`, `+`), list number (`1.`, `1)`) or
+checkbox (`[ ]`, `[x]`) is dropped. Text with no line break is one
+criterion. Past 30 lines the rest is folded into `C30`. The review request
+carries the list as `criteria`, and the reviewer answers by id. A
+multi-line paragraph becomes one criterion per line, so write one
+criterion per line.
+
+**The `criteria-evidence` gate** reads those answers after the verdict is
+recorded:
+
+| The answers                                                          | Result           | Under `enforce`                                         |
+| -------------------------------------------------------------------- | ---------------- | ------------------------------------------------------- |
+| The issue has no criteria                                            | `not-applicable` | Nothing                                                 |
+| Every criterion `met`, each with non-empty evidence                  | `pass`           | Nothing                                                 |
+| Any criterion `unmet`                                                | `violation`      | Each becomes a blocking finding and the work is revised |
+| Otherwise: a criterion missing, `unanswered`, or `met` with no evidence | `unknown`     | The review is asked again, then the issue escalates     |
+
+- A verdict with only `findings` still parses. Its criteria are simply
+  unanswered, which is `unknown`, never a pass.
+- An `unmet` criterion becomes a finding whose `criterion` is the
+  criterion's text and whose `note` is the reviewer's evidence. It needs no
+  citation, and it blocks even when the `review` gate only observes.
+- For `unknown`, the next review request carries `feedback` naming the
+  unanswered ids. The retry shares the bound of two with unparseable
+  verdicts and never counts against `maxRevisions`. After that the issue
+  escalates with `criteria unanswered after 3 reviews: C2, C3`. A reviewer
+  profile that ignores the schema ends here every time; set
+  `gates.criteria-evidence` to `observe` to close without the answers.
+- If the same verdict also has a reviewer blocker that stands, the work is
+  revised first, and the review of the revised work answers the criteria.
+- Two answers for one id: the worse one counts. An answer for an id that
+  does not exist is ignored.
+- Evidence is checked for being there, not for being true. `looks fine`
+  passes this gate. The answers are kept on the verdict record, where a
+  human can read what the close rested on.
+- Under `observe`, `violation` and `unknown` are recorded with their
+  would-block and the review counts as it did before. Under `off` the
+  reviewer is not sent the list and nothing is counted.
+
+With the gate evaluated on an issue that has criteria, the verdict summary
+counts them: `pass blocking=0 advisory=0 criteria=2/2`. The label follows
+the blocking findings alone, so `pass ... criteria=1/2` is a verdict with
+no blocker and an unanswered criterion.
+
+**A reviewer's blocker is checked before it counts.** A blocking finding
+costs an implementer run and another review, so the coordinator checks it
+twice first. Both steps can only take a blocker away, neither has a gate
+mode, and neither touches a finding the core wrote itself (a
+[failed check](#the-check), `author: "code"`).
+
+1. **The citation check.** The finding must point at a file and line that
+   exist in the reviewed tree: its `citation`, or else the first
+   `path:line` in its `evidence`. One that does not becomes `advisory`,
+   with `[Downgraded: citation does not resolve in the reviewed tree]`
+   appended to its note. It is kept, not dropped. A reviewer whose
+   complaint is that something is missing cites the nearest existing line,
+   or answers the criterion `unmet`. With no result tree (tree binding
+   `off`, or no git repository) this step is skipped and blockers stand.
+2. **The recheck.** If any reviewer blocker is left, the same reviewer
+   executor gets one follow-up run: role `reviewer`, the same workspace
+   and trees, the numbered blockers as `recheck`, and the answer back as
+   `recheck` on its completion:
+
+   ```json
+   { "answers": [{ "n": 1, "decision": "keep", "reason": "line 41 still sleeps a constant" }] }
+   ```
+
+   `downgrade` turns blocker `n` into `advisory` with `[Not a blocker on a
+   second look: <reason>]` appended. `keep`, or no answer for `n`, leaves
+   it. Through the bridge this is a second launch of the reviewer profile
+   with no memory of the review, so the task carries each blocker's text
+   and citation.
+
+The recheck fails safe. A request that is rejected or not accepted in
+time, a run that does not finish within ten minutes, a failed completion,
+a question, an answer that does not match the schema, and an answer from a
+run that is not [independent](#gates) of the author all leave every
+blocker standing and record a `recheck-failed` audit event. A verdict with
+no reviewer blocker left costs no recheck. One that has any costs one
+extra reviewer run per review.
+
+Only then is the `review` gate computed, from the reviewer's blockers that
+remain. The verdict summary, the failure fingerprint and the findings a
+revision receives all use that processed verdict.
+
+**Two records per round.** The `workgraph-verdict verdict {json}` comment
+is the reviewer's first reply as reported, with its criterion answers. If
+the citation check downgraded anything or a recheck was requested, a
+second comment, `workgraph-verdict recheck {json}`, records the outcome:
+the findings as they stand, the number of citation downgrades, and the
+recheck's answers or the reason it failed. A record that carries a
+downgrade is as durable as the verdict: if it cannot be written the issue
+escalates instead of closing on it.
+
+**The review's context.** A completion's provenance may carry `context`:
+what the run was launched with. The bridge launches every run `fresh`,
+with no memory of the implementation, and reports that. The verdict record
+keeps it under `reviewerProvenance`, and `workgraph_status` prints `Review
+context: fresh` under the last verdict. It is recorded, not enforced: no
+policy rejects a review for its context, and like the rest of provenance
+it is the executor's own report.
+
 ### The frozen bar
 
 Pi settings are read from a file inside the checkout on every lookup, and
@@ -862,8 +1007,8 @@ further away.
 - **Status bar** — current claim, lifecycle phase, executor, and lease
   countdown in the footer, TUI only; headless sessions never touch the UI.
 - **Audit trail** — every lease transition is recorded as an issue comment,
-  every plan as a `workgraph-plan` comment, and every verdict as a
-  `workgraph-verdict` comment. See [Audit events](#5-audit-events) below.
+  every plan as a `workgraph-plan` comment, and every verdict (and what a
+  blocker recheck made of it) as a `workgraph-verdict` comment. See [Audit events](#5-audit-events) below.
 
 Every tool declares sequential execution so lease reads and writes from one
 session never interleave; cross-process concurrency is the store's locking,
@@ -1050,6 +1195,8 @@ parked for a human), `plan-approved`, `plan-rejected`,
 the recorded result tree and was snapshotted again), `bar-frozen` (the bar
 a run is judged against, captured at claim), `bar-changed` (the issue or
 the settings no longer match it; the run keeps the frozen bar),
+`recheck-failed` (a second look at a reviewer's blocking findings could
+not be obtained, with the reason; the blockers stand),
 `escalated`, and `judgment-closed`. A `run-completed` event for an implementation or a
 revision carries `workspacePath` and, when a snapshot was taken, its
 `tree`; a restarted coordinator rebuilds the run from it.
@@ -1058,8 +1205,11 @@ without the trail, and a broken audit surface must not take claiming down
 with it.
 
 Two more trails ride the same comments under their own prefixes.
-`workgraph-verdict` holds each reviewer verdict, and is the one write
-judgment waits on: a verdict that cannot be recorded escalates the run.
+`workgraph-verdict` holds each reviewer verdict as it was reported, and
+after it a `recheck` record when the blocker checks changed or questioned
+it (see [Criteria and blockers](#criteria-and-blockers)). The verdict is a
+write judgment waits on: one that cannot be recorded escalates the run,
+and so does a recheck record that takes a blocker away.
 `workgraph-proof` holds each gate result (see [Gates](#gates)), which like
 the audit trail never blocks, and two records that do: the check receipt
 (see [The check](#the-check)) and the close stamp (see
@@ -1136,12 +1286,14 @@ implementing --oneshot success--> verifying --> accepted --> closed
 implementing --oneshot failure/blocked--> ready (promoted to reviewed)
 implementing --implementation completed--> judging
 implementing --failed/blocked--> revising | escalated
-judging --review gate blocks (enforce, blocking findings)--> revising
-judging --review gate passes (no blocking findings, or observe)--> verifying
+judging --review gate blocks (enforce, a reviewer blocker left after the citation check and the recheck)--> revising
+judging --criteria-evidence gate blocks (enforce, an unmet criterion)--> revising
+judging --criteria-evidence gate blocks (enforce, a criterion unanswered)--> judging (reviewed again, then escalated)
+judging --both gates pass (or observe)--> verifying
 judging --review gate off (no review requested)--> verifying
 judging --verdict record could not be written--> escalated
 judging --tree-binding gate blocks (enforce, no base or result tree)--> escalated
-judging --workspace changed during review or after the verdict--> judging (new result tree, reviewed again)
+judging --workspace changed during review, during the blocker recheck, or after the verdict--> judging (new result tree, reviewed again)
 verifying --close stamp could not be written--> escalated
 revising --new execution accepted--> revising
 revising --implementation completed--> judging
@@ -1331,7 +1483,12 @@ Bridge semantics:
   structured output.
 - **Reported provenance.** Completions carry the model upstream _reported
   using_, never the one requested; the provider is split off only when the
-  `provider/id` format is unambiguous.
+  `provider/id` format is unambiguous. They also carry `context`, the
+  context the run was launched with: always `fresh`.
+- **A recheck is a second launch.** A reviewer request that carries
+  `recheck` gets a task listing the numbered blockers instead of the
+  review instructions, and its structured output rides the completion as
+  `recheck`, never as a verdict.
 - **A plan critic judges a plan, never an implementation.** `plan_critic`
   runs launch the upstream `reviewer` profile by default (upstream ships no
   plan-critic profile), in the source checkout like the planner. The task

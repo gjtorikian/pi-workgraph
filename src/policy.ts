@@ -8,13 +8,16 @@
  * GATES. A policy names seven gates and gives each a mode per risk tier:
  * `off` (not evaluated, nothing recorded), `observe` (evaluated and
  * recorded, never blocks) or `enforce` (evaluated, recorded, and blocks).
- * Three have an evaluation today: `review` (the reviewer's blocking
- * findings), `tree-binding` (the work is bound to a base tree and a result
- * tree, `src/snapshot.ts`) and `check` (the core ran the check command
- * against the result tree, `src/check.ts`). The other four are declared,
- * defaulted and validated here so that a later release only adds an
- * evaluation, never a config surface. What a gate result means, and when
- * it blocks, lives in `src/proof.ts`.
+ * Four have an evaluation today: `review` (the reviewer's blocking findings
+ * that survive the citation check and the recheck, `src/verdict.ts`),
+ * `tree-binding` (the work is bound to a base tree and a result tree,
+ * `src/snapshot.ts`), `check` (the core ran the check command against the
+ * result tree, `src/check.ts`) and `criteria-evidence` (the verdict answers
+ * every numbered acceptance criterion as met, with evidence,
+ * `src/criteria.ts`). The other three are declared, defaulted and validated
+ * here so that a later release only adds an evaluation, never a config
+ * surface. What a gate result means, and when it blocks, lives in
+ * `src/proof.ts`.
  *
  * The remaining knobs are deliberately trimmed to what a criterion exercises
  * (decision log): author independence, max revisions, and escalation

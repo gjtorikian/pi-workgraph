@@ -59,6 +59,15 @@ export interface RoleScript {
    *  plan_critic transport). Presence, not truthiness, decides: `null` and
    *  malformed values are sent as-is so tests can drive the invalid paths. */
   critique?: unknown;
+  /**
+   * Attached verbatim as the completion's extra `recheck` field (the answer
+   * to a blocker recheck, which arrives as a `reviewer` request carrying
+   * `recheck`). A recheck request takes the NEXT entry of a reviewer array
+   * like any other reviewer request, so a sequence scripts it in order
+   * (`[{ verdict }, { recheck }]`); a single non-array script may carry both
+   * fields, since the review reads one and the recheck the other.
+   */
+  recheck?: unknown;
   finalization?: unknown;
   provenance?: RunCompletedT["provenance"];
   artifacts?: string[];
@@ -135,6 +144,7 @@ export interface CompleteOverrides {
   leaseEpoch?: number;
   outcome?: RunOutcomeT;
   verdict?: unknown;
+  recheck?: unknown;
   plan?: unknown;
   finalization?: unknown;
   provenance?: RunCompletedT["provenance"];
@@ -196,6 +206,7 @@ export function installFakeExecutor(
     script: RoleScript = {},
   ): RunCompletedT {
     const verdict = overrides.verdict ?? script.verdict;
+    const recheck = overrides.recheck ?? script.recheck;
     const plan = overrides.plan ?? script.plan;
     const finalization = overrides.finalization ?? script.finalization;
     const critique = script.critique;
@@ -223,8 +234,10 @@ export function installFakeExecutor(
       provenance: overrides.provenance ??
         script.provenance ??
         opts.provenance ?? { harness: "fake" },
-      // Extra v1-tolerated fields — the verdict, plan, and critique transports.
+      // Extra v1-tolerated fields — the verdict, recheck, plan, and critique
+      // transports.
       ...(verdict !== undefined ? { verdict } : {}),
+      ...(recheck !== undefined ? { recheck } : {}),
       ...(plan !== undefined ? { plan } : {}),
       ...(critique !== undefined ? { critique } : {}),
       ...(finalization !== undefined ? { finalization } : {}),

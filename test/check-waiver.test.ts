@@ -70,6 +70,14 @@ const IMPL_PROV = { harness: "fake", model: "impl-model", provider: "prov-impl" 
 const REV_PROV = { harness: "fake", model: "rev-model", provider: "prov-rev" };
 
 const CLEAN_VERDICT: VerdictT = { findings: [] };
+/**
+ * A clean verdict for an issue with ONE acceptance criterion: no findings is
+ * not a pass by itself, so the reviewer also answers C1, with evidence.
+ */
+const ANSWERED_VERDICT: VerdictT = {
+  findings: [],
+  criteria: [{ id: "C1", status: "met", evidence: "the check receipt" }],
+};
 
 const refusal = (tier: string): string =>
   `${tier}-risk work needs a check command (check: "npm test") or an explicit waiver (checkWaiver: "<why no check applies>").`;
@@ -769,6 +777,7 @@ describe("waived and unapproved work at the gate", () => {
       expect(stamp!.gates).toEqual({
         "tree-binding": "pass",
         check: "not-applicable",
+        "criteria-evidence": "not-applicable",
         review: "pass",
       });
       const record = (await listGateRecords(repo.dir, waived)).find((r) => r.gate === "check")!;
@@ -976,10 +985,11 @@ describe("the frozen bar", () => {
       workspace: isolatedIn(repo),
       roleScripts: {
         implementer: { behavior: "accept-stall", provenance: IMPL_PROV },
-        // Two review rounds: an unparseable verdict, then a clean one.
+        // Two review rounds: an unparseable verdict, then a clean one that
+        // answers the frozen criterion.
         reviewer: [
           { provenance: REV_PROV, verdict: "not a verdict" },
-          { provenance: REV_PROV, verdict: CLEAN_VERDICT },
+          { provenance: REV_PROV, verdict: ANSWERED_VERDICT },
         ],
       },
     });
@@ -1007,6 +1017,10 @@ describe("the frozen bar", () => {
       for (const review of reviews) {
         expect(review.issue.acceptanceCriteria).toBe("the strict criteria");
         expect(review.issue.riskTier).toBe("medium");
+        // The numbered criteria are the frozen ones too.
+        expect((review as typeof review & { criteria?: unknown }).criteria).toEqual([
+          { id: "C1", text: "the strict criteria" },
+        ]);
       }
       // Two rounds of the loop, one record of the change.
       const changed = await audits(repo.dir, id, "bar-changed");
@@ -1136,7 +1150,9 @@ describe("the frozen bar", () => {
     const fakeB = installFakeExecutor(second.mock.events, {
       executorId: "reviewer-exec",
       roles: ["reviewer"],
-      roleScripts: { reviewer: { provenance: REV_PROV, verdict: CLEAN_VERDICT } },
+      // The bar frozen at re-adoption carries the rewritten criterion, and
+      // the verdict answers it.
+      roleScripts: { reviewer: { provenance: REV_PROV, verdict: ANSWERED_VERDICT } },
     });
     const ectx2 = makeEventContext(repo.dir);
     try {

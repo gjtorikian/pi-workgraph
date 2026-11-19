@@ -246,6 +246,10 @@ interface BridgedRun {
   issueId: string;
   leaseEpoch: number;
   role: ExecutorRoleT;
+  /** A reviewer run asked to recheck blockers, not to review: its
+   *  structured output is a recheck answer and rides the completion as
+   *  `recheck`, never as `verdict`. */
+  recheck: boolean;
   /** messageId of the `run:request` (inReplyTo on accepted/rejected). */
   requestMessageId: string;
   /** Accepted by our queue or by upstream's started event. */
@@ -309,10 +313,96 @@ export function splitProvider(model: string): string | undefined {
   return /\s/.test(provider) ? undefined : provider;
 }
 
+/** One numbered acceptance criterion, as a review request lists it. */
+interface RequestedCriterion {
+  id: string;
+  text: string;
+}
+
+/** One numbered blocker, as a recheck request lists it. */
+interface RequestedBlocker {
+  n: number;
+  criterion: string;
+  note?: string;
+  citation?: { path: string; line: number };
+}
+
+/**
+ * The tolerated extra fields a reviewer request may carry. They are not in
+ * the `RunRequest` schema, so they arrive unvalidated: each reader below
+ * checks the shape itself and reads a wrong one as absent.
+ */
+type ReviewRequest = RunRequestT & {
+  artifacts?: unknown;
+  criteria?: unknown;
+  recheck?: unknown;
+};
+
+/** The request's numbered criteria; empty when it has none or the shape is wrong. */
+function requestedCriteria(msg: ReviewRequest): RequestedCriterion[] {
+  const raw = msg.criteria;
+  if (!Array.isArray(raw)) return [];
+  const criteria: RequestedCriterion[] = [];
+  for (const item of raw as unknown[]) {
+    if (item === null || typeof item !== "object") return [];
+    const { id, text } = item as { id?: unknown; text?: unknown };
+    if (typeof id !== "string" || typeof text !== "string") return [];
+    criteria.push({ id, text });
+  }
+  return criteria;
+}
+
+/**
+ * The blockers a reviewer request asks to have rechecked, or undefined when
+ * the request is an ordinary review (no `recheck`, an empty list, or a shape
+ * that is not one). Decides both the task text and where the run's
+ * structured output goes.
+ */
+function requestedRecheck(
+  msg: ReviewRequest,
+): RequestedBlocker[] | undefined {
+  if (msg.role !== "reviewer") return undefined;
+  const raw = msg.recheck;
+  if (raw === null || typeof raw !== "object") return undefined;
+  const list = (raw as { blockers?: unknown }).blockers;
+  if (!Array.isArray(list) || list.length === 0) return undefined;
+  const blockers: RequestedBlocker[] = [];
+  for (const item of list as unknown[]) {
+    if (item === null || typeof item !== "object") return undefined;
+    const { n, criterion, note, citation } = item as {
+      n?: unknown;
+      criterion?: unknown;
+      note?: unknown;
+      citation?: unknown;
+    };
+    if (
+      typeof n !== "number" ||
+      !Number.isInteger(n) ||
+      n < 1 ||
+      typeof criterion !== "string"
+    ) {
+      return undefined;
+    }
+    const cited =
+      citation !== null && typeof citation === "object"
+        ? (citation as { path?: unknown; line?: unknown })
+        : undefined;
+    blockers.push({
+      n,
+      criterion,
+      ...(typeof note === "string" ? { note } : {}),
+      ...(cited !== undefined &&
+      typeof cited.path === "string" &&
+      typeof cited.line === "number"
+        ? { citation: { path: cited.path, line: cited.line } }
+        : {}),
+    });
+  }
+  return blockers;
+}
+
 /** The task prompt an upstream agent receives for a bridged run. */
-export function buildSubagentTask(
-  msg: RunRequestT & { artifacts?: string[] },
-): string {
+export function buildSubagentTask(msg: ReviewRequest): string {
   const lines = [
     `[workgraph ${msg.role}] Issue ${msg.issue.id}: "${msg.issue.title}" (workflow run ${msg.workflowRunId}, attempt ${msg.attempt}).`,
   ];
@@ -334,7 +424,33 @@ export function buildSubagentTask(
   if (msg.decision) lines.push("", ...renderDecision(msg.decision));
   if (msg.instructions)
     lines.push("", "Workflow instructions:", msg.instructions);
-  if (msg.role === "reviewer") {
+  const recheck = requestedRecheck(msg);
+  if (msg.role === "reviewer" && recheck !== undefined) {
+    // A recheck is a new launch that remembers nothing of the review, so
+    // the task carries each blocker's text and citation, and the same tree
+    // sentence a review gets.
+    lines.push(
+      "",
+      "You are an INDEPENDENT reviewer taking a second look. An earlier review of this implementation reported the blocking findings below, and each one sends the work back for a revision. Do not review anything else.",
+    );
+    const { path, baseTree, tree } = msg.workspace;
+    if (path && baseTree && tree) {
+      lines.push(
+        `The change under review is "git diff ${baseTree} ${tree}" in ${path}. Do not modify any file.`,
+      );
+    }
+    lines.push(
+      "Blocking findings to recheck:",
+      ...recheck.map(
+        (b) =>
+          `${b.n}. ${b.criterion}${b.note ? ` — ${b.note}` : ""}${
+            b.citation ? ` (cited: ${b.citation.path}:${b.citation.line})` : ""
+          }`,
+      ),
+      "For each numbered blocker reply keep with the lines that prove it, or downgrade with why it does not hold.",
+      'Report your answers as structured output matching the provided schema: one entry per blocker in "answers", with its number as "n", "decision" ("keep" or "downgrade") and "reason".',
+    );
+  } else if (msg.role === "reviewer") {
     lines.push(
       "",
       "You are an INDEPENDENT reviewer: evaluate the implementation against the acceptance criteria and report your verdict as structured output matching the provided schema.",
@@ -346,12 +462,33 @@ export function buildSubagentTask(
     if (path && baseTree && tree) {
       lines.push(
         `The change under review is "git diff ${baseTree} ${tree}" in ${path}. Do not modify any file.`,
+        // Beside the tree sentence, and only with it: the core checks a
+        // citation against that tree, so without one it checks nothing.
+        'Give every blocking finding a "citation": the path and line in that tree that show the problem. A blocking finding whose citation does not exist there is downgraded to advisory. If the problem is something missing, cite the nearest existing line.',
       );
     }
     if (Array.isArray(msg.artifacts) && msg.artifacts.length > 0) {
       lines.push(
         "Artifacts under review:",
-        ...msg.artifacts.map((a) => `- ${a}`),
+        ...(msg.artifacts as unknown[]).map((a) => `- ${String(a)}`),
+      );
+    }
+    // Only when the request numbers the criteria (the `criteria-evidence`
+    // gate is evaluated and the issue has some): a request without the
+    // list keeps the task text it always had.
+    const criteria = requestedCriteria(msg);
+    if (criteria.length > 0) {
+      lines.push(
+        "Acceptance criteria by id:",
+        ...criteria.map((c) => `- ${c.id}: ${c.text}`),
+        'Answer every criterion by id in "criteria": met with evidence (a file path and line, or the check receipt), unmet with what is missing, or unanswered if you could not determine it.',
+      );
+    }
+    if (msg.feedback) {
+      lines.push(
+        "",
+        "Your previous verdict for this result was not accepted — address this:",
+        msg.feedback,
       );
     }
   }
@@ -644,13 +781,19 @@ export function registerPiSubagentsExecutor(
         : undefined;
     const provider = model !== undefined ? splitProvider(model) : undefined;
     // The verdict rides ONLY a reviewer run's structured output (non-strict
-    // schemas tolerate the extra field — the phase-3 transport). Missing or
-    // malformed structured output is emitted as-is: the coordinator's
-    // verdict-invalid path is the handler; the bridge never synthesizes.
-    const verdict =
+    // schemas tolerate the extra field). Missing or malformed structured
+    // output is emitted as-is: the coordinator's verdict-invalid path is
+    // the handler; the bridge never synthesizes. A reviewer run that was
+    // asked to RECHECK blockers answers with a recheck, not a verdict, and
+    // its output rides as `recheck` under the same rule: sent as `verdict`
+    // it would read as an invalid answer and no blocker could ever be
+    // downgraded, with nothing failing.
+    const reviewed =
       run.role === "reviewer" && first?.structuredOutput !== undefined
         ? first.structuredOutput
         : undefined;
+    const verdict = run.recheck ? undefined : reviewed;
+    const recheck = run.recheck ? reviewed : undefined;
     const plan =
       run.role === "planner" && first?.structuredOutput !== undefined
         ? first.structuredOutput
@@ -664,6 +807,7 @@ export function registerPiSubagentsExecutor(
         : undefined;
     const completed: RunCompletedT & {
       verdict?: unknown;
+      recheck?: unknown;
       plan?: unknown;
       critique?: unknown;
       finalization?: unknown;
@@ -692,8 +836,14 @@ export function registerPiSubagentsExecutor(
         harness: "pi-subagents",
         ...(model !== undefined ? { model } : {}),
         ...(provider !== undefined ? { provider } : {}),
+        // What the launch was actually given, read back from its own
+        // parameters so the report cannot drift from the launch.
+        ...(typeof run.params.context === "string"
+          ? { context: run.params.context }
+          : {}),
       },
       ...(verdict !== undefined ? { verdict } : {}),
+      ...(recheck !== undefined ? { recheck } : {}),
       ...(plan !== undefined ? { plan } : {}),
       ...(critique !== undefined ? { critique } : {}),
       ...(run.role === "finalizer"
@@ -844,6 +994,7 @@ export function registerPiSubagentsExecutor(
         issueId: msg.issue.id,
         leaseEpoch: msg.leaseEpoch,
         role: msg.role,
+        recheck: requestedRecheck(msg) !== undefined,
         requestMessageId: msg.messageId,
         accepted: false,
         submitted: false,
@@ -856,9 +1007,7 @@ export function registerPiSubagentsExecutor(
           // default background mode returns a launch receipt immediately.
           async: false,
           foregroundOnly: true,
-          task: buildSubagentTask(
-            msg as RunRequestT & { artifacts?: string[] },
-          ),
+          task: buildSubagentTask(msg),
           // Workgraph owns this checkout. Modern upstream runtimes reject
           // the legacy worktree option even when its value is false.
           ...(workspace
