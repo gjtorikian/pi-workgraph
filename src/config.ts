@@ -15,7 +15,10 @@ import {
   settingsStore,
   settingsSubagentsExecutor,
 } from "./settings.ts";
-import { parseTiersValue, type TierConfig } from "./tiers.ts";
+import { parseTiersValue, THINKING_LEVELS, type TierConfig } from "./tiers.ts";
+
+/** A Pi thinking level, or `off` for no reasoning. */
+export type CompactionReasoningLevel = (typeof THINKING_LEVELS)[number];
 
 export type SubagentsRoleRoutes = Partial<
   Record<
@@ -146,6 +149,13 @@ export interface WorkgraphConfig {
    * session start; see src/tiers.ts.
    */
   tiers?: TierConfig;
+  /**
+   * Opt-in: the reasoning level for the compaction takeover's summary call.
+   * Unset (the default) keeps the session's own thinking level. Reasoning
+   * tokens share the summary's output budget, so lowering this keeps a
+   * high-reasoning session from hitting `maxTokens` mid-summary.
+   */
+  compactionReasoningLevel?: CompactionReasoningLevel;
 }
 
 export const DEFAULT_LEASE_TTL_MS = 300_000;
@@ -238,6 +248,11 @@ const FLAGS = [
     name: "workgraph-tiers",
     description:
       'Role → model routing for executors (headless override of Pi settings), JSON like {"planner":"anthropic/claude-opus-*","implementer":{"model":"anthropic/claude-sonnet-*","thinking":"low"}} (env WORKGRAPH_TIERS)',
+  },
+  {
+    name: "workgraph-compaction-reasoning-level",
+    description:
+      "Optional reasoning level for the compaction summary: off, minimal, low, medium, high, xhigh, or max (env WORKGRAPH_COMPACTION_REASONING_LEVEL)",
   },
 ] as const;
 
@@ -341,6 +356,25 @@ function subagentsValue(
     );
     return undefined;
   }
+}
+
+function compactionReasoningValue(
+  pi: ExtensionAPI,
+  flag: string,
+  envVar: string,
+): CompactionReasoningLevel | undefined {
+  const raw = stringValue(pi, flag, envVar);
+  if (raw === undefined) return undefined;
+  const lowered = raw.toLowerCase();
+  const level = THINKING_LEVELS.find((candidate) => candidate === lowered);
+  if (level === undefined) {
+    // An unknown value never guesses a level: compaction keeps the
+    // session's own thinking level, exactly as if the option were unset.
+    console.error(
+      `[pi-workgraph] ignoring ${flag}/${envVar} value "${raw}": must be one of ${THINKING_LEVELS.join(", ")}`,
+    );
+  }
+  return level;
 }
 
 function parseSubagentsRoutes(
@@ -546,6 +580,11 @@ export function resolveConfig(pi: ExtensionAPI): WorkgraphConfig {
     tiers: tiersValue(pi),
     executorByRole: executorsValue(pi),
     store: stringValue(pi, "workgraph-store", "WORKGRAPH_STORE") ?? settingsStore(),
+    compactionReasoningLevel: compactionReasoningValue(
+      pi,
+      "workgraph-compaction-reasoning-level",
+      "WORKGRAPH_COMPACTION_REASONING_LEVEL",
+    ),
   };
 }
 

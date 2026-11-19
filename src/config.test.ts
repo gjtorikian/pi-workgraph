@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveConfig } from "./config.ts";
 import { noteSessionCwd } from "./settings.ts";
 import { asExtensionAPI, makeMockPi } from "../test/helpers/mock-pi.ts";
@@ -176,5 +176,67 @@ describe("planCritique resolution", () => {
     expect(result).toBe("off");
     expect(logged.length).toBeGreaterThan(0);
     for (const line of logged) expect(line).toContain('planCritique must be "off" or "high-risk", got "banana"');
+  });
+});
+
+describe("compaction reasoning level config", () => {
+  const FLAG = "workgraph-compaction-reasoning-level";
+  const ENV = "WORKGRAPH_COMPACTION_REASONING_LEVEL";
+  let previousEnv: string | undefined;
+
+  beforeEach(() => {
+    previousEnv = process.env[ENV];
+    delete process.env[ENV];
+  });
+
+  afterEach(() => {
+    if (previousEnv === undefined) delete process.env[ENV];
+    else process.env[ENV] = previousEnv;
+    vi.restoreAllMocks();
+  });
+
+  it("is unset by default", () => {
+    const mock = makeMockPi();
+
+    expect(
+      resolveConfig(asExtensionAPI(mock)).compactionReasoningLevel,
+    ).toBeUndefined();
+  });
+
+  it("parses the flag case-insensitively", () => {
+    const mock = makeMockPi();
+    mock.setFlag(FLAG, " Low ");
+
+    expect(resolveConfig(asExtensionAPI(mock)).compactionReasoningLevel).toBe(
+      "low",
+    );
+  });
+
+  it("falls back to the environment variable, and the flag wins over it", () => {
+    const mock = makeMockPi();
+    process.env[ENV] = "off";
+
+    expect(resolveConfig(asExtensionAPI(mock)).compactionReasoningLevel).toBe(
+      "off",
+    );
+
+    mock.setFlag(FLAG, "minimal");
+
+    expect(resolveConfig(asExtensionAPI(mock)).compactionReasoningLevel).toBe(
+      "minimal",
+    );
+  });
+
+  it("ignores an unknown level and says so", () => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    const mock = makeMockPi();
+    mock.setFlag(FLAG, "hgih");
+
+    expect(
+      resolveConfig(asExtensionAPI(mock)).compactionReasoningLevel,
+    ).toBeUndefined();
+    expect(logged.mock.calls.map((args) => args.join(" "))).toEqual([
+      expect.stringContaining(`${FLAG}/${ENV} value "hgih"`),
+    ]);
   });
 });
