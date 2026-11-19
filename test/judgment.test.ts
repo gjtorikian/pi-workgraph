@@ -65,7 +65,11 @@ import {
   makeToolContext,
   type MockPi,
 } from "./helpers/mock-pi.ts";
-import { makeScratchGraph, type ScratchGraph } from "./helpers/scratch.ts";
+import {
+  makeScratchGraph,
+  makeScratchRepo,
+  type ScratchGraph,
+} from "./helpers/scratch.ts";
 
 const WORKER = "judgment-test-worker";
 
@@ -862,7 +866,8 @@ describe("executor failure diagnostics", () => {
       getConfig: () => config,
       probeVersion: () => "0.34.8",
     });
-    const graph = makeScratchGraph({ prefix: "serial", seed: 2 });
+    // A git repository: the bridge cuts a worktree for every implementer.
+    const graph = makeScratchRepo({ prefix: "serial", seed: 2 });
     for (const id of graph.seededIds) approve(graph, id);
     const fake = installFakeSubagents(mock.events, {
       singleForeground: true,

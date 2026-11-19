@@ -173,12 +173,24 @@ export const RunRequest = Type.Object({
   /** Caller-supplied instructions for this role, separate from issue content. */
   instructions: Type.Optional(Type.String()),
   workspace: Type.Object({
+    /** The commit the work started from; "" when the core recorded none. */
     baseRevision: Type.String(),
     requiresIsolation: Type.Boolean(),
     /** Source checkout; an adapter can retain one worktree for this workflow. */
     repoPath: Type.Optional(Type.String()),
     /** Retained workspace from a previous run of this issue (human follow-up). */
     sourceWorkflowRunId: Type.Optional(Type.String({ minLength: 1 })),
+    /**
+     * Where the implementer's work lives, as its completion reported it.
+     * Set on every request AFTER the implementation (reviewer, revision,
+     * finalizer): the role runs in this directory. Absent on planning-time
+     * and implementer requests.
+     */
+    path: Type.Optional(Type.String({ minLength: 1 })),
+    /** Tree the work started from; with `tree`, the change is `git diff <baseTree> <tree>`. */
+    baseTree: Type.Optional(Type.String({ minLength: 1 })),
+    /** Tree of the result under judgment. */
+    tree: Type.Optional(Type.String({ minLength: 1 })),
   }),
   outputSchema: Type.Optional(Type.Unknown()),
   /** Prior judgment findings — used from phase 3. */
@@ -290,6 +302,19 @@ export const RunCompleted = Type.Object({
     model: Type.Optional(Type.String()),
     provider: Type.Optional(Type.String()),
   }),
+  /**
+   * Where the work is. An implementer reports the directory it wrote in, so
+   * the core can snapshot it and send every later role there; an isolated
+   * executor adds the revision its workspace was cut from. Optional and
+   * v1-safe, but VALIDATED when present: a `workspace` without a non-empty
+   * string `path` fails the whole message.
+   */
+  workspace: Type.Optional(
+    Type.Object({
+      path: Type.String({ minLength: 1 }),
+      baseRevision: Type.Optional(Type.String()),
+    }),
+  ),
 });
 export type RunCompletedT = Static<typeof RunCompleted>;
 

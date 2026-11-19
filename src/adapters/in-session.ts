@@ -489,6 +489,11 @@ export function registerInSessionExecutor(
         ...base,
         outcome: "success",
         evidence: [sessionNote],
+        // The work happened in the session's own checkout: the core
+        // snapshots it there and sends every later role to it. No base
+        // revision: this executor is not isolated, so the core recorded the
+        // base itself, before the request.
+        ...(ctx.cwd ? { workspace: { path: ctx.cwd } } : {}),
       });
     }
     await restoreTier(run);

@@ -22,7 +22,8 @@
  *   comments <id> --json                        → JSON array
  *   dep add <id> --depends-on <id2>
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -93,6 +94,14 @@ export interface MakeScratchGraphOptions {
   seed?: number;
   /** Issue-id prefix (default "scratch"). */
   prefix?: string;
+}
+
+/** A scratch graph whose directory is also a git repository with one commit. */
+export interface ScratchRepo extends ScratchGraph {
+  /** SHA of the seed commit: what an isolated fake reports as its `baseRevision`. */
+  head: string;
+  /** Run git in the repository and return its trimmed stdout. */
+  git(...args: string[]): string;
 }
 
 /** Parse `--flag value` / `--flag` / repeated flags out of an argv tail. */
@@ -249,11 +258,54 @@ export function runOp(dir: string, args: string[]): string {
   }
 }
 
+/**
+ * A scratch graph inside a REAL git repository with one commit — what the
+ * tree-binding gate needs to snapshot anything. The repository is created
+ * before the workspace, so `.workgraph/` sits in it exactly as it does in a
+ * user's checkout (untracked, its database ignored by its own `.gitignore`).
+ * The seed commit is empty and carries a `-c` identity, so the helper works
+ * on a machine with no git identity and never touches global config.
+ */
+export function makeScratchRepo(opts: MakeScratchGraphOptions = {}): ScratchRepo {
+  // Resolved: git reports `/private/var/...` for a macOS temp dir, and a
+  // fake that echoes the repository path back must agree with it.
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "pi-workgraph-repo-")));
+  const git = (...args: string[]): string =>
+    execFileSync("git", args, {
+      cwd: dir,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+  try {
+    git("init", "-q");
+    git(
+      "-c",
+      "user.name=Test",
+      "-c",
+      "user.email=test@example.com",
+      "-c",
+      "commit.gpgsign=false",
+      "commit",
+      "--allow-empty",
+      "-qm",
+      "test: seed repository",
+    );
+    const head = git("rev-parse", "HEAD");
+    return { ...makeScratchGraph({ ...opts, dir }), head, git };
+  } catch (e) {
+    rmSync(dir, { recursive: true, force: true });
+    throw e;
+  }
+}
+
 export function makeScratchGraph(
-  opts: MakeScratchGraphOptions = {},
+  opts: MakeScratchGraphOptions & {
+    /** An existing directory to initialize in (default: a fresh temp dir). */
+    dir?: string;
+  } = {},
 ): ScratchGraph {
   const prefix = opts.prefix ?? "scratch";
-  const dir = mkdtempSync(join(tmpdir(), "pi-workgraph-"));
+  const dir = opts.dir ?? mkdtempSync(join(tmpdir(), "pi-workgraph-"));
   runOp(dir, ["init", "--prefix", prefix]);
 
   const op = (args: string[]): string => runOp(dir, args);

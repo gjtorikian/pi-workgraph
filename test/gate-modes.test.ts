@@ -8,9 +8,15 @@
  * This suite does NOT pin `PRE_PROOF_POLICY`. Its configs come from
  * `shippedConfig`, so a case with no `policy` runs on the defaults a user
  * gets, and a case that sets modes says so in the case. (The one place the
- * pin appears is the block that tests the pin itself.) Only `review` has an
- * evaluation today, so the other six gates are asserted as configuration
- * and as the decision table, not as behavior.
+ * pin appears is the block that tests the pin itself.) `review` is the gate
+ * whose behavior this suite covers; `tree-binding` has its own suite
+ * (test/proof-binding.test.ts), and the other five are asserted as
+ * configuration and as the decision table, not as behavior.
+ *
+ * Because the defaults enforce `tree-binding` at medium and high, every case
+ * that drives the coordinator runs in a real git repository
+ * (`makeScratchRepo`) with a fake that reports its workspace, and reads the
+ * review gate's records through `reviewRecords`.
  *
  * Timer discipline is the repo's: no fake timers, huge scheduling intervals,
  * tiny REAL protocol timeouts, ticks driven through `agent_settled`, and
@@ -77,7 +83,9 @@ import {
 import {
   failCommentWrites,
   makeScratchGraph,
+  makeScratchRepo,
   type ScratchGraph,
+  type ScratchRepo,
 } from "./helpers/scratch.ts";
 
 const WORKER = "gate-modes-worker";
@@ -170,6 +178,24 @@ async function commentCount(dir: string, id: string, marker: string): Promise<nu
 
 const verdictCount = (dir: string, id: string) =>
   commentCount(dir, id, "workgraph-verdict verdict ");
+
+/**
+ * What an isolated fake reports: its work is in the repository, cut from
+ * HEAD. With it the `tree-binding` gate (enforced by default at medium and
+ * high) passes, so a case about the review gate is about the review gate.
+ */
+function isolatedIn(repo: ScratchRepo) {
+  return { path: repo.dir, baseRevision: repo.head };
+}
+
+/**
+ * The `review` gate's records. The coordinator cases below run on a
+ * git-backed scratch, where the `tree-binding` gate records ahead of every
+ * review; its own behavior is covered in test/proof-binding.test.ts.
+ */
+async function reviewRecords(dir: string, issueId?: string) {
+  return (await listGateRecords(dir, issueId)).filter((r) => r.gate === "review");
+}
 
 async function toolText(
   mock: MockPi,
@@ -689,8 +715,9 @@ describe("proof record trail", () => {
 
 describe("the review gate", () => {
   /** An implementer and a reviewer that returns one blocking finding. */
-  function blockingReview(mock: MockPi) {
+  function blockingReview(mock: MockPi, graph: ScratchRepo) {
     return installFakeExecutor(mock.events, {
+      workspace: isolatedIn(graph),
       roles: ["implementer", "reviewer"],
       roleScripts: {
         implementer: { provenance: IMPL_PROV, artifacts: ["src/thing.ts"] },
@@ -700,11 +727,11 @@ describe("the review gate", () => {
   }
 
   it("enforce: blocking findings send the issue to revising and record one blocked result", async () => {
-    const graph = makeScratchGraph({ prefix: "gmenf", seed: 1 });
+    const graph = makeScratchRepo({ prefix: "gmenf", seed: 1 });
     const id = graph.seededIds[0]!;
     approve(graph, id);
     const { mock, coordinator } = makeHarness({ medium: { gates: { review: "enforce" } } });
-    const fake = blockingReview(mock);
+    const fake = blockingReview(mock, graph);
     const ectx = makeEventContext(graph.dir);
     captureErrors(); // "no revision-capable executor" is expected noise
     try {
@@ -719,7 +746,7 @@ describe("the review gate", () => {
       expect(String(metadata[WORKGRAPH_LAST_VERDICT_KEY])).toMatch(/^reject blocking=1/);
       expect(await verdictCount(graph.dir, id)).toBe(1);
 
-      const records = await listGateRecords(graph.dir, id);
+      const records = await reviewRecords(graph.dir, id);
       expect(records).toHaveLength(1);
       expect(records[0]).toMatchObject({
         gate: "review",
@@ -740,11 +767,11 @@ describe("the review gate", () => {
   }, 60_000);
 
   it("observe: the same findings close the issue and record one would-block", async () => {
-    const graph = makeScratchGraph({ prefix: "gmobs", seed: 1 });
+    const graph = makeScratchRepo({ prefix: "gmobs", seed: 1 });
     const id = graph.seededIds[0]!;
     approve(graph, id);
     const { mock, coordinator } = makeHarness({ medium: { gates: { review: "observe" } } });
-    const fake = blockingReview(mock);
+    const fake = blockingReview(mock, graph);
     const ectx = makeEventContext(graph.dir);
     try {
       await drive(mock, ectx.ctx);
@@ -758,7 +785,7 @@ describe("the review gate", () => {
       expect(await verdictCount(graph.dir, id)).toBe(1);
       expect(fake.requests.filter((r) => r.role === "reviewer")).toHaveLength(1);
 
-      const records = await listGateRecords(graph.dir, id);
+      const records = await reviewRecords(graph.dir, id);
       expect(records).toHaveLength(1);
       expect(records[0]).toMatchObject({
         gate: "review",
@@ -777,11 +804,11 @@ describe("the review gate", () => {
   }, 60_000);
 
   it("off: the issue closes with no reviewer request, no verdict and no gate record", async () => {
-    const graph = makeScratchGraph({ prefix: "gmoff", seed: 1 });
+    const graph = makeScratchRepo({ prefix: "gmoff", seed: 1 });
     const id = graph.seededIds[0]!;
     approve(graph, id);
     const { mock, coordinator } = makeHarness({ medium: { gates: { review: "off" } } });
-    const fake = blockingReview(mock);
+    const fake = blockingReview(mock, graph);
     const ectx = makeEventContext(graph.dir);
     try {
       await drive(mock, ectx.ctx);
@@ -792,7 +819,7 @@ describe("the review gate", () => {
       expect(metadata[WORKGRAPH_LAST_VERDICT_KEY]).toBe("review off");
       expect(fake.requests.map((r) => r.role)).toEqual(["implementer"]);
       expect(await verdictCount(graph.dir, id)).toBe(0);
-      expect(await listGateRecords(graph.dir, id)).toEqual([]);
+      expect(await reviewRecords(graph.dir, id)).toEqual([]);
       // The close is still audited, attributed to the implementation.
       const comments = await listComments(graph.dir, id);
       const closed = comments.filter((c) => c.text.startsWith("workgraph-lease judgment-closed "));
@@ -811,11 +838,12 @@ describe("the review gate", () => {
   }, 60_000);
 
   it("off: an issue does not park in judging when nothing offers the reviewer role", async () => {
-    const graph = makeScratchGraph({ prefix: "gmoffnr", seed: 1 });
+    const graph = makeScratchRepo({ prefix: "gmoffnr", seed: 1 });
     const id = graph.seededIds[0]!;
     approve(graph, id);
     const { mock, coordinator } = makeHarness({ medium: { gates: { review: "off" } } });
     const fake = installFakeExecutor(mock.events, {
+      workspace: isolatedIn(graph),
       roles: ["implementer"],
       roleScripts: { implementer: { provenance: IMPL_PROV } },
     });
@@ -832,11 +860,12 @@ describe("the review gate", () => {
   }, 60_000);
 
   it("off accepts only a reported success: a reported failure escalates instead of closing", async () => {
-    const graph = makeScratchGraph({ prefix: "gmofffail", seed: 1 });
+    const graph = makeScratchRepo({ prefix: "gmofffail", seed: 1 });
     const id = graph.seededIds[0]!;
     approve(graph, id);
     const { mock, coordinator } = makeHarness({ medium: { gates: { review: "off" } } });
     const fake = installFakeExecutor(mock.events, {
+      workspace: isolatedIn(graph),
       roles: ["implementer", "reviewer"],
       roleScripts: {
         implementer: { provenance: IMPL_PROV, outcome: "failure", evidence: ["tests fail"] },
@@ -854,7 +883,7 @@ describe("the review gate", () => {
       const escalated = comments.filter((c) => c.text.startsWith("workgraph-lease escalated "));
       expect(escalated).toHaveLength(1);
       expect(escalated[0]!.text).toContain("the review gate is off");
-      expect(await listGateRecords(graph.dir, id)).toEqual([]);
+      expect(await reviewRecords(graph.dir, id)).toEqual([]);
     } finally {
       fake.uninstall();
       await coordinator.teardown(ectx.ctx);
@@ -863,7 +892,7 @@ describe("the review gate", () => {
   }, 60_000);
 
   it("a mode that differs by tier: high enforces while low is off, in one policy", async () => {
-    const graph = makeScratchGraph({ prefix: "gmtier", seed: 2 });
+    const graph = makeScratchRepo({ prefix: "gmtier", seed: 2 });
     const [high, low] = graph.seededIds as [string, string];
     approve(graph, high, "high");
     approve(graph, low, "low");
@@ -871,7 +900,7 @@ describe("the review gate", () => {
       high: { gates: { review: "enforce" } },
       low: { gates: { review: "off" } },
     });
-    const fake = blockingReview(mock);
+    const fake = blockingReview(mock, graph);
     const ectx = makeEventContext(graph.dir);
     captureErrors();
     try {
@@ -884,10 +913,10 @@ describe("the review gate", () => {
 
       const reviewed = fake.requests.filter((r) => r.role === "reviewer").map((r) => r.issue.id);
       expect(reviewed).toEqual([high]);
-      expect((await listGateRecords(graph.dir, high)).map((r) => [r.mode, r.blocked])).toEqual([
+      expect((await reviewRecords(graph.dir, high)).map((r) => [r.mode, r.blocked])).toEqual([
         ["enforce", true],
       ]);
-      expect(await listGateRecords(graph.dir, low)).toEqual([]);
+      expect(await reviewRecords(graph.dir, low)).toEqual([]);
     } finally {
       fake.uninstall();
       await coordinator.teardown(ectx.ctx);
@@ -896,12 +925,12 @@ describe("the review gate", () => {
   }, 60_000);
 
   it("with no gate configuration at all, a medium issue is blocked and a low issue would be", async () => {
-    const graph = makeScratchGraph({ prefix: "gmdef", seed: 2 });
+    const graph = makeScratchRepo({ prefix: "gmdef", seed: 2 });
     const [medium, low] = graph.seededIds as [string, string];
     approve(graph, medium, "medium");
     approve(graph, low, "low");
     const { mock, coordinator } = makeHarness(); // shipped defaults
-    const fake = blockingReview(mock);
+    const fake = blockingReview(mock, graph);
     const ectx = makeEventContext(graph.dir);
     captureErrors();
     try {
@@ -909,13 +938,13 @@ describe("the review gate", () => {
 
       expect(metadataOf(graph, medium)[WORKGRAPH_PHASE_KEY]).toBe("revising");
       expect(graph.showIssue(low).status).toBe("closed");
-      expect((await listGateRecords(graph.dir)).map((r) => [r.issueId, r.mode, r.blocked, r.wouldBlock])).toEqual(
+      expect((await reviewRecords(graph.dir)).map((r) => [r.issueId, r.mode, r.blocked, r.wouldBlock])).toEqual(
         expect.arrayContaining([
           [medium, "enforce", true, false],
           [low, "observe", false, true],
         ]),
       );
-      expect(await listGateRecords(graph.dir)).toHaveLength(2);
+      expect(await reviewRecords(graph.dir)).toHaveLength(2);
     } finally {
       fake.uninstall();
       await coordinator.teardown(ectx.ctx);
@@ -924,11 +953,12 @@ describe("the review gate", () => {
   }, 60_000);
 
   it("a revision loop leaves one record per review: a violation, then a pass", async () => {
-    const graph = makeScratchGraph({ prefix: "gmloop", seed: 1 });
+    const graph = makeScratchRepo({ prefix: "gmloop", seed: 1 });
     const id = graph.seededIds[0]!;
     approve(graph, id);
     const { mock, coordinator } = makeHarness();
     const fake = installFakeExecutor(mock.events, {
+      workspace: isolatedIn(graph),
       roles: ["implementer", "reviewer", "revision"],
       roleScripts: {
         implementer: { provenance: IMPL_PROV },
@@ -944,7 +974,7 @@ describe("the review gate", () => {
       await drive(mock, ectx.ctx);
 
       expect(graph.showIssue(id).status).toBe("closed");
-      const records = await listGateRecords(graph.dir, id);
+      const records = await reviewRecords(graph.dir, id);
       expect(records.map((r) => [r.result, r.blocked, r.attempt])).toEqual([
         ["violation", true, 1],
         ["pass", false, 2],
@@ -966,12 +996,16 @@ describe("the review gate", () => {
   }, 60_000);
 
   it("a failed gate-record write does not stop judgment", async () => {
-    const graph = makeScratchGraph({ prefix: "gmwf", seed: 1 });
+    const graph = makeScratchRepo({ prefix: "gmwf", seed: 1 });
     const id = graph.seededIds[0]!;
     approve(graph, id);
-    failCommentWrites(graph.dir, "workgraph-proof");
+    // Gate records only. The close stamp shares the `workgraph-proof` prefix
+    // and is NOT fire-and-forget: failing it would block the close, which
+    // is its own case in test/proof-binding.test.ts.
+    failCommentWrites(graph.dir, "workgraph-proof gate ");
     const { mock, coordinator } = makeHarness();
     const fake = installFakeExecutor(mock.events, {
+      workspace: isolatedIn(graph),
       roles: ["implementer", "reviewer"],
       roleScripts: {
         implementer: { provenance: IMPL_PROV },
@@ -985,7 +1019,7 @@ describe("the review gate", () => {
 
       expect(graph.showIssue(id).status).toBe("closed");
       expect(await verdictCount(graph.dir, id)).toBe(1);
-      expect(await listGateRecords(graph.dir, id)).toEqual([]);
+      expect(await reviewRecords(graph.dir, id)).toEqual([]);
       expect(logged().some((line) => line.includes("PROOF WRITE FAILED"))).toBe(true);
     } finally {
       fake.uninstall();
@@ -1001,12 +1035,13 @@ describe("the review gate", () => {
 
 describe("gate report", () => {
   it("lists, per gate, the issue it blocked under enforce and the issue it would have blocked under observe", async () => {
-    const graph = makeScratchGraph({ prefix: "gmrep", seed: 3 });
+    const graph = makeScratchRepo({ prefix: "gmrep", seed: 3 });
     const [high, low, untouched] = graph.seededIds as [string, string, string];
     approve(graph, high, "high"); // review enforces by default
     approve(graph, low, "low"); // review observes by default
     const { mock, coordinator } = makeHarness();
     const fake = installFakeExecutor(mock.events, {
+      workspace: isolatedIn(graph),
       roles: ["implementer", "reviewer"],
       roleScripts: {
         implementer: { provenance: IMPL_PROV },
@@ -1021,7 +1056,8 @@ describe("gate report", () => {
       const report = await toolText(mock, "workgraph_gates", {}, graph.dir);
       expect(report.split("\n")).toEqual([
         `review: 1 blocked (${high}), 1 would block (${low})`,
-        "tree-binding: no records",
+        // Evaluated for both issues, and passed for both.
+        "tree-binding: 0 blocked, 0 would block",
         "check: no records",
         "criteria-evidence: no records",
         "weakened-tests: no records",
@@ -1043,12 +1079,13 @@ describe("gate report", () => {
   }, 60_000);
 
   it("workgraph_status prints the gate modes for the issue's tier and each gate's latest result", async () => {
-    const graph = makeScratchGraph({ prefix: "gmsts", seed: 3 });
+    const graph = makeScratchRepo({ prefix: "gmsts", seed: 3 });
     const [high, low, legacy] = graph.seededIds as [string, string, string];
     approve(graph, high, "high");
     approve(graph, low, "low");
     const { mock, coordinator } = makeHarness();
     const fake = installFakeExecutor(mock.events, {
+      workspace: isolatedIn(graph),
       roles: ["implementer", "reviewer"],
       roleScripts: {
         implementer: { provenance: IMPL_PROV },
@@ -1122,12 +1159,13 @@ describe("an invalid policy", () => {
   it("a tick claims nothing and the skip log names the bad key, once; dispatch resumes when it is fixed", async () => {
     const previousEnv = process.env.WORKGRAPH_POLICY;
     delete process.env.WORKGRAPH_POLICY;
-    const graph = makeScratchGraph({ prefix: "gmbad", seed: 1 });
+    const graph = makeScratchRepo({ prefix: "gmbad", seed: 1 });
     const id = graph.seededIds[0]!;
     approve(graph, id);
     const { mock, coordinator } = makeFlagHarness();
     mock.setFlag("workgraph-policy", JSON.stringify({ medium: { gateMode: "blocking" } }));
     const fake = installFakeExecutor(mock.events, {
+      workspace: isolatedIn(graph),
       roles: ["implementer", "reviewer"],
       roleScripts: {
         implementer: { provenance: IMPL_PROV },
@@ -1191,7 +1229,7 @@ describe("an invalid policy", () => {
   it("wired by index.ts: every session handler still runs, and only dispatch stops", async () => {
     const previousEnv = process.env.WORKGRAPH_POLICY;
     delete process.env.WORKGRAPH_POLICY;
-    const graph = makeScratchGraph({ prefix: "gmbadidx", seed: 1 });
+    const graph = makeScratchRepo({ prefix: "gmbadidx", seed: 1 });
     const id = graph.seededIds[0]!;
     approve(graph, id);
     const mock = makeMockPi();
@@ -1203,6 +1241,7 @@ describe("an invalid policy", () => {
     mock.setFlag("workgraph-compat-in-session-executor", "false");
     mock.setFlag("workgraph-policy", JSON.stringify({ medium: { gates: { chekc: "observe" } } }));
     const fake = installFakeExecutor(mock.events, {
+      workspace: isolatedIn(graph),
       roles: ["implementer", "reviewer"],
       roleScripts: {
         implementer: { provenance: IMPL_PROV },
@@ -1241,7 +1280,7 @@ describe("an invalid policy", () => {
   }, 60_000);
 
   it("a policy that breaks mid-run stops judgment but not the heartbeat, the completion, or the release", async () => {
-    const graph = makeScratchGraph({ prefix: "gmbadmid", seed: 2 });
+    const graph = makeScratchRepo({ prefix: "gmbadmid", seed: 2 });
     const [id, waiting] = graph.seededIds as [string, string];
     approve(graph, id);
     approve(graph, waiting);
@@ -1258,6 +1297,7 @@ describe("an invalid policy", () => {
       now: () => clock,
     });
     const fake = installFakeExecutor(mock.events, {
+      workspace: isolatedIn(graph),
       roles: ["implementer", "reviewer"],
       roleScripts: {
         implementer: { behavior: "accept-stall", provenance: IMPL_PROV },

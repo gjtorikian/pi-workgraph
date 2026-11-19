@@ -209,6 +209,57 @@ describe("schema validation", () => {
     }
   });
 
+  it("a completion's workspace is optional, but validated when present", () => {
+    const completed = validCompleted();
+    // Absent: an executor that predates the field stays valid.
+    expect(parseMessage(CH.runCompleted, RunCompleted, completed)).toEqual(
+      completed,
+    );
+    for (const workspace of [
+      { path: "/work/checkout" },
+      { path: "/work/checkout", baseRevision: "c0ffee" },
+      // The bridge reports its whole manifest; the extra keys ride along.
+      { path: "/work/checkout", baseRevision: "c0ffee", repoPath: "/repo", branch: "workgraph/x" },
+    ]) {
+      expect(() =>
+        parseMessage(CH.runCompleted, RunCompleted, { ...completed, workspace }),
+      ).not.toThrow();
+    }
+    // Present but unusable: the whole message is rejected rather than
+    // snapshotting the wrong directory ("" would mean the process's own).
+    for (const workspace of [{}, { path: "" }, { path: 7 }, { baseRevision: "c0ffee" }, "here"]) {
+      expect(
+        () => parseMessage(CH.runCompleted, RunCompleted, { ...completed, workspace }),
+        `workspace ${JSON.stringify(workspace)} must reject`,
+      ).toThrow(ProtocolError);
+    }
+  });
+
+  it("a request's workspace carries the optional path and trees; empty strings reject", () => {
+    const request = validRequest();
+    const bound = {
+      ...request,
+      workspace: {
+        ...request.workspace,
+        baseRevision: "c0ffee",
+        path: "/work/checkout",
+        baseTree: "aaa111",
+        tree: "bbb222",
+      },
+    };
+    expect(parseMessage(CH.runRequest, RunRequest, bound)).toEqual(bound);
+    for (const field of ["path", "baseTree", "tree"]) {
+      expect(
+        () =>
+          parseMessage(CH.runRequest, RunRequest, {
+            ...bound,
+            workspace: { ...bound.workspace, [field]: "" },
+          }),
+        `an empty workspace.${field} must reject`,
+      ).toThrow(ProtocolError);
+    }
+  });
+
   it("extra fields are tolerated (non-strict by design)", () => {
     const offer = { ...validOffer(), futureField: { nested: true } };
     expect(() => parseMessage(CH.offer, ExecutorOffer, offer)).not.toThrow();

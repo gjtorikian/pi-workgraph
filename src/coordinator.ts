@@ -45,7 +45,20 @@
  *    workflow run holds through implementation AND judgment.
  *  - The coordinator never wakes the model itself: `pi.sendMessage` belongs
  *    to the in-session compatibility adapter alone.
+ *  - TREE BINDING (`src/snapshot.ts`): unless the `tree-binding` gate is
+ *    `off`, every run is bound to two git trees — the BASE the work started
+ *    from and the RESULT the implementer handed back — taken by the core
+ *    itself. The verdict, the review gate record and the close stamp name
+ *    the result tree; the workspace is compared against it after the review
+ *    and again before the stamp, and a workspace that moved goes back
+ *    through review. The stamp is written before finalization.
+ *  - ONE ISSUE UNDER JUDGMENT PER SHARED CHECKOUT: while a run whose work
+ *    sits in a non-isolated checkout is in judging or verifying, no new
+ *    issue is claimed for a non-isolated executor in that checkout. The
+ *    comparison above is against the live checkout, so a second issue's
+ *    edits there would read as a change to the first.
  */
+import { existsSync, realpathSync } from "node:fs";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -102,6 +115,8 @@ import {
 import {
   activeExecutionIdOf,
   attemptOf,
+  baseCommitOf,
+  baseTreeOf,
   escalate,
   executorIdOf,
   failureFingerprintOf,
@@ -114,6 +129,7 @@ import {
   transition,
   workflowClassOf,
   workflowRunIdOf,
+  workspacePathOf,
 } from "./lifecycle.ts";
 import {
   latestPlan,
@@ -123,8 +139,21 @@ import {
   recordPlan,
   renderPlan,
 } from "./plan.ts";
-import { checkIndependence, resolvePolicy, type RiskTier } from "./policy.ts";
-import { decideGate, recordGate, type GateResult } from "./proof.ts";
+import {
+  checkIndependence,
+  resolvePolicy,
+  type GateModeT,
+  type GateName,
+  type RiskTier,
+} from "./policy.ts";
+import {
+  decideGate,
+  recordGate,
+  recordStamp,
+  recordStampAmendment,
+  StampWriteError,
+  type GateResult,
+} from "./proof.ts";
 import {
   CH,
   newEnvelope,
@@ -144,9 +173,20 @@ import {
   listRunHeldInProgress,
   partitionByExpiry,
   reconstructAuthorCompletion,
+  reconstructBinding,
   requestStatus,
+  type RecoveredBinding,
   type ReconcileReport,
 } from "./recovery.ts";
+import {
+  anchorTree,
+  isGitWorkspace,
+  proofRef,
+  runKey,
+  snapshotWorkspace,
+  treeOf,
+  treeOfCommit,
+} from "./snapshot.ts";
 import { clearLeaseStatus, showLeaseStatus } from "./status.ts";
 import { reclaimAndLeaveReady } from "./sweep.ts";
 import type {
@@ -163,11 +203,15 @@ import {
   Plan,
   PlanCritique,
   Verdict,
+  WORKGRAPH_ACCEPTED_TREE_KEY,
   WORKGRAPH_ACTIVE_EXECUTION_ID_KEY,
   WORKGRAPH_ATTEMPT_KEY,
   WORKGRAPH_AUTHOR_PROVENANCE_KEY,
+  WORKGRAPH_BASE_COMMIT_KEY,
+  WORKGRAPH_BASE_TREE_KEY,
   WORKGRAPH_EXECUTOR_ID_KEY,
   WORKGRAPH_FAILURE_FINGERPRINT_KEY,
+  WORKGRAPH_FINALIZED_TREE_KEY,
   WORKGRAPH_LAST_VERDICT_KEY,
   WORKGRAPH_PHASE_KEY,
   WORKGRAPH_PLAN_APPROVED_KEY,
@@ -175,8 +219,11 @@ import {
   WORKGRAPH_PLAN_FEEDBACK_KEY,
   WORKGRAPH_PLAN_SUMMARY_KEY,
   WORKGRAPH_PLANNER_PROVENANCE_KEY,
+  WORKGRAPH_RESULT_COMMIT_KEY,
+  WORKGRAPH_RESULT_TREE_KEY,
   WORKGRAPH_WORKFLOW_RUN_ID_KEY,
   WORKGRAPH_WORKFLOW_CLASS_KEY,
+  WORKGRAPH_WORKSPACE_PATH_KEY,
 } from "./types.ts";
 import {
   artifactDigest,
@@ -222,6 +269,18 @@ export interface CoordinatorDeps {
    * a knob with one exercised value is a constant.
    */
   planCritiqueWaitMs?: number;
+  /**
+   * TEST SEAM. Called on every pass through the judgment gate's tail, after
+   * the verdict was recorded (or the review gate was found `off`) and
+   * immediately before the last comparison of the workspace against the
+   * result tree. It is the one window no executor runs in, so a test that
+   * needs a file edited "after the verdict" has no other way in. Not a user
+   * setting.
+   */
+  beforeAcceptance?: (run: {
+    issueId: string;
+    workspacePath?: string;
+  }) => void | Promise<void>;
 }
 
 /**
@@ -305,6 +364,29 @@ export interface CoordinatorRun {
   finalizationInFlight?: boolean;
   /** Evidence refs from the latest fenced completion (compaction). */
   evidence?: string[];
+  /**
+   * Where the implementer's work lives: the path its completion reported,
+   * else the coordinator's own checkout. Set at the implementation's
+   * completion (whatever the `tree-binding` mode — it is routing, not
+   * proof); every later request of the run sends its role there, and the
+   * claim-wait rule reads it.
+   */
+  workspacePath?: string;
+  /** The commit the work started from, its tree, and the workspace both
+   *  belong to: the base is keyed by workspace path. */
+  baseCommit?: string;
+  baseTree?: string;
+  basePath?: string;
+  /** The anchored snapshot of the result under judgment, and its tree. */
+  resultCommit?: string;
+  resultTree?: string;
+  /** Why the run has no base or no result tree (the gate's `unknown` reason). */
+  bindingReason?: string;
+  /** Latest result of each gate evaluated for this run; the close stamp
+   *  copies it. Kept in memory because gate records are fire-and-forget. */
+  gateResults?: Record<string, GateResult>;
+  /** The tree the close stamp accepted (compared again after finalization). */
+  stampedTree?: string;
   /**
    * A recorded plan that has not parked yet: set by acceptPlan when a
    * critique will run, cleared by parkForPlanReview. While set, the
@@ -503,8 +585,10 @@ export function registerCoordinator(
    *    stops dispatch and stops judgment.
    *  - `heldConfig()` never throws. For the paths that protect or finish
    *    work ALREADY under a lease — the heartbeat, teardown, completion
-   *    handling, an in-flight revision — which read timers and routing,
-   *    never the policy. It logs the message and keeps the last config that
+   *    handling, an in-flight revision — which read timers and routing.
+   *    Of the policy they read one thing, the `tree-binding` mode, and only
+   *    to learn whether to take a snapshot (and, for one-shot work, which
+   *    has no judgment loop, to decide that gate). It logs the message and keeps the last config that
    *    resolved, because stopping these over a typo would let a live lease
    *    lapse or strand an issue between two transitions.
    *
@@ -533,6 +617,445 @@ export function registerCoordinator(
   function onInvalid(channel: string, error: ProtocolError): void {
     // Invalid payload → log once with channel + reason; no state change.
     logSkipOnce(`invalid message on ${channel}: ${error.detail}`);
+  }
+
+  // -------------------------------------------------------------------------
+  // Tree binding. All git access goes through src/snapshot.ts; everything
+  // here turns a git failure into a reason on the run, never into a throw —
+  // a snapshot that fails must not abort a claim or a completion.
+  // -------------------------------------------------------------------------
+
+  /** Whether two paths name one directory (`/var/...` vs `/private/var/...`). */
+  function samePath(a: string, b: string): boolean {
+    if (a === b) return true;
+    try {
+      return realpathSync(a) === realpathSync(b);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * The `tree-binding` mode for an issue under a given config. The gate is
+   * DECIDED in the judgment loop, under `currentConfig()`; the completion
+   * handler and the claim path only ask this to learn whether snapshots are
+   * wanted at all, and they ask it of the config they already hold.
+   */
+  function bindingModeOf(issue: WorkIssue, config: WorkgraphConfig): GateModeT {
+    return resolvePolicy(riskTierOf(issue), config.policy).gates[
+      "tree-binding"
+    ];
+  }
+
+  /** Why git could not snapshot `path`, in words an escalation can carry. */
+  function gitFailure(path: string, e: unknown): string {
+    if (!existsSync(path)) return `workspace path does not exist: ${path}`;
+    if (!isGitWorkspace(path)) return "workspace is not a git repository";
+    const stderr = (e as { stderr?: unknown } | null)?.stderr;
+    const detail =
+      typeof stderr === "string" && stderr.trim() !== ""
+        ? stderr.trim()
+        : e instanceof Error
+          ? e.message
+          : String(e);
+    return `git failed in the workspace: ${detail.split("\n")[0]}`;
+  }
+
+  /** The result tree, but only when the run also has a base: a result with
+   *  nothing to measure it against binds nothing. */
+  function boundTreeOf(run: CoordinatorRun): string | undefined {
+    return run.baseTree !== undefined ? run.resultTree : undefined;
+  }
+
+  function noteGate(
+    run: CoordinatorRun,
+    gate: GateName,
+    result: GateResult,
+  ): void {
+    run.gateResults = { ...run.gateResults, [gate]: result };
+  }
+
+  /**
+   * The `workspace` block of every run request, in one place so the six
+   * request sites cannot drift. `path` appears once the implementer
+   * reported where its work is; `baseTree` and `tree` appear together, once
+   * both exist.
+   */
+  function requestWorkspace(run: CoordinatorRun): RunRequestT["workspace"] {
+    const tree = boundTreeOf(run);
+    return {
+      repoPath: run.cwd,
+      ...sourceWorkspace(run.issue.metadata),
+      baseRevision: run.baseCommit ?? "",
+      requiresIsolation: false,
+      ...(run.workspacePath !== undefined ? { path: run.workspacePath } : {}),
+      ...(tree !== undefined && run.baseTree !== undefined
+        ? { baseTree: run.baseTree, tree }
+        : {}),
+    };
+  }
+
+  /**
+   * The base for a NON-ISOLATED executor: snapshot the coordinator's own
+   * checkout just before the implementer request goes out, so whatever the
+   * user already had uncommitted there is part of the base and is never
+   * attributed to the issue. Kept across re-claims: a base already stored
+   * for this checkout is reused, so a file deleted in a first attempt still
+   * shows as deleted against it. (An isolated executor's base is the
+   * revision its completion reports — see `bindResult`.) Never throws.
+   */
+  async function recordSharedBase(
+    run: CoordinatorRun,
+    isolation: IsolationLevelT,
+    config: WorkgraphConfig,
+  ): Promise<void> {
+    if (isolation !== "none") return;
+    if (bindingModeOf(run.issue, config) === "off") return;
+    const storedPath = workspacePathOf(run.issue);
+    const storedCommit = baseCommitOf(run.issue);
+    const storedTree = baseTreeOf(run.issue);
+    if (
+      storedPath !== undefined &&
+      storedCommit !== undefined &&
+      storedTree !== undefined &&
+      samePath(storedPath, run.cwd)
+    ) {
+      run.baseCommit = storedCommit;
+      run.baseTree = storedTree;
+      run.basePath = run.cwd;
+      return;
+    }
+    try {
+      const base = snapshotWorkspace(
+        run.cwd,
+        proofRef(run.issue.id, `${runKey(run.workflowRunId)}/base`),
+        `workgraph base: ${run.issue.id} (${run.workflowRunId})`,
+      );
+      run.baseCommit = base.commit;
+      run.baseTree = base.tree;
+      run.basePath = run.cwd;
+    } catch {
+      // No base: the gate reports `unknown` once the work completes, with
+      // the reason `bindResult` works out then.
+      return;
+    }
+    try {
+      await setMetadata(
+        run.cwd,
+        run.issue.id,
+        {
+          [WORKGRAPH_WORKSPACE_PATH_KEY]: run.cwd,
+          [WORKGRAPH_BASE_COMMIT_KEY]: run.baseCommit,
+          [WORKGRAPH_BASE_TREE_KEY]: run.baseTree,
+        },
+        run.actor.bdActor,
+      );
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      logSkipOnce(`could not record the base of ${run.issue.id}: ${msg}`);
+    }
+  }
+
+  /**
+   * Bind a completed implementation or revision: settle where the work is,
+   * settle its base, snapshot the result. Returns the metadata to write in
+   * the SAME transition that moves the issue on, so the path, the base and
+   * the result survive a restart together. Under `off` it only notes the
+   * workspace path (routing) and writes nothing.
+   *
+   * The base, in order: the one this run already holds for this path (the
+   * shared-checkout snapshot); the one stored on the issue for this path
+   * (a follow-up into a retained worktree); the revision the completion
+   * reports, for an executor that is not known to be non-isolated. No base
+   * and no result are both `unknown`, with the reason kept on the run.
+   */
+  function bindResult(
+    run: CoordinatorRun,
+    completion: RunCompletedT,
+    attempt: number,
+    isolation: IsolationLevelT | undefined,
+    mode: GateModeT,
+  ): Record<string, MetadataValue> {
+    const path = completion.workspace?.path ?? run.workspacePath ?? run.cwd;
+    run.workspacePath = path;
+    if (mode === "off") return {};
+
+    let reason: string | undefined;
+    if (run.basePath === undefined || !samePath(run.basePath, path)) {
+      delete run.baseCommit;
+      delete run.baseTree;
+      delete run.basePath;
+      const storedPath = workspacePathOf(run.issue);
+      const storedCommit = baseCommitOf(run.issue);
+      const storedTree = baseTreeOf(run.issue);
+      const reported = completion.workspace?.baseRevision;
+      if (
+        storedPath !== undefined &&
+        storedCommit !== undefined &&
+        storedTree !== undefined &&
+        samePath(storedPath, path)
+      ) {
+        run.baseCommit = storedCommit;
+        run.baseTree = storedTree;
+        run.basePath = path;
+      } else if (isolation !== "none" && reported) {
+        try {
+          run.baseTree = treeOfCommit(path, reported);
+          run.baseCommit = reported;
+          run.basePath = path;
+        } catch (e) {
+          reason = `base revision ${reported} could not be resolved: ${gitFailure(path, e)}`;
+        }
+      } else {
+        reason =
+          isolation === "none"
+            ? "no base snapshot of the workspace was recorded before the work started"
+            : "the executor reported no base revision for its workspace";
+      }
+    }
+
+    delete run.resultCommit;
+    delete run.resultTree;
+    try {
+      const result = snapshotWorkspace(
+        path,
+        proofRef(
+          run.issue.id,
+          `${runKey(run.workflowRunId)}/result-${attempt}`,
+        ),
+        `workgraph result: ${run.issue.id} attempt ${attempt} (${run.workflowRunId})`,
+      );
+      run.resultCommit = result.commit;
+      run.resultTree = result.tree;
+    } catch (e) {
+      // The result is the tree every record names: its failure is the
+      // reason reported, whatever happened to the base.
+      reason = gitFailure(path, e);
+    }
+    if (reason !== undefined) run.bindingReason = reason;
+    else delete run.bindingReason;
+    // Path and base are written together, "" for a missing value: a base
+    // left behind from another workspace would read as this one's.
+    return {
+      [WORKGRAPH_WORKSPACE_PATH_KEY]: path,
+      [WORKGRAPH_BASE_COMMIT_KEY]: run.baseCommit ?? "",
+      [WORKGRAPH_BASE_TREE_KEY]: run.baseTree ?? "",
+      [WORKGRAPH_RESULT_COMMIT_KEY]: run.resultCommit ?? "",
+      [WORKGRAPH_RESULT_TREE_KEY]: run.resultTree ?? "",
+    };
+  }
+
+  /**
+   * Compare the live workspace with the result tree the run is bound to.
+   * `same`: nothing moved. `changed`: it moved, and the run is now bound to
+   * the new tree (anchored, written to metadata, audited) — the caller
+   * sends it back through review. `failed`: git could not answer; the run
+   * loses its result tree and carries the reason, so the gate reports
+   * `unknown` on the next pass. A run with no bound tree is always `same`.
+   */
+  async function recheckWorkspace(
+    run: CoordinatorRun,
+    attempt: number,
+    when: string,
+  ): Promise<"same" | "changed" | "failed"> {
+    const recorded = boundTreeOf(run);
+    const path = run.workspacePath;
+    if (recorded === undefined || path === undefined) return "same";
+    let live: string;
+    let commit: string;
+    try {
+      live = treeOf(path);
+      if (live === recorded) return "same";
+      // Anchor the tree that was just compared, not a fresh snapshot: no
+      // window for the workspace to move again in between.
+      commit = anchorTree(
+        path,
+        live,
+        proofRef(
+          run.issue.id,
+          `${runKey(run.workflowRunId)}/result-${attempt}-${live.slice(0, 12)}`,
+        ),
+        `workgraph result: ${run.issue.id} attempt ${attempt}, workspace changed ${when} (${run.workflowRunId})`,
+      ).commit;
+    } catch (e) {
+      run.bindingReason = gitFailure(path, e);
+      delete run.resultCommit;
+      delete run.resultTree;
+      return "failed";
+    }
+    run.resultCommit = commit;
+    run.resultTree = live;
+    await setMetadata(
+      run.cwd,
+      run.lease.issueId,
+      {
+        [WORKGRAPH_RESULT_COMMIT_KEY]: commit,
+        [WORKGRAPH_RESULT_TREE_KEY]: live,
+      },
+      run.actor.bdActor,
+    );
+    await recordLeaseEvent(
+      run.cwd,
+      "workspace-changed",
+      run.lease.issueId,
+      {
+        workflowRunId: run.workflowRunId,
+        workspacePath: path,
+        previousTree: recorded,
+        tree: live,
+        when,
+      },
+      run.actor.bdActor,
+    );
+    return "changed";
+  }
+
+  /**
+   * Evaluate and record the `tree-binding` gate for the run's current
+   * result: `pass` when a base tree and a result tree both exist, `unknown`
+   * otherwise. Returns the escalation reason when the gate blocks
+   * (`enforce` and `unknown`), else undefined.
+   */
+  async function evaluateBinding(
+    run: CoordinatorRun,
+    mode: GateModeT,
+    attempt: number,
+  ): Promise<string | undefined> {
+    const tree = boundTreeOf(run);
+    const result: GateResult = tree !== undefined ? "pass" : "unknown";
+    const reason = run.bindingReason ?? "no result tree was recorded";
+    const decision = decideGate("tree-binding", mode, result);
+    noteGate(run, "tree-binding", result);
+    await recordGate(
+      run.cwd,
+      run.lease.issueId,
+      {
+        gate: "tree-binding",
+        mode,
+        result,
+        ...decision,
+        ...(tree !== undefined ? { tree } : { reason }),
+        workflowRunId: run.workflowRunId,
+        attempt,
+      },
+      run.actor.bdActor,
+    );
+    return decision.blocked
+      ? `tree-binding: ${reason}; set gates.tree-binding to observe to close without it`
+      : undefined;
+  }
+
+  /**
+   * Write the close stamp and `workgraph_accepted_tree`. The stamp is
+   * durable like the verdict: if it cannot be written the run escalates
+   * from `verifying` and this returns false — the caller stops, nothing
+   * closes. A run with no bound tree (`observe` and `unknown`) is stamped
+   * without the tree fields.
+   */
+  async function stampAcceptance(
+    run: CoordinatorRun,
+    attempt: number,
+    verdict?: { executionId: string; summary: string },
+  ): Promise<boolean> {
+    const tree = boundTreeOf(run);
+    try {
+      await recordStamp(
+        run.cwd,
+        run.lease.issueId,
+        {
+          ...(tree !== undefined
+            ? {
+                tree,
+                baseTree: run.baseTree,
+                ...(run.resultCommit !== undefined
+                  ? { commit: run.resultCommit }
+                  : {}),
+              }
+            : {}),
+          workflowRunId: run.workflowRunId,
+          attempt,
+          ...(verdict !== undefined ? { verdict } : {}),
+          gates: { ...run.gateResults },
+        },
+        run.actor.bdActor,
+      );
+    } catch (e) {
+      if (!(e instanceof StampWriteError)) throw e;
+      await escalateRun(
+        run,
+        "verifying",
+        `close stamp could not be written: ${e.detail}`,
+      );
+      return false;
+    }
+    run.stampedTree = tree;
+    await setMetadata(
+      run.cwd,
+      run.lease.issueId,
+      { [WORKGRAPH_ACCEPTED_TREE_KEY]: tree ?? "" },
+      run.actor.bdActor,
+    );
+    return true;
+  }
+
+  /**
+   * After a finalization that succeeded: if it changed the stamped tree,
+   * record the new tree (anchored, in `workgraph_finalized_tree`, and as a
+   * stamp amendment). Never blocks: finalization's external effects have
+   * already happened (decision log).
+   */
+  async function amendAfterFinalization(run: CoordinatorRun): Promise<void> {
+    const stamped = run.stampedTree;
+    const path = run.workspacePath;
+    if (stamped === undefined || path === undefined) return;
+    let live: string;
+    try {
+      live = treeOf(path);
+      if (live === stamped) return;
+      anchorTree(
+        path,
+        live,
+        proofRef(run.issue.id, `${runKey(run.workflowRunId)}/finalized`),
+        `workgraph finalized: ${run.issue.id} (${run.workflowRunId})`,
+      );
+    } catch (e) {
+      logSkipOnce(
+        `could not compare ${run.lease.issueId} after finalization: ${gitFailure(path, e)}`,
+      );
+      return;
+    }
+    await setMetadata(
+      run.cwd,
+      run.lease.issueId,
+      { [WORKGRAPH_FINALIZED_TREE_KEY]: live },
+      run.actor.bdActor,
+    );
+    await recordStampAmendment(
+      run.cwd,
+      run.lease.issueId,
+      { finalizedTree: live, workflowRunId: run.workflowRunId },
+      run.actor.bdActor,
+    );
+  }
+
+  /** Put what recovery rebuilt about a run's workspace and trees onto it. */
+  function applyBinding(run: CoordinatorRun, binding: RecoveredBinding): void {
+    if (binding.workspacePath !== undefined) {
+      run.workspacePath = binding.workspacePath;
+    }
+    if (
+      binding.workspacePath !== undefined &&
+      binding.baseCommit !== undefined &&
+      binding.baseTree !== undefined
+    ) {
+      run.baseCommit = binding.baseCommit;
+      run.baseTree = binding.baseTree;
+      run.basePath = binding.workspacePath;
+    }
+    if (binding.resultTree !== undefined) run.resultTree = binding.resultTree;
+    if (binding.resultCommit !== undefined) {
+      run.resultCommit = binding.resultCommit;
+    }
   }
 
   function heldRuns(): CoordinatorRun[] {
@@ -818,6 +1341,7 @@ export function registerCoordinator(
   async function finishOneshot(
     run: CoordinatorRun,
     msg: RunCompletedT,
+    bindingFields: Record<string, MetadataValue>,
   ): Promise<void> {
     run.executionId = msg.executionId;
     run.evidence = [...msg.evidence];
@@ -865,6 +1389,7 @@ export function registerCoordinator(
 
     await transition(run.cwd, run.lease.issueId, "implementing", "verifying", {
       fields: {
+        ...bindingFields,
         [WORKGRAPH_AUTHOR_PROVENANCE_KEY]: JSON.stringify(msg.provenance),
       },
       actor: run.actor.bdActor,
@@ -878,6 +1403,27 @@ export function registerCoordinator(
       actor: run.actor.bdActor,
       summary: `one-shot implementation completed by ${run.executorId}`,
     });
+    // TREE BINDING for one-shot work. There is no judging phase and no
+    // judgment loop here, so the gate is decided where the work lands: in
+    // `verifying`, on the policy of the config this handler holds. Then the
+    // stamp, BEFORE finalization, exactly as on the reviewed path.
+    const bindingMode = bindingModeOf(run.issue, heldConfig());
+    if (bindingMode !== "off") {
+      const blocked = await evaluateBinding(run, bindingMode, run.attempt);
+      let stopped: boolean;
+      if (blocked !== undefined) {
+        await escalateRun(run, "verifying", blocked);
+        stopped = true;
+      } else {
+        // Escalates by itself when the stamp cannot be written.
+        stopped = !(await stampAcceptance(run, run.attempt));
+      }
+      if (stopped) {
+        if (state.active === run) state.active = null;
+        if (heldRuns().length === 0) stopHeartbeat();
+        return;
+      }
+    }
     if (heldConfig().finalization) {
       state.active = null;
       state.judged.push(run);
@@ -887,6 +1433,7 @@ export function registerCoordinator(
         closed: false,
       });
       if (!(await finalize(run, msg))) return;
+      if (bindingMode !== "off") await amendAfterFinalization(run);
     }
     await transition(run.cwd, run.lease.issueId, "verifying", "accepted", {
       actor: run.actor.bdActor,
@@ -1034,6 +1581,27 @@ export function registerCoordinator(
         return;
       }
 
+      // TREE BINDING, for a finished implementation only (a plan has no
+      // result, and a question or an execution error is not one either):
+      // note where the work is and snapshot it BEFORE the audit below, so
+      // the `run-completed` event — what a restart rebuilds the run from —
+      // carries the workspace path and the result tree. The metadata it
+      // returns rides the transition that moves the issue on.
+      let bindingFields: Record<string, MetadataValue> = {};
+      if (
+        run.role === "implementer" &&
+        !msg.decisionQuestion &&
+        !msg.executionError
+      ) {
+        bindingFields = bindResult(
+          run,
+          msg,
+          run.attempt,
+          run.isolation,
+          bindingModeOf(run.issue, heldConfig()),
+        );
+      }
+
       // Fenced: record the evidence, transition to judging (guarded CAS,
       // stamping the author's reported provenance in the SAME write), KEEP
       // the lease, and hand the run to the judgment gate.
@@ -1051,6 +1619,12 @@ export function registerCoordinator(
           evidence: msg.evidence,
           ...(msg.executionError ? { executionError: msg.executionError } : {}),
           provenance: msg.provenance,
+          ...(run.role === "implementer" && run.workspacePath !== undefined
+            ? { workspacePath: run.workspacePath }
+            : {}),
+          ...(run.role === "implementer" && run.resultTree !== undefined
+            ? { tree: run.resultTree }
+            : {}),
         },
         run.actor.bdActor,
       );
@@ -1090,7 +1664,7 @@ export function registerCoordinator(
           if (heldRuns().length === 0) stopHeartbeat();
         }
       } else if (effectiveWorkflowClass(run.issue) === "oneshot") {
-        await finishOneshot(run, msg);
+        await finishOneshot(run, msg, bindingFields);
       } else {
         try {
           await transition(
@@ -1100,6 +1674,7 @@ export function registerCoordinator(
             "judging",
             {
               fields: {
+                ...bindingFields,
                 [WORKGRAPH_AUTHOR_PROVENANCE_KEY]: JSON.stringify(
                   msg.provenance,
                 ),
@@ -1443,6 +2018,10 @@ export function registerCoordinator(
       { [WORKGRAPH_EXECUTOR_ID_KEY]: implementer.executorId },
       run.actor.bdActor,
     );
+    // The planner tier reaches its implementer here, not through the claim
+    // path, so the shared-checkout base is taken here too.
+    await recordSharedBase(run, implementer.isolation, config);
+    if (state.active !== run) return; // halted while the base was recorded
 
     const request: RunRequestT = {
       ...newEnvelope(nowFn),
@@ -1464,12 +2043,7 @@ export function registerCoordinator(
       role: "implementer",
       attempt: run.attempt,
       ...decisionAnswer(run.issue.metadata),
-      workspace: {
-        repoPath: run.cwd,
-        ...sourceWorkspace(run.issue.metadata),
-        baseRevision: "",
-        requiresIsolation: false,
-      },
+      workspace: requestWorkspace(run),
       ...(run.plan !== undefined ? { plan: run.plan } : {}),
     };
     const result = await requestRun(pi.events, request, {
@@ -1670,12 +2244,7 @@ export function registerCoordinator(
       },
       role: "plan_critic",
       attempt: run.attempt,
-      workspace: {
-        repoPath: run.cwd,
-        ...sourceWorkspace(run.issue.metadata),
-        baseRevision: "",
-        requiresIsolation: false,
-      },
+      workspace: requestWorkspace(run),
       outputSchema: PlanCritique,
       // What the implementer would receive — the critic judges exactly that.
       plan: renderPlan(pending.plan),
@@ -2185,6 +2754,7 @@ export function registerCoordinator(
     verdict: VerdictT,
     attempt: number,
     acceptanceCriteria: string | undefined,
+    bindingMode: GateModeT,
   ): Promise<RunCompletedT | "parked" | "aborted"> {
     const config = heldConfig();
     if (box.closed) return "aborted";
@@ -2231,12 +2801,7 @@ export function registerCoordinator(
       role: "revision",
       attempt,
       ...decisionAnswer(run.issue.metadata),
-      workspace: {
-        repoPath: run.cwd,
-        ...sourceWorkspace(run.issue.metadata),
-        baseRevision: "",
-        requiresIsolation: false,
-      },
+      workspace: requestWorkspace(run),
       priorFindings: canonicalFindings(verdict.findings).map((f) =>
         JSON.stringify(f),
       ),
@@ -2315,6 +2880,13 @@ export function registerCoordinator(
       dropJudgedRun(run);
       return "aborted";
     }
+    // A revision is a new result: snapshot it before the audit, as the
+    // implementation's completion handler does, and write its keys in the
+    // revising → judging transition below.
+    const bindingFields =
+      completion.decisionQuestion || completion.executionError
+        ? {}
+        : bindResult(run, completion, attempt, revisor.isolation, bindingMode);
     await recordLeaseEvent(
       run.cwd,
       "run-completed",
@@ -2331,6 +2903,10 @@ export function registerCoordinator(
         artifacts: completion.artifacts,
         evidence: completion.evidence,
         provenance: completion.provenance,
+        ...(run.workspacePath !== undefined
+          ? { workspacePath: run.workspacePath }
+          : {}),
+        ...(run.resultTree !== undefined ? { tree: run.resultTree } : {}),
       },
       run.actor.bdActor,
     );
@@ -2351,6 +2927,7 @@ export function registerCoordinator(
     try {
       await transition(run.cwd, run.lease.issueId, "revising", "judging", {
         fields: {
+          ...bindingFields,
           [WORKGRAPH_AUTHOR_PROVENANCE_KEY]: JSON.stringify(
             completion.provenance,
           ),
@@ -2455,12 +3032,7 @@ export function registerCoordinator(
       },
       role: "finalizer",
       attempt: run.attempt,
-      workspace: {
-        repoPath: run.cwd,
-        ...sourceWorkspace(run.issue.metadata),
-        baseRevision: "",
-        requiresIsolation: false,
-      },
+      workspace: requestWorkspace(run),
       instructions: task.instructions,
       outputSchema: FinalizationResult,
       artifacts: author.artifacts,
@@ -2606,12 +3178,19 @@ export function registerCoordinator(
    * verdict summary, or `review off`. `executionId` is the execution the
    * close is attributed to: the review's, or the implementation's when
    * there was no review.
+   *
+   * `proof` carries what the close stamp needs: the `tree-binding` mode
+   * (`off` writes no stamp — nothing was evaluated), the attempt, and
+   * whether a verdict exists. The stamp is written once the issue is in
+   * `verifying` and BEFORE finalization; a tree finalization changes is
+   * recorded afterwards as an amendment and does not block.
    */
   async function acceptAndClose(
     run: CoordinatorRun,
     author: RunCompletedT,
     summary: string,
     executionId: string,
+    proof: { bindingMode: GateModeT; attempt: number; reviewed: boolean },
   ): Promise<void> {
     try {
       await transition(run.cwd, run.lease.issueId, "judging", "verifying", {
@@ -2630,7 +3209,19 @@ export function registerCoordinator(
         actor: run.actor.bdActor,
         summary,
       });
+      if (proof.bindingMode !== "off") {
+        const stamped = await stampAcceptance(
+          run,
+          proof.attempt,
+          proof.reviewed ? { executionId, summary } : undefined,
+        );
+        if (!stamped) return; // escalated from verifying; nothing closes
+      }
+      const finalizes = heldConfig().finalization !== undefined;
       if (!(await finalize(run, author))) return;
+      if (finalizes && proof.bindingMode !== "off") {
+        await amendAfterFinalization(run);
+      }
       await transition(run.cwd, run.lease.issueId, "verifying", "accepted", {
         actor: run.actor.bdActor,
       });
@@ -2714,10 +3305,16 @@ export function registerCoordinator(
     // The implementation result currently under judgment; a completed
     // revision replaces it (fresh artifacts + provenance).
     let author = implementation;
+    // Shared by every reason a review round is thrown away: no parseable
+    // verdict, a workspace that changed during the review, a workspace that
+    // changed after the verdict. One bound, so the loop cannot spin.
     let reviewRetries = 0;
     // Executors whose reviews were rejected (non-independent) or who did
     // not accept — never re-selected for THIS run.
     const excluded = new Set<string>();
+    // The result the `tree-binding` gate was last recorded for: one gate
+    // record per result, not one per review round.
+    let bindingRecordedFor: string | undefined;
 
     for (;;) {
       if (box.closed) return; // teardown
@@ -2728,7 +3325,65 @@ export function registerCoordinator(
       const issue = await show(run.cwd, run.lease.issueId);
       const policy = resolvePolicy(riskTierOf(issue), config.policy);
       const mode = policy.gates.review;
+      const bindingMode = policy.gates["tree-binding"];
       const attempt = attemptOf(issue) ?? 1;
+
+      // ---- the tree-binding gate. Decided here, under the validated
+      // policy, not where the snapshot was taken. `off`: not evaluated, and
+      // every record below simply names no tree. ----
+      if (bindingMode !== "off") {
+        if (run.resultTree === undefined && run.bindingReason === undefined) {
+          // No snapshot was ever attempted for this result: a run adopted
+          // from before tree binding, or a gate switched on after the
+          // implementation completed. Take it now.
+          const fields = bindResult(run, author, attempt, undefined, bindingMode);
+          await setMetadata(
+            run.cwd,
+            run.lease.issueId,
+            fields,
+            run.actor.bdActor,
+          );
+        }
+        const key = boundTreeOf(run) ?? `unknown: ${run.bindingReason ?? ""}`;
+        if (bindingRecordedFor !== key) {
+          bindingRecordedFor = key;
+          const blocked = await evaluateBinding(run, bindingMode, attempt);
+          if (blocked !== undefined) {
+            await escalateRun(run, "judging", blocked);
+            return;
+          }
+        }
+      }
+      // The tree every record of this round names; undefined = unbound.
+      const tree = bindingMode !== "off" ? boundTreeOf(run) : undefined;
+
+      /**
+       * The last look before the close: has the workspace moved since the
+       * result was snapshotted (or last compared)? `accept`: no. `again`:
+       * yes — the run is bound to the new tree and goes round the loop, so
+       * the new tree is reviewed. `stop`: escalated.
+       */
+      const beforeAcceptance = async (): Promise<"accept" | "again" | "stop"> => {
+        await deps.beforeAcceptance?.({
+          issueId: run.lease.issueId,
+          ...(run.workspacePath !== undefined
+            ? { workspacePath: run.workspacePath }
+            : {}),
+        });
+        if (tree === undefined) return "accept";
+        const moved = await recheckWorkspace(run, attempt, "after the verdict");
+        if (moved === "same") return "accept";
+        reviewRetries += 1;
+        if (reviewRetries > MAX_REVIEW_RETRIES) {
+          await escalateRun(
+            run,
+            "judging",
+            `review retries exhausted (${MAX_REVIEW_RETRIES}): workspace changed after the verdict`,
+          );
+          return "stop";
+        }
+        return "again";
+      };
 
       // ---- review gate off: not evaluated, so no reviewer is selected, no
       // verdict exists, and no gate result is recorded. The work is accepted
@@ -2746,7 +3401,14 @@ export function registerCoordinator(
           );
           return;
         }
-        await acceptAndClose(run, author, "review off", author.executionId);
+        const next = await beforeAcceptance();
+        if (next === "stop") return;
+        if (next === "again") continue;
+        await acceptAndClose(run, author, "review off", author.executionId, {
+          bindingMode,
+          attempt,
+          reviewed: false,
+        });
         return;
       }
 
@@ -2810,12 +3472,7 @@ export function registerCoordinator(
         role: "reviewer",
         attempt,
         ...decisionAnswer(run.issue.metadata),
-        workspace: {
-          repoPath: run.cwd,
-          ...sourceWorkspace(run.issue.metadata),
-          baseRevision: "",
-          requiresIsolation: false,
-        },
+        workspace: requestWorkspace(run),
         // The required structured-verdict output schema (a TypeBox schema
         // IS a JSON schema object).
         outputSchema: Verdict,
@@ -2926,6 +3583,46 @@ export function registerCoordinator(
         continue; // bounded review retry — never counts against maxRevisions
       }
 
+      // ---- the workspace must still be the tree that was reviewed ----
+      // A verdict on a tree that is no longer in the workspace judges
+      // nothing: discard it and review again. The reviewer is NOT excluded
+      // (unlike a non-independent one) — with a single reviewer that would
+      // escalate for want of a reviewer instead of reviewing the new tree.
+      if (tree !== undefined) {
+        const moved = await recheckWorkspace(run, attempt, "during review");
+        if (moved !== "same") {
+          reviewRetries += 1;
+          const reason =
+            moved === "changed"
+              ? "workspace changed during review"
+              : `workspace could not be read during review: ${run.bindingReason ?? "git failed"}`;
+          await recordLeaseEvent(
+            run.cwd,
+            "review-rejected",
+            run.lease.issueId,
+            {
+              workflowRunId: run.workflowRunId,
+              executionId: completion.executionId,
+              executorId: reviewer.executorId,
+              reason,
+              reviewedTree: tree,
+              ...(run.resultTree !== undefined ? { tree: run.resultTree } : {}),
+              retry: reviewRetries,
+            },
+            run.actor.bdActor,
+          );
+          if (reviewRetries > MAX_REVIEW_RETRIES) {
+            await escalateRun(
+              run,
+              "judging",
+              `review retries exhausted (${MAX_REVIEW_RETRIES}): ${reason}`,
+            );
+            return;
+          }
+          continue; // review the tree that is there now
+        }
+      }
+
       // ---- author independence (fail closed) ----
       const independence = checkIndependence(
         {
@@ -2968,6 +3665,7 @@ export function registerCoordinator(
             executorId: reviewer.executorId,
             attempt,
             reviewerProvenance: completion.provenance,
+            ...(tree !== undefined ? { tree } : {}),
           },
           run.actor.bdActor,
         );
@@ -2990,6 +3688,7 @@ export function registerCoordinator(
       const gateResult: GateResult =
         blocking.length > 0 ? "violation" : "pass";
       const decision = decideGate("review", mode, gateResult);
+      noteGate(run, "review", gateResult);
       await recordGate(
         run.cwd,
         run.lease.issueId,
@@ -2999,13 +3698,16 @@ export function registerCoordinator(
           result: gateResult,
           ...decision,
           ...(gateResult === "violation" ? { reason: summary } : {}),
+          ...(tree !== undefined ? { tree } : {}),
           workflowRunId: run.workflowRunId,
           attempt,
         },
         run.actor.bdActor,
       );
       if (decision.blocked) {
-        const digest = artifactDigest(author.artifacts);
+        // The tree when there is one: the fingerprint then follows file
+        // content. The artifact list is the fallback when nothing is bound.
+        const digest = tree ?? artifactDigest(author.artifacts);
         const fingerprint = failureFingerprint(blocking, digest);
         if (failureFingerprintOf(issue) === fingerprint) {
           if (effectiveWorkflowClass(issue) === "reviewed") {
@@ -3078,6 +3780,7 @@ export function registerCoordinator(
           verdict,
           attempt + 1,
           issue.acceptance_criteria,
+          bindingMode,
         );
         if (revision === "aborted" || revision === "parked") return;
         author = revision;
@@ -3086,7 +3789,14 @@ export function registerCoordinator(
       }
 
       // ---- gate passed (clean, advisory findings, or observe mode) ----
-      await acceptAndClose(run, author, summary, completion.executionId);
+      const next = await beforeAcceptance();
+      if (next === "stop") return;
+      if (next === "again") continue; // the new tree goes back through review
+      await acceptAndClose(run, author, summary, completion.executionId, {
+        bindingMode,
+        attempt,
+        reviewed: true,
+      });
       return;
     }
   }
@@ -3239,10 +3949,11 @@ export function registerCoordinator(
         selected = canImplement
           ? selectExecutor(
               offers,
-              // No isolation policy exists yet (phase 5+): neither planning
-              // nor implementation runs require isolation, which is what
-              // lets the in-session compat adapter (isolation "none") stay
-              // eligible.
+              // Neither planning nor implementation runs REQUIRE
+              // isolation, which is what lets the in-session adapter
+              // (isolation "none") stay eligible. What a non-isolated
+              // executor may not do is start a second issue in a checkout
+              // that holds one under judgment — the claim-wait rule below.
               { role: "planner", requiresIsolation: false },
               pinFor("planner"),
               inFlightCounts(),
@@ -3279,6 +3990,24 @@ export function registerCoordinator(
       logSkipOnce(`no eligible executor for role ${role} — no claim`);
       return;
     }
+    // CLAIM-WAIT. A non-isolated executor works in this checkout. If a run
+    // whose work sits in this same checkout is under judgment, a new issue
+    // here would change the very tree that run's verdict and stamp are
+    // compared against — so the claim waits for it to resolve. Review of
+    // in-session work is therefore one issue at a time (decision log). The
+    // rule is per process, and isolated executors are never held by it.
+    if (selected.isolation === "none") {
+      const underReview = state.judged.find(
+        (judged) =>
+          judged.workspacePath !== undefined &&
+          samePath(judged.workspacePath, ctx.cwd),
+      );
+      if (underReview) {
+        logSkipOnce(`workspace under review: ${underReview.lease.issueId}`);
+        return;
+      }
+    }
+
     // The phase the claim enters, and the phase every downstream write in
     // this tick expects. Kept in one binding so the claim transition, the
     // activity event, and the request role can never disagree.
@@ -3404,6 +4133,14 @@ export function registerCoordinator(
       summary: `claimed for ${selected.executorId} (${role})`,
     });
 
+    // The shared-checkout base, taken just before the implementer request.
+    // (A planner run takes it later, in dispatchImplementation.) A failed
+    // snapshot never aborts the claim: the gate reports it at judgment.
+    if (role === "implementer") {
+      await recordSharedBase(run, selected.isolation, config);
+      if (state.active !== run) return; // halted while the base was recorded
+    }
+
     const request: RunRequestT = {
       ...newEnvelope(nowFn),
       executorId: selected.executorId,
@@ -3424,12 +4161,7 @@ export function registerCoordinator(
       role,
       attempt: 1,
       ...decisionAnswer(run.issue.metadata),
-      workspace: {
-        repoPath: run.cwd,
-        ...sourceWorkspace(run.issue.metadata),
-        baseRevision: "",
-        requiresIsolation: false,
-      },
+      workspace: requestWorkspace(run),
       ...(role === "planner" ? { outputSchema: Plan } : {}),
       ...(role === "planner" && planFeedback !== undefined ? { feedback: planFeedback } : {}),
       ...(run.plan !== undefined ? { plan: run.plan } : {}),
@@ -3994,6 +4726,9 @@ export function registerCoordinator(
             nowFn,
           );
           const run = makeRun("judging");
+          // Workspace path, base and result tree, rebuilt from the trail:
+          // the claim-wait rule needs the path, the gate needs the trees.
+          applyBinding(run, await reconstructBinding(ctx.cwd, cur));
           trackLease(ctx.cwd, lease, actor);
           state.judged.push(run);
           state.inboxes.set(workflowRunId, {
@@ -4015,13 +4750,29 @@ export function registerCoordinator(
             },
             actor.bdActor,
           );
-          if (author) resumed.push(judge(run, author));
+          if (author) {
+            // The workspace may have been edited while nobody was watching.
+            // If it no longer matches the recorded result tree, bind the run
+            // to what is there now; the resumed loop then reviews THAT. (A
+            // run with no recorded tree is snapshotted by the loop itself.)
+            if (bindingModeOf(cur, config) !== "off") {
+              await recheckWorkspace(
+                run,
+                run.attempt,
+                "while the coordinator was down",
+              );
+            }
+            resumed.push(judge(run, author));
+          }
         } else if (phase === "revising" || phase === "verifying") {
           // Mid-gate states whose in-flight context (a revision execution,
           // a verification pass) cannot be rebuilt from memory: park with
           // the heartbeat so the lease survives; the gate resolves via
           // human override / re-approve or a later phase's reconnection.
           const run = makeRun(phase);
+          // Parked, but still occupying its workspace: the claim-wait rule
+          // reads the path from here.
+          applyBinding(run, await reconstructBinding(ctx.cwd, cur));
           // A revising run's recorded execution IS a revision execution
           // bound at its accept (the revising→revising self edge) and never
           // completed (completion would have transitioned to judging) — it

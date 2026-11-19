@@ -116,6 +116,38 @@ export const WORKGRAPH_DECISION_QUESTION_KEY = "workgraph_decision_question";
 export const WORKGRAPH_DECISION_ANSWER_KEY = "workgraph_decision_answer";
 
 /**
+ * Tree-binding keys (`src/snapshot.ts`): where an issue's work lives and the
+ * git trees its proof records name. All scalar strings; a cleared key holds
+ * "". Not to be confused with `workgraph_workspace_run_id`, which names the
+ * RUN whose retained worktree a human follow-up reuses.
+ */
+/** The directory the implementer's work was reported in. The base below belongs to it. */
+export const WORKGRAPH_WORKSPACE_PATH_KEY = "workgraph_workspace_path";
+/** The commit (an anchored snapshot, or the reported base revision) the work started from. */
+export const WORKGRAPH_BASE_COMMIT_KEY = "workgraph_base_commit";
+/** The tree of {@link WORKGRAPH_BASE_COMMIT_KEY}. */
+export const WORKGRAPH_BASE_TREE_KEY = "workgraph_base_tree";
+/** The anchored snapshot of the latest implementation or revision result. */
+export const WORKGRAPH_RESULT_COMMIT_KEY = "workgraph_result_commit";
+/** The tree of {@link WORKGRAPH_RESULT_COMMIT_KEY}: what the verdict judges. */
+export const WORKGRAPH_RESULT_TREE_KEY = "workgraph_result_tree";
+/** The tree the close stamp accepted. */
+export const WORKGRAPH_ACCEPTED_TREE_KEY = "workgraph_accepted_tree";
+/** The tree after finalization, written only when finalization changed it. */
+export const WORKGRAPH_FINALIZED_TREE_KEY = "workgraph_finalized_tree";
+
+/** Every tree-binding key, for the one writer that clears them all (override release). */
+export const WORKGRAPH_TREE_BINDING_KEYS: readonly string[] = [
+  WORKGRAPH_WORKSPACE_PATH_KEY,
+  WORKGRAPH_BASE_COMMIT_KEY,
+  WORKGRAPH_BASE_TREE_KEY,
+  WORKGRAPH_RESULT_COMMIT_KEY,
+  WORKGRAPH_RESULT_TREE_KEY,
+  WORKGRAPH_ACCEPTED_TREE_KEY,
+  WORKGRAPH_FINALIZED_TREE_KEY,
+];
+
+/**
  * The lifecycle phase union (README "Durable lifecycle metadata"). the store'
  * four native statuses stay untouched; this is workgraph semantics stored in
  * `workgraph_phase`. Legal edges live in `src/lifecycle.ts`'s LEGAL table.
@@ -196,8 +228,13 @@ export type LeaseEvent =
   | "executor-rejected"
   /** Coordinator (phase 2): no accept/reject inside the deadline — released. */
   | "accept-timeout"
-  /** Coordinator (phase 2): a fenced run:completed landed; issue → judging. */
+  /** Coordinator (phase 2): a fenced run:completed landed; issue → judging.
+   *  An implementer or revision completion also carries `workspacePath` and,
+   *  when a result snapshot was taken, its `tree`. */
   | "run-completed"
+  /** Tree binding: the workspace no longer matched the recorded result tree
+   *  and was snapshotted again; the new tree goes back through review. */
+  | "workspace-changed"
   /** Coordinator (phase 2): a run:completed failed the fencing triple — ignored. */
   | "stale-result-rejected"
   /** workgraph_approve: draft/legacy issue approved into the ready phase. */

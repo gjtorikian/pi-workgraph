@@ -34,6 +34,7 @@ import {
   release,
   setMetadata,
   show,
+  unsetMetadata,
   update,
 } from "./store.ts";
 import { resolveConfig, type WorkgraphConfig } from "./config.ts";
@@ -115,6 +116,7 @@ import {
   WORKGRAPH_DECISION_QUESTION_KEY,
   WORKGRAPH_EXECUTOR_ID_KEY,
   WORKGRAPH_PHASE_KEY,
+  WORKGRAPH_TREE_BINDING_KEYS,
   WORKGRAPH_PLAN_APPROVED_KEY,
   WORKGRAPH_PLAN_CRITIQUE_KEY,
   WORKGRAPH_PLAN_FEEDBACK_KEY,
@@ -618,6 +620,16 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
       // Release: the deliberate unfenced path — clears the assignee and the
       // lease holder/expiry metadata regardless of who holds it.
       await release(ctx.cwd, params.id, actor.bdActor);
+      // A released issue starts over: its next run must not inherit the
+      // previous one's workspace, base or result tree. This is the one
+      // place those keys are cleared — a re-claim, a promotion and a
+      // re-approval all keep the base on purpose (`src/snapshot.ts`).
+      await unsetMetadata(
+        ctx.cwd,
+        params.id,
+        [...WORKGRAPH_TREE_BINDING_KEYS],
+        actor.bdActor,
+      );
       if (resetsPhase) {
         await setMetadata(
           ctx.cwd,

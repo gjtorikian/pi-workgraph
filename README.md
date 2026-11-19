@@ -62,6 +62,13 @@ sessions, harnesses, and machines. Everything else is delegated:
 - [Pi](https://github.com/earendil-works/pi) ≥ 0.83
 - Node ≥ 22.13 (the store is `node:sqlite`; Pi loads the TypeScript source
   directly — no build step, no native dependency)
+- `git` on the `PATH`, and the work in a git repository. The coordinator
+  snapshots each run's working tree with git, so that a verdict names the
+  exact content it judged (see [Tree binding](#tree-binding)). Outside a
+  git repository, medium- and high-risk work does not close under the
+  default policy; set `gates.tree-binding` to `"observe"` to close without
+  a tree. The [pi-subagents bridge](#6-optional-executor-the-pi-subagents-bridge)
+  needs more: a repository with at least one commit, whatever the policy.
 
 ## Install
 
@@ -354,7 +361,9 @@ Note the in-session executor offers `planner` and `implementer` only: with
 nothing else online, `reviewed` and `planned` work reaches judgment and
 escalates for lack of an independent reviewer. Enable the bridge (the
 `subagentsExecutor` setting above, or `--workgraph-subagents-executor=true`)
-for the full chain.
+for the full chain. In-session work is reviewed one issue at a time: the
+next issue is not claimed into the session's checkout while one is under
+review there (see [Tree binding](#tree-binding)).
 
 The flag form:
 
@@ -447,16 +456,17 @@ of seven gates a mode, per risk tier.
 | Gate                | Passes when                                                                           |
 | ------------------- | ------------------------------------------------------------------------------------- |
 | `review`            | The reviewer's verdict has no blocking findings                                       |
-| `tree-binding`      | The verdict, the check receipt, and the close all name the same git tree              |
+| `tree-binding`      | The work has a base tree and a result tree, and the verdict and the close name the result |
 | `check`             | The issue's check command passed on the accepted tree                                 |
 | `criteria-evidence` | The verdict answers every acceptance criterion, with evidence for each one marked met |
 | `weakened-tests`    | The change deletes no tests and skips none                                            |
 | `unproven-tests`    | Every new test fails without the change                                               |
 | `scope`             | The change stays inside the approved plan's path targets                              |
 
-Only `review` is evaluated in this release. The other six are already part
-of the policy, so a policy written today keeps working as each gate gains
-its check. Until then they record nothing, whatever their mode.
+`review` and `tree-binding` are evaluated in this release. The other five
+are already part of the policy, so a policy written today keeps working as
+each gate gains its check. Until then they record nothing, whatever their
+mode.
 
 Each gate has one of three modes:
 
@@ -522,7 +532,105 @@ issue and each gate's latest result on it.
 
 **The verdict record has no mode.** If a reviewer's verdict cannot be
 written to the issue, the run escalates with the write failure as the
-reason. It does not close under `observe` either.
+reason. It does not close under `observe` either. The same holds for the
+close stamp described below.
+
+### Tree binding
+
+Without it, nothing ties a verdict to the content it judged: a reviewer
+could approve one state of the files and the issue close on another. The
+`tree-binding` gate gives every run two git trees and makes every proof
+record name them.
+
+- The **base tree** is what the work started from.
+- The **result tree** is what the implementer handed back. Each revision
+  produces a new one.
+
+The coordinator takes these snapshots itself. It stages the working tree
+into a temporary index, writes a tree, and wraps it in a commit object.
+Your index, your branches and `HEAD` are never written, and no executor is
+asked to commit. A snapshot holds tracked and untracked files and leaves
+ignored files out. A submodule or nested repository is recorded as one
+link, so an edit inside it does not change the tree.
+
+**Where the work is.** An implementer's completion reports its
+`workspace`: the directory it wrote in, and for an isolated executor the
+revision that directory was cut from. The coordinator snapshots that
+directory and sends every later role there: the reviewer, each revision
+and the finalizer all receive `workspace.path`, and the reviewer's request
+also carries `workspace.baseTree` and `workspace.tree`, so the change under
+review is `git diff <baseTree> <tree>`.
+
+**Where the base comes from** depends on the executor:
+
+| Executor                                            | Base                                                                                         |
+| --------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Not isolated (in-session: works in your checkout)   | A snapshot of the checkout, taken just before the implementer starts                         |
+| Isolated (the bridge: works in its own worktree)    | The `baseRevision` its completion reports                                                    |
+
+For in-session work the base therefore includes whatever you had
+uncommitted before the issue was claimed, and none of it is attributed to
+the issue. The base belongs to one workspace path and is kept for as long
+as the issue keeps using that path: across a re-claim, a workflow
+promotion and a re-approval. `workgraph_override` with `action: "release"`
+clears it, along with the other keys below.
+
+**What is checked.** The gate passes when both trees exist. It is
+`unknown` when they do not: the directory is not a git repository, git
+failed, the reported path does not exist, or an isolated executor reported
+no `baseRevision`. Under `enforce` an `unknown` escalates the issue, and
+the reason ends with `set gates.tree-binding to observe to close without
+it`. Under `observe` the would-block is recorded and the run continues,
+and its records name no tree. Under `off` nothing is snapshotted.
+
+With trees in hand:
+
+1. The verdict record and the `review` gate record carry the result tree.
+2. After each review, the workspace is snapshotted again. If it no longer
+   matches the tree that was reviewed, the verdict is discarded
+   (`review-rejected`, reason `workspace changed during review`) and the
+   tree that is there now is reviewed instead.
+3. Before the close, the workspace is compared once more. A change sends
+   the new tree back through review.
+4. Steps 2 and 3 share one bound with unparseable verdicts: after two
+   retries the issue escalates.
+5. The failure fingerprint uses the result tree, so identical findings on
+   changed content count as a new failure, not a repeat.
+
+**The close stamp.** Once the gates have passed and the issue is in
+`verifying`, the coordinator writes one `workgraph-proof stamp {json}`
+comment: the accepted tree, its base tree, the snapshot commit, the
+workflow run, the attempt, the verdict it rests on, and the latest result
+of each evaluated gate. The stamp is written **before** finalization. If
+it cannot be written the issue escalates and does not close. If
+finalization then changes the tree, the new tree is recorded as a
+`workgraph-proof stamp-amended {json}` comment and in
+`workgraph_finalized_tree`; this does not block the close, because
+finalization's external effects have already happened.
+
+**One issue under review per shared checkout.** While an issue whose work
+sits in a non-isolated checkout is in `judging` or `verifying`, the
+coordinator does not claim another issue for a non-isolated executor in
+that checkout. The comparisons above are against the live checkout, so a
+second issue's edits there would read as a change to the first. In-session
+work is therefore reviewed one issue at a time. The log line `workspace
+under review: <issue id>` names the issue in the way. An issue parked in
+`judging` because nothing offers the `reviewer` role holds the checkout
+until a reviewer appears or you release it with `workgraph_override`.
+Isolated executors are never held by this rule. The rule covers the runs
+one coordinator supervises: a second Pi session in the same checkout is
+not held by it, and the comparisons are what catch the result.
+
+**The refs.** Each snapshot commit is anchored under
+`refs/workgraph/<issue>/<run key>/`, so `git gc` keeps it: `base`,
+`result-<attempt>`, `result-<attempt>-<tree>` for a workspace that was
+snapshotted again, and `finalized`. This is not a branch namespace and
+`git push` does not send it by default. The refs are never removed
+automatically. To delete them all:
+
+```bash
+git for-each-ref refs/workgraph --format='%(refname)' | xargs -n1 git update-ref -d
+```
 
 ## How it works
 
@@ -747,7 +855,11 @@ among them `approve`, `plan-critique` (a critic's gaps were recorded
 against a plan), `plan-critique-unavailable` (a critique was attempted and
 the plan parked without one, with the reason), `plan-review` (a plan was
 parked for a human), `plan-approved`, `plan-rejected`,
-`revision-requested`, `escalated`, and `judgment-closed`.
+`revision-requested`, `workspace-changed` (the workspace no longer matched
+the recorded result tree and was snapshotted again), `escalated`, and
+`judgment-closed`. A `run-completed` event for an implementation or a
+revision carries `workspacePath` and, when a snapshot was taken, its
+`tree`; a restarted coordinator rebuilds the run from it.
 Audit writes never block lease operations: the protocol stays correct
 without the trail, and a broken audit surface must not take claiming down
 with it.
@@ -755,8 +867,10 @@ with it.
 Two more trails ride the same comments under their own prefixes.
 `workgraph-verdict` holds each reviewer verdict, and is the one write
 judgment waits on: a verdict that cannot be recorded escalates the run.
-`workgraph-proof` holds each gate result (see [Gates](#gates)) and, like
-the audit trail, never blocks.
+`workgraph-proof` holds each gate result (see [Gates](#gates)), which like
+the audit trail never blocks, and the close stamp (see
+[Tree binding](#tree-binding)), which does: a stamp that cannot be
+recorded escalates the run.
 
 ## Experimental: Control-Plane Protocol v1
 
@@ -800,6 +914,16 @@ issue metadata:
 | `workgraph_planner_provenance`  | Compact JSON describing the planner's effective harness, provider, and model                                                |
 | `workgraph_plan_approved`       | `true` once a human approved the recorded plan; the next claim implements it (cleared on re-approve)                        |
 | `workgraph_plan_feedback`       | Feedback from a rejected plan, carried on the next planner request and consumed by the next recorded plan                   |
+| `workgraph_workspace_path`      | The directory the implementer reported its work in; the base below belongs to this path                                     |
+| `workgraph_base_commit`         | The commit the work started from: a snapshot of a shared checkout, or an isolated executor's reported base revision         |
+| `workgraph_base_tree`           | The tree of `workgraph_base_commit`                                                                                         |
+| `workgraph_result_commit`       | The snapshot commit of the latest implementation or revision result                                                         |
+| `workgraph_result_tree`         | The tree of `workgraph_result_commit`: what the verdict judges                                                              |
+| `workgraph_accepted_tree`       | The tree the close stamp accepted                                                                                           |
+| `workgraph_finalized_tree`      | The tree after finalization, written only when finalization changed it                                                      |
+
+The seven tree keys are scalar strings (see [Tree binding](#tree-binding)).
+A cleared key holds an empty string.
 
 ### 2. State transitions
 
@@ -819,6 +943,9 @@ judging --review gate blocks (enforce, blocking findings)--> revising
 judging --review gate passes (no blocking findings, or observe)--> verifying
 judging --review gate off (no review requested)--> verifying
 judging --verdict record could not be written--> escalated
+judging --tree-binding gate blocks (enforce, no base or result tree)--> escalated
+judging --workspace changed during review or after the verdict--> judging (new result tree, reviewed again)
+verifying --close stamp could not be written--> escalated
 revising --new execution accepted--> revising
 revising --implementation completed--> judging
 verifying --pass--> accepted --close--> closed
@@ -868,6 +995,21 @@ over these Pi event-bus channels in the first transport:
 Dispatch must discover an eligible executor **before** claiming work: no
 executor means no claim, and a missing or incompatible executor leaves the
 issue ready.
+
+Two optional fields carry [tree binding](#tree-binding) across the
+protocol:
+
+- `run:completed` may include `workspace: { path, baseRevision? }`. An
+  implementer sets `path` to the directory it wrote in; an isolated
+  executor adds the revision that directory was cut from. An adapter that
+  omits `workspace` stays valid, and its work is taken to be in the
+  coordinator's own checkout. When the field is present it is validated: a
+  `workspace` without a non-empty string `path` fails the whole message.
+- `run:request` carries `workspace.baseRevision` (the base commit, or `""`
+  when none was recorded) and, on reviewer, revision and finalizer
+  requests, `workspace.path`, `workspace.baseTree` and `workspace.tree`.
+  An adapter that receives `workspace.path` runs the role in that
+  directory.
 
 Consume the schemas without the extension via the `pi-workgraph/protocol`
 subpath export — see [Protocol-only usage](#protocol-only-usage).
@@ -1114,12 +1256,23 @@ opaque `data`. The result is stored in `workgraph_finalization_result`;
 The Pi subagents adapter accepts per-role `options` alongside `routes` in
 `WORKGRAPH_SUBAGENTS_EXECUTOR`: opaque `model`, optional `thinking` (requires
 an explicit model), and `skills` names. Thinking is encoded using Pi's model
-suffix. Explicit skills are passed via Pi's native skill selection. With
-finalization enabled, the adapter creates one retained Git worktree per workflow
-and shares it across implementation, review, revision, and finalization. New
-worktrees start from the source checkout's current commit; staged, unstaged, and
-untracked changes stay in the source checkout. The adapter never removes the
-workflow branch or worktree.
+suffix. Explicit skills are passed via Pi's native skill selection.
+
+The adapter creates one retained Git worktree for every implementer run,
+whether or not finalization is configured, on a branch named
+`workgraph/<issue>-<key>`. Its completion reports that worktree as the
+`workspace`, and review, revision and finalization run in it. New worktrees
+start from the source checkout's current commit; staged, unstaged, and
+untracked changes stay in the source checkout. This needs a git repository
+with at least one commit: in any other directory the adapter rejects the
+implementer request and the issue returns to the ready pool. A reviewer,
+revision or finalizer whose request names `workspace.path` runs in that
+directory without a worktree of its own, which is how a bridged reviewer
+judges an implementation done in the chat session's checkout.
+
+The adapter never removes the workflow branch or worktree, so they
+accumulate, one per implementer run. List them with `git worktree list`;
+remove one with `git worktree remove <path>` and `git branch -D <branch>`.
 Accepted plans are included in every downstream task. Pi executor children retain
 workgraph tools but do not start additional coordinators or recovery sweeps.
 

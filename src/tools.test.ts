@@ -501,6 +501,62 @@ describe("workgraph_override", () => {
     }
   }, 30_000);
 
+  it("override-release clears the workspace, base and result trees; override-close keeps them", async () => {
+    const local = makeScratchGraph({ prefix: "tovr4", seed: 2 });
+    const [released, closed] = local.seededIds as [string, string];
+    const binding = [
+      "workgraph_workspace_path=/work/checkout",
+      "workgraph_base_commit=b0",
+      "workgraph_base_tree=b1",
+      "workgraph_result_commit=r0",
+      "workgraph_result_tree=r1",
+      "workgraph_accepted_tree=a1",
+      "workgraph_finalized_tree=f1",
+    ];
+    try {
+      for (const id of [released, closed]) {
+        local.op(["update", id, "--claim", "--actor", "gone-worker"]);
+        local.op([
+          "update",
+          id,
+          "--set-metadata",
+          "workgraph_lifecycle_version=1",
+          "--set-metadata",
+          "workgraph_phase=judging",
+          "--set-metadata",
+          "workgraph_risk_tier=high",
+          ...binding.flatMap((pair) => ["--set-metadata", pair]),
+        ]);
+      }
+      await run(
+        "workgraph_override",
+        { id: released, action: "release", reason: "start over" },
+        local.dir,
+      );
+      // A released issue starts over: its next run must not inherit the
+      // previous run's workspace or measure against its base.
+      const after = local.showIssue(released).metadata ?? {};
+      for (const pair of binding) {
+        expect(after).not.toHaveProperty(pair.slice(0, pair.indexOf("=")));
+      }
+      // Nothing else was swept up with them.
+      expect(after.workgraph_risk_tier).toBe("high");
+      expect(after.workgraph_phase).toBe("draft");
+
+      await run(
+        "workgraph_override",
+        { id: closed, action: "close", reason: "ship as-is" },
+        local.dir,
+      );
+      // A close is a record of what was there, so it keeps the trees.
+      const kept = local.showIssue(closed).metadata ?? {};
+      expect(kept.workgraph_result_tree).toBe("r1");
+      expect(kept.workgraph_base_tree).toBe("b1");
+    } finally {
+      local.cleanup();
+    }
+  }, 30_000);
+
   it("override-release resets a mid-judging phase to draft for re-approval", async () => {
     const local = makeScratchGraph({ prefix: "tovr3" });
     try {

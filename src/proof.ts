@@ -24,8 +24,19 @@
  * PERSISTENCE follows the audit-trail pattern (`src/audit.ts`): one
  * machine-readable comment per evaluation, `workgraph-proof gate {json}`,
  * written fire-and-forget — a failed gate-record write is logged loudly and
- * never stops judgment. The durable record a close depends on is the verdict
- * (`src/verdict.ts`), not this trail.
+ * never stops judgment.
+ *
+ * THE STAMP is the other record under this prefix, and it is not
+ * fire-and-forget. `workgraph-proof stamp {json}` is written once per
+ * accepted run, after the gates passed and BEFORE finalization: it names
+ * the tree that was accepted, the base it is measured against, the verdict
+ * it rests on and the latest result of every gate that was evaluated. Like
+ * the verdict (`src/verdict.ts`), it is a record a close depends on, so
+ * {@link recordStamp} rejects with {@link StampWriteError} when the write
+ * fails and the caller escalates instead of closing. Comments are
+ * append-only, so a tree changed by finalization is recorded as a second
+ * comment, `workgraph-proof stamp-amended {json}`, which
+ * {@link latestStamp} folds into the stamp it returns.
  */
 import {
   addComment,
@@ -40,6 +51,12 @@ export const PROOF_PREFIX = "workgraph-proof";
 
 /** Marker opening every gate record: the prefix, the record kind, a space. */
 const GATE_MARKER = `${PROOF_PREFIX} gate `;
+
+/** Marker opening the close stamp. The space keeps it from matching an amendment. */
+const STAMP_MARKER = `${PROOF_PREFIX} stamp `;
+
+/** Marker opening a stamp amendment (finalization changed the tree). */
+const STAMP_AMENDED_MARKER = `${PROOF_PREFIX} stamp-amended `;
 
 /** Cap on a record's `reason`, truncation marker included. */
 export const MAX_REASON_CHARS = 400;
@@ -72,7 +89,7 @@ export interface GateRecord {
   wouldBlock: boolean;
   /** capped at {@link MAX_REASON_CHARS} */
   reason?: string;
-  /** the tree the result is bound to (unset until tree binding exists) */
+  /** the result tree the evaluation is bound to; unset when none was recorded */
   tree?: string;
   workflowRunId: string;
   attempt: number;
@@ -251,4 +268,208 @@ export function latestGateRecords<T extends GateRecord>(
     const record = latest.get(gate);
     return record ? [record] : [];
   });
+}
+
+// ---------------------------------------------------------------------------
+// The close stamp
+// ---------------------------------------------------------------------------
+
+/**
+ * What an accepted run was accepted ON. The three tree fields are present
+ * together or not at all: a run whose workspace could not be snapshotted
+ * (`tree-binding: unknown` under `observe`) is stamped without them, which
+ * says exactly that — the close rests on no tree.
+ */
+export interface Stamp {
+  /** The accepted result tree. */
+  tree?: string;
+  /** The tree the work started from. */
+  baseTree?: string;
+  /** The anchored snapshot commit holding `tree`. */
+  commit?: string;
+  workflowRunId: string;
+  attempt: number;
+  /** The verdict the close rests on; absent when no review ran. */
+  verdict?: { executionId: string; summary: string };
+  /** Latest result per gate evaluated for this run. */
+  gates: Record<string, GateResult>;
+  /** Set only when finalization changed the tree (folded in by {@link latestStamp}). */
+  finalizedTree?: string;
+}
+
+/** Thrown when a close stamp could not be written to the comment trail. */
+export class StampWriteError extends Error {
+  readonly issueId: string;
+  /** The underlying write failure. */
+  readonly detail: string;
+
+  constructor(issueId: string, detail: string) {
+    super(`Close stamp for ${issueId} could not be written: ${detail}`);
+    this.name = "StampWriteError";
+    this.issueId = issueId;
+    this.detail = detail;
+  }
+}
+
+/**
+ * Persist the close stamp as `workgraph-proof stamp {json}`. REJECTS with
+ * {@link StampWriteError} when the write fails, unlike {@link recordGate}:
+ * the caller must not close an issue whose stamp was not recorded.
+ */
+export async function recordStamp(
+  cwd: string,
+  issueId: string,
+  stamp: Stamp,
+  actor?: string,
+): Promise<void> {
+  const payload: Stamp = {
+    ...(stamp.tree !== undefined ? { tree: stamp.tree } : {}),
+    ...(stamp.baseTree !== undefined ? { baseTree: stamp.baseTree } : {}),
+    ...(stamp.commit !== undefined ? { commit: stamp.commit } : {}),
+    workflowRunId: stamp.workflowRunId,
+    attempt: stamp.attempt,
+    ...(stamp.verdict !== undefined
+      ? {
+          verdict: {
+            executionId: stamp.verdict.executionId,
+            summary: stamp.verdict.summary,
+          },
+        }
+      : {}),
+    gates: { ...stamp.gates },
+  };
+  const text = `${STAMP_MARKER}${JSON.stringify(payload)}`;
+  try {
+    await addComment(cwd, issueId, text, actor);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // Loud AND blocking — the close must not proceed without the record.
+    console.error(`[pi-workgraph] STAMP WRITE FAILED (${issueId}): ${msg}`);
+    throw new StampWriteError(issueId, msg);
+  }
+}
+
+/**
+ * Record that finalization changed the stamped tree, as
+ * `workgraph-proof stamp-amended {json}`. Resolves even when the write
+ * fails: finalization's external effects have already happened, so nothing
+ * is gained by blocking the close on this record (decision log).
+ */
+export async function recordStampAmendment(
+  cwd: string,
+  issueId: string,
+  amendment: { finalizedTree: string; workflowRunId: string },
+  actor?: string,
+): Promise<void> {
+  const text = `${STAMP_AMENDED_MARKER}${JSON.stringify({
+    finalizedTree: amendment.finalizedTree,
+    workflowRunId: amendment.workflowRunId,
+  })}`;
+  try {
+    await addComment(cwd, issueId, text, actor);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error(
+      `[pi-workgraph] PROOF WRITE FAILED (stamp amendment on ${issueId}): ${msg}`,
+    );
+  }
+}
+
+function jsonObject(text: string): Record<string, unknown> | undefined {
+  try {
+    const raw: unknown = JSON.parse(text);
+    return raw !== null && typeof raw === "object" && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseStamp(json: string): Stamp | undefined {
+  const payload = jsonObject(json);
+  if (
+    !payload ||
+    typeof payload.workflowRunId !== "string" ||
+    typeof payload.attempt !== "number"
+  ) {
+    return undefined;
+  }
+  const gates: Record<string, GateResult> = {};
+  const rawGates = payload.gates;
+  if (
+    rawGates !== null &&
+    typeof rawGates === "object" &&
+    !Array.isArray(rawGates)
+  ) {
+    for (const [gate, value] of Object.entries(rawGates)) {
+      const result = GATE_RESULTS.find((candidate) => candidate === value);
+      if (result !== undefined) gates[gate] = result;
+    }
+  }
+  const verdict = payload.verdict as
+    | { executionId?: unknown; summary?: unknown }
+    | null
+    | undefined;
+  return {
+    ...(typeof payload.tree === "string" ? { tree: payload.tree } : {}),
+    ...(typeof payload.baseTree === "string"
+      ? { baseTree: payload.baseTree }
+      : {}),
+    ...(typeof payload.commit === "string" ? { commit: payload.commit } : {}),
+    workflowRunId: payload.workflowRunId,
+    attempt: payload.attempt,
+    ...(verdict !== null &&
+    typeof verdict === "object" &&
+    typeof verdict.executionId === "string" &&
+    typeof verdict.summary === "string"
+      ? {
+          verdict: {
+            executionId: verdict.executionId,
+            summary: verdict.summary,
+          },
+        }
+      : {}),
+    gates,
+  };
+}
+
+/**
+ * The newest close stamp on an issue, with the newest amendment written
+ * after it for the same run folded in as `finalizedTree`. Undefined when the
+ * issue has none. A comment under either marker that does not parse is
+ * skipped, never thrown.
+ */
+export async function latestStamp(
+  cwd: string,
+  issueId: string,
+): Promise<Stamp | undefined> {
+  const comments = await listComments(cwd, issueId);
+  let finalizedBy: { finalizedTree: string; workflowRunId: string } | undefined;
+  for (let i = comments.length - 1; i >= 0; i--) {
+    const text = comments[i]!.text;
+    if (text.startsWith(STAMP_AMENDED_MARKER)) {
+      const payload = jsonObject(text.slice(STAMP_AMENDED_MARKER.length));
+      if (
+        finalizedBy === undefined &&
+        payload &&
+        typeof payload.finalizedTree === "string" &&
+        typeof payload.workflowRunId === "string"
+      ) {
+        finalizedBy = {
+          finalizedTree: payload.finalizedTree,
+          workflowRunId: payload.workflowRunId,
+        };
+      }
+      continue;
+    }
+    if (!text.startsWith(STAMP_MARKER)) continue;
+    const stamp = parseStamp(text.slice(STAMP_MARKER.length));
+    if (!stamp) continue;
+    return finalizedBy !== undefined &&
+      finalizedBy.workflowRunId === stamp.workflowRunId
+      ? { ...stamp, finalizedTree: finalizedBy.finalizedTree }
+      : stamp;
+  }
+  return undefined;
 }

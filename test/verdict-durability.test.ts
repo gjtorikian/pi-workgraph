@@ -13,7 +13,10 @@
  * and these tests read that audit back.
  *
  * This suite does not pin `PRE_PROOF_POLICY`: each case sets its `review`
- * mode explicitly.
+ * mode explicitly and every other gate runs on its shipped default. The
+ * `tree-binding` gate enforces at medium risk, so the integration cases run
+ * in a real git repository (`makeScratchRepo`) with a fake that reports its
+ * workspace — the setup a user's bridged executor has.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -43,7 +46,9 @@ import {
   COMMENT_WRITE_FAILURE,
   failCommentWrites,
   makeScratchGraph,
+  makeScratchRepo,
   type ScratchGraph,
+  type ScratchRepo,
 } from "./helpers/scratch.ts";
 
 const WORKER = "verdict-durability-worker";
@@ -115,7 +120,7 @@ async function commentsStarting(dir: string, id: string, marker: string): Promis
 
 /** One issue, one implementation, one review returning `verdict`, driven to rest. */
 async function judge(
-  graph: ScratchGraph,
+  graph: ScratchRepo,
   policy: PolicyOverrides,
   verdict: VerdictT,
 ): Promise<{ id: string; reviews: number; cleanup: () => Promise<void> }> {
@@ -124,6 +129,9 @@ async function judge(
   const { mock, coordinator } = makeHarness(policy);
   const fake = installFakeExecutor(mock.events, {
     roles: ["implementer", "reviewer"],
+    // Isolated, with its work in the repository and cut from HEAD: the
+    // tree-binding gate passes and the case is about the verdict alone.
+    workspace: { path: graph.dir, baseRevision: graph.head },
     roleScripts: {
       implementer: { provenance: IMPL_PROV, artifacts: ["src/thing.ts"] },
       reviewer: { provenance: REV_PROV, verdict },
@@ -203,7 +211,7 @@ describe("a failed verdict write never closes", () => {
   ] as const)(
     "review %s, %s: the run escalates and the audit carries the write failure",
     async (mode, _what, verdict) => {
-      const graph = makeScratchGraph({ prefix: "vdfail", seed: 1 });
+      const graph = makeScratchRepo({ prefix: "vdfail", seed: 1 });
       failCommentWrites(graph.dir, "workgraph-verdict");
       vi.spyOn(console, "error").mockImplementation(() => {});
       const flow = await judge(graph, reviewMode(mode), verdict);
@@ -227,9 +235,14 @@ describe("a failed verdict write never closes", () => {
 
         expect(await commentsStarting(graph.dir, id, VERDICT_MARKER)).toEqual([]);
         expect(await commentsStarting(graph.dir, id, "workgraph-lease judgment-closed ")).toEqual([]);
-        // The gate was never applied: its result is recorded only once the
-        // verdict it rests on is durable.
-        expect(await listGateRecords(graph.dir, id)).toEqual([]);
+        // The review gate was never applied: its result is recorded only
+        // once the verdict it rests on is durable. (The tree-binding gate
+        // is evaluated before the review and has its own record.)
+        const records = await listGateRecords(graph.dir, id);
+        expect(records.filter((r) => r.gate === "review")).toEqual([]);
+        expect(records.map((r) => [r.gate, r.result])).toEqual([
+          ["tree-binding", "pass"],
+        ]);
         expect(heldLeases(graph.dir)).toHaveLength(0);
       } finally {
         await flow.cleanup();
@@ -242,7 +255,7 @@ describe("a failed verdict write never closes", () => {
   it.each(["enforce", "observe"] as const)(
     "control, review %s: the same clean verdict closes once the write can land",
     async (mode) => {
-      const graph = makeScratchGraph({ prefix: "vdctl", seed: 1 });
+      const graph = makeScratchRepo({ prefix: "vdctl", seed: 1 });
       const flow = await judge(graph, reviewMode(mode), CLEAN_VERDICT);
       try {
         const { id } = flow;
@@ -259,7 +272,7 @@ describe("a failed verdict write never closes", () => {
   );
 
   it("review off attempts no verdict, so an unwritable verdict trail changes nothing", async () => {
-    const graph = makeScratchGraph({ prefix: "vdoff", seed: 1 });
+    const graph = makeScratchRepo({ prefix: "vdoff", seed: 1 });
     failCommentWrites(graph.dir, "workgraph-verdict");
     const flow = await judge(graph, reviewMode("off"), CLEAN_VERDICT);
     try {

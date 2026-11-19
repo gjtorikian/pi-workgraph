@@ -139,10 +139,14 @@ export function artifactDigest(artifacts: readonly string[]): string {
 
 /**
  * The failure fingerprint stored in `workgraph_failure_fingerprint`:
- * sha256 over the canonical JSON of the BLOCKING findings plus the artifact
- * digest of the implementation result being judged. A repeated blocking
- * verdict without a changed artifact digest escalates instead of
- * relaunching revisions (decision log).
+ * sha256 over the canonical JSON of the BLOCKING findings plus a digest of
+ * the implementation result being judged. `digest` is the RESULT TREE when
+ * the work was snapshotted, so the fingerprint follows file content: the
+ * same findings on changed content are a new failure, not a repeat. When no
+ * tree exists (tree binding off, or no git repository) it falls back to
+ * {@link artifactDigest}, which only sees the artifact path list. A repeated
+ * blocking verdict on an unchanged digest escalates instead of relaunching
+ * revisions (decision log).
  */
 export function failureFingerprint(
   blocking: readonly FindingT[],
@@ -179,7 +183,8 @@ export function verdictSummary(verdict: VerdictT): string {
  * Persist one verdict as a machine-readable comment:
  * `workgraph-verdict verdict {json}` — findings capped/truncated, extra
  * context (`details`: workflowRunId, executionId, reviewer provenance,
- * attempt) folded in. REJECTS with {@link VerdictWriteError} when the write
+ * attempt, and `tree` — the result tree the verdict judged, when one was
+ * recorded) folded in. REJECTS with {@link VerdictWriteError} when the write
  * fails, unlike `recordLeaseEvent`: the caller must not close an issue whose
  * verdict was not recorded (see the module comment).
  */

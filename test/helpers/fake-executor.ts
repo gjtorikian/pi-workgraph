@@ -63,6 +63,16 @@ export interface RoleScript {
   provenance?: RunCompletedT["provenance"];
   artifacts?: string[];
   rejectReason?: string;
+  /** Reported as the completion's `workspace` (where the work is). */
+  workspace?: FakeWorkspace;
+  /**
+   * Runs when the scripted run does its "work": synchronously, after the
+   * accept and BEFORE the completion is emitted (for `accept-stall`, when
+   * the test calls `complete()`). The hook is how a fake edits files in the
+   * workspace — an implementer that writes a file, a reviewer or finalizer
+   * that should not have.
+   */
+  onRequest?: (request: RunRequestT) => void;
 }
 
 /**
@@ -91,6 +101,12 @@ export interface FakeExecutorOptions {
   rejectReason?: string;
   /** Default provenance on completions (default `{harness: "fake"}`). */
   provenance?: RunCompletedT["provenance"];
+  /** Default `workspace` on every completion (a role script's wins). An
+   *  isolated fake reports `{ path, baseRevision }`; the default fake
+   *  reports nothing, like an executor that predates the field. */
+  workspace?: FakeWorkspace;
+  /** Default `onRequest` hook for every role (a role script's wins). */
+  onRequest?: (request: RunRequestT) => void;
   /** Per-role response scripts (phase-3 judgment playground). */
   roleScripts?: Partial<Record<ExecutorRoleT, RoleScript | RoleScript[]>>;
   /** Delay the discovery offer (late-offer / deadline tests). */
@@ -111,6 +127,9 @@ export interface FakeExecutorOptions {
   status?: FakeStatusScript;
 }
 
+/** Where a fake says its work is; rides `run:completed` as `workspace`. */
+export type FakeWorkspace = NonNullable<RunCompletedT["workspace"]>;
+
 export interface CompleteOverrides {
   /** Override the echoed lease epoch (stale-result tests). */
   leaseEpoch?: number;
@@ -120,6 +139,7 @@ export interface CompleteOverrides {
   finalization?: unknown;
   provenance?: RunCompletedT["provenance"];
   artifacts?: string[];
+  workspace?: FakeWorkspace;
 }
 
 export interface FakeExecutorHandle {
@@ -179,6 +199,7 @@ export function installFakeExecutor(
     const plan = overrides.plan ?? script.plan;
     const finalization = overrides.finalization ?? script.finalization;
     const critique = script.critique;
+    const workspace = overrides.workspace ?? script.workspace ?? opts.workspace;
     return {
       ...newEnvelope(),
       workflowRunId: request.workflowRunId,
@@ -207,7 +228,17 @@ export function installFakeExecutor(
       ...(plan !== undefined ? { plan } : {}),
       ...(critique !== undefined ? { critique } : {}),
       ...(finalization !== undefined ? { finalization } : {}),
+      ...(workspace !== undefined ? { workspace } : {}),
     } as RunCompletedT;
+  }
+
+  /**
+   * Run the scripted `onRequest` hook. BEFORE the completion is built and
+   * emitted: the coordinator snapshots the workspace inside its completion
+   * handler, so an edit made any later would not be in the result tree.
+   */
+  function runHook(script: RoleScript, request: RunRequestT): void {
+    (script.onRequest ?? opts.onRequest)?.(request);
   }
 
   function emitCompletion(message: RunCompletedT): void {
@@ -291,6 +322,7 @@ export function installFakeExecutor(
       });
 
       if (behavior === "accept-complete") {
+        runHook(script, msg);
         const completion = buildCompletion(msg, executionId, {}, script);
         emitCompletion(completion);
         if (opts.duplicateCompletion) {
@@ -367,6 +399,7 @@ export function installFakeExecutor(
       if (!lastAccepted) {
         throw new Error("fake executor: no accepted run to complete");
       }
+      runHook(lastAccepted.script, lastAccepted.request);
       const message = buildCompletion(
         lastAccepted.request,
         lastAccepted.executionId,

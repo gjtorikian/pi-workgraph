@@ -19,7 +19,8 @@
  *
  * This module owns the pure/protocol pieces — enumeration, partition, the
  * correlated status exchange, and audit-trail reconstruction of a judging
- * run's author completion. The ADOPTION itself (coordinator state, inboxes,
+ * run's author completion and of its tree binding (workspace path, base
+ * and result tree). The ADOPTION itself (coordinator state, inboxes,
  * heartbeats, the judgment loop) lives in coordinator.ts's `reconcile()`,
  * which composes these. Everything here is fenced + idempotent: a
  * reconciliation that crashes midway is safe to re-run — unprocessed issues
@@ -29,7 +30,14 @@ import type { EventBus } from "@earendil-works/pi-coding-agent";
 import { AUDIT_PREFIX } from "./audit.ts";
 import { listComments, listInProgressUpdatedBefore } from "./store.ts";
 import { leaseExpiresAtOf, leaseHolderOf, rfc3339 } from "./lease.ts";
-import { workflowRunIdOf } from "./lifecycle.ts";
+import {
+  baseCommitOf,
+  baseTreeOf,
+  resultCommitOf,
+  resultTreeOf,
+  workflowRunIdOf,
+  workspacePathOf,
+} from "./lifecycle.ts";
 import {
   CH,
   newEnvelope,
@@ -289,6 +297,103 @@ export async function reconstructAuthorCompletion(
     };
   }
   return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Tree-binding reconstruction for judging/revising/verifying re-adoption
+// ---------------------------------------------------------------------------
+
+const WORKSPACE_CHANGED_PREFIX = `${AUDIT_PREFIX} workspace-changed `;
+
+/** What a restarted coordinator can recover about a run's workspace and trees. */
+export interface RecoveredBinding {
+  /** Where the work lives. */
+  workspacePath?: string;
+  /** The result tree recorded for THIS run, if any. */
+  resultTree?: string;
+  /** The anchored snapshot commit holding `resultTree`, when still on record. */
+  resultCommit?: string;
+  baseCommit?: string;
+  baseTree?: string;
+}
+
+/**
+ * Rebuild a run's workspace path, base and result tree after a restart.
+ *
+ * The RESULT TREE comes from the audit trail, not from
+ * `workgraph_result_tree`: metadata survives a re-claim, so after a crash
+ * that key can still hold the previous run's tree. The newest
+ * `run-completed` (implementer or revision) or `workspace-changed` event
+ * carrying THIS run's id is the tree currently under judgment. An event
+ * with no tree — a run from before tree binding, or one whose snapshot
+ * failed — yields none, and the caller snapshots at re-adoption.
+ *
+ * The BASE comes from metadata, and only when it belongs to the same
+ * workspace: the base is keyed by workspace path.
+ */
+export async function reconstructBinding(
+  cwd: string,
+  issue: WorkIssue,
+): Promise<RecoveredBinding> {
+  const workflowRunId = workflowRunIdOf(issue);
+  let eventPath: string | undefined;
+  let eventTree: string | undefined;
+  if (workflowRunId !== undefined) {
+    let comments: Awaited<ReturnType<typeof listComments>> = [];
+    try {
+      comments = await listComments(cwd, issue.id);
+    } catch {
+      comments = []; // no trail readable — fall back to metadata for the path
+    }
+    for (let i = comments.length - 1; i >= 0; i--) {
+      const text = comments[i]!.text;
+      const prefix = text.startsWith(RUN_COMPLETED_PREFIX)
+        ? RUN_COMPLETED_PREFIX
+        : text.startsWith(WORKSPACE_CHANGED_PREFIX)
+          ? WORKSPACE_CHANGED_PREFIX
+          : undefined;
+      if (prefix === undefined) continue;
+      let details: Record<string, unknown>;
+      try {
+        const parsed: unknown = JSON.parse(text.slice(prefix.length));
+        if (
+          parsed === null ||
+          typeof parsed !== "object" ||
+          Array.isArray(parsed)
+        ) {
+          continue;
+        }
+        details = parsed as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      if (details.workflowRunId !== workflowRunId) continue;
+      if (details.role === "planner") continue; // a plan has no result tree
+      if (typeof details.workspacePath === "string" && details.workspacePath) {
+        eventPath = details.workspacePath;
+      }
+      if (typeof details.tree === "string" && details.tree) {
+        eventTree = details.tree;
+      }
+      break; // the newest matching event decides, tree or no tree
+    }
+  }
+  const workspacePath = eventPath ?? workspacePathOf(issue);
+  const sameWorkspace =
+    workspacePath !== undefined && workspacePathOf(issue) === workspacePath;
+  const baseCommit = sameWorkspace ? baseCommitOf(issue) : undefined;
+  const baseTree = sameWorkspace ? baseTreeOf(issue) : undefined;
+  const resultCommit =
+    eventTree !== undefined && resultTreeOf(issue) === eventTree
+      ? resultCommitOf(issue)
+      : undefined;
+  return {
+    ...(workspacePath !== undefined ? { workspacePath } : {}),
+    ...(eventTree !== undefined ? { resultTree: eventTree } : {}),
+    ...(resultCommit !== undefined ? { resultCommit } : {}),
+    ...(baseCommit !== undefined ? { baseCommit } : {}),
+    ...(baseTree !== undefined ? { baseTree } : {}),
+  };
 }
 
 function stringArray(raw: unknown): string[] {

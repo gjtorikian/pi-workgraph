@@ -23,7 +23,7 @@ import {
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   registerInSessionExecutor,
   IN_SESSION_EXECUTOR_ID,
@@ -78,6 +78,38 @@ function makeBridgeHarness(
   return { mock, bridge, warnings, config };
 }
 
+/**
+ * The repository every default request names. A bridged implementer always
+ * works in a workgraph-owned worktree cut from HEAD, so its request needs a
+ * real git repository with one commit — the same requirement a user has.
+ * One for the whole suite: cases that share a workflow-run id share its
+ * retained worktree, exactly as later roles of one run do.
+ */
+let SUITE_REPO = "";
+
+beforeAll(() => {
+  SUITE_REPO = mkdtempSync(join(tmpdir(), "workgraph-adapter-repo-"));
+  const git = (...args: string[]) =>
+    execFileSync("git", args, { cwd: SUITE_REPO, stdio: "ignore" });
+  git("init", "-q");
+  git(
+    "-c",
+    "user.name=Test",
+    "-c",
+    "user.email=test@example.com",
+    "-c",
+    "commit.gpgsign=false",
+    "commit",
+    "--allow-empty",
+    "-qm",
+    "test: seed repository",
+  );
+});
+
+afterAll(() => {
+  if (SUITE_REPO) rmSync(SUITE_REPO, { recursive: true, force: true });
+});
+
 function makeRunRequest(overrides: Partial<RunRequestT> = {}): RunRequestT {
   return {
     ...newEnvelope(),
@@ -93,7 +125,11 @@ function makeRunRequest(overrides: Partial<RunRequestT> = {}): RunRequestT {
     leaseEpoch: 3,
     role: "implementer",
     attempt: 1,
-    workspace: { baseRevision: "", requiresIsolation: true },
+    workspace: {
+      baseRevision: "",
+      requiresIsolation: true,
+      repoPath: SUITE_REPO,
+    },
     ...overrides,
   };
 }
@@ -316,7 +352,12 @@ describe("implementer round-trip", () => {
         }),
       );
       expect(fake.requests[0]!.params.agent).toBe("economy-worker");
-      expect(fake.requests[0]!.params.worktree).toBe(true);
+      // A workgraph-owned worktree, named by `cwd`; the upstream `worktree`
+      // option is not sent at all.
+      expect(fake.requests[0]!.params.cwd).toEqual(
+        expect.stringContaining("checkout"),
+      );
+      expect(fake.requests[0]!.params).not.toHaveProperty("worktree");
     } finally {
       fake.uninstall();
       bridge.teardown();
@@ -336,11 +377,17 @@ describe("implementer round-trip", () => {
       const request = makeRunRequest();
       mock.events.emit(CH.runRequest, request);
 
-      // Role mapping: implementer → a fresh worktree-isolated worker.
+      // Role mapping: implementer → a fresh worker in a workgraph-owned
+      // worktree (no finalization is configured here: the worktree does not
+      // depend on it).
       expect(fake.requests).toHaveLength(1);
       const params = fake.requests[0]!.params;
       expect(params.agent).toBe("worker");
-      expect(params.worktree).toBe(true);
+      expect(params).not.toHaveProperty("worktree");
+      const checkout = String(params.cwd);
+      expect(checkout).toContain(join("workgraph", "runs"));
+      expect(checkout.endsWith("checkout")).toBe(true);
+      expect(statSync(checkout).isDirectory()).toBe(true);
       expect(params.context).toBe("fresh");
       expect(String(params.task)).toContain("wire the flux capacitor");
       expect(String(params.task)).toContain("the capacitor fluxes");
@@ -370,7 +417,17 @@ describe("implementer round-trip", () => {
           model: "anthropic/claude-test-1",
           provider: "anthropic",
         },
-        artifacts: ["/tmp/artifacts/run-1"],
+        // The workspace first, then what upstream reported.
+        artifacts: [checkout, "/tmp/artifacts/run-1"],
+        // WHERE THE WORK IS: the path the core snapshots and sends every
+        // later role to, and the revision the worktree was cut from.
+        workspace: {
+          path: checkout,
+          baseRevision: execFileSync("git", ["rev-parse", "HEAD"], {
+            cwd: SUITE_REPO,
+            encoding: "utf8",
+          }).trim(),
+        },
       });
       expect(completions[0]!.executionId).toBe(
         (accepted[0] as { executionId: string }).executionId,
@@ -1189,6 +1246,137 @@ it("keeps every downstream role in the implementation worktree", async () => {
     bridge.teardown();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+describe("workspace routing", () => {
+  it("rejects an implementer whose repository path is not a git repository", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bridge-nogit-"));
+    const { mock, bridge } = makeBridgeHarness();
+    const upstream = installFakeSubagents(mock.events);
+    try {
+      mock.events.emit(
+        CH.runRequest,
+        makeRunRequest({
+          workspace: { repoPath: dir, baseRevision: "", requiresIsolation: true },
+        }),
+      );
+      // No upstream launch; the rejection carries git's own message.
+      expect(upstream.requests).toHaveLength(0);
+      const rejected = busOn(mock, CH.runRejected) as Array<{ reason: string }>;
+      expect(rejected).toHaveLength(1);
+      expect(rejected[0]!.reason).toMatch(/not a git repository/i);
+      expect(bridge.activeRunCount()).toBe(0);
+    } finally {
+      upstream.uninstall();
+      bridge.teardown();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["without finalization", undefined],
+    ["with finalization", { instructions: "Export to our system" }],
+  ] as const)(
+    "%s: a later role is launched in the directory its request names, with no worktree of its own",
+    async (_label, finalization) => {
+      // Where an in-session implementer left its work: the user's own
+      // checkout. Not a git repository here, which proves no manifest and
+      // no worktree is looked up for it.
+      const reported = mkdtempSync(join(tmpdir(), "bridge-reported-"));
+      const { mock, bridge } = makeBridgeHarness(
+        finalization ? { finalization } : {},
+      );
+      const upstream = installFakeSubagents(mock.events, {
+        script: { structuredOutput: { findings: [] } },
+      });
+      const roles = finalization
+        ? ["reviewer", "revision", "finalizer"]
+        : ["reviewer", "revision"];
+      try {
+        for (const role of roles) {
+          mock.events.emit(
+            CH.runRequest,
+            makeRunRequest({
+              role,
+              workspace: {
+                repoPath: reported,
+                baseRevision: "",
+                requiresIsolation: false,
+                path: reported,
+              },
+            }),
+          );
+          await mock.flushEvents();
+        }
+        expect(busOn(mock, CH.runRejected)).toEqual([]);
+        expect(upstream.requests).toHaveLength(roles.length);
+        for (const request of upstream.requests) {
+          expect(request.params.cwd).toBe(reported);
+          expect(request.params).not.toHaveProperty("worktree");
+        }
+        // Each completion says where it ran, and nothing more.
+        const completions = busOn(mock, CH.runCompleted) as RunCompletedT[];
+        expect(completions).toHaveLength(roles.length);
+        for (const completion of completions) {
+          expect(completion.workspace).toEqual({ path: reported });
+          expect(completion.artifacts[0]).toBe(reported);
+        }
+      } finally {
+        upstream.uninstall();
+        bridge.teardown();
+        rmSync(reported, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("the reviewer task names the base and result trees only when the request carries all three", () => {
+    const sentence =
+      'The change under review is "git diff aaa111 bbb222" in /work/checkout. Do not modify any file.';
+    const bound = buildSubagentTask(
+      makeRunRequest({
+        role: "reviewer",
+        workspace: {
+          baseRevision: "c0ffee",
+          requiresIsolation: false,
+          path: "/work/checkout",
+          baseTree: "aaa111",
+          tree: "bbb222",
+        },
+      }),
+    );
+    expect(bound.split("\n")).toContain(sentence);
+
+    // Unbound (tree binding off, or no git repository): the task text is
+    // what it always was.
+    for (const workspace of [
+      { baseRevision: "", requiresIsolation: false },
+      { baseRevision: "", requiresIsolation: false, path: "/work/checkout" },
+      {
+        baseRevision: "",
+        requiresIsolation: false,
+        path: "/work/checkout",
+        tree: "bbb222",
+      },
+    ]) {
+      const task = buildSubagentTask(makeRunRequest({ role: "reviewer", workspace }));
+      expect(task).not.toContain("git diff");
+      expect(task).not.toContain("Do not modify any file.");
+    }
+    // Only a reviewer is told this.
+    const revision = buildSubagentTask(
+      makeRunRequest({
+        role: "revision",
+        workspace: {
+          baseRevision: "",
+          requiresIsolation: false,
+          path: "/work/checkout",
+          baseTree: "aaa111",
+          tree: "bbb222",
+        },
+      }),
+    );
+    expect(revision).not.toContain("git diff");
+  });
 });
 
 it("does not treat a thinking suffix as a different model", async () => {

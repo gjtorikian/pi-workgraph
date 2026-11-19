@@ -230,9 +230,16 @@ export function defaultProbeVersion(): string | undefined {
 /** One bridged run: the requestId ↔ executionId mapping is OURS — upstream
  *  slash events carry no executionId, so the bridge mints one and keeps the
  *  correlation for update/response/cancel routing. */
+/**
+ * Where a bridged run works: the retained worktree's whole manifest for a
+ * run that resolved one, or only the path for a role sent to a directory
+ * the request named. Either way the completion reports it as `workspace`.
+ */
+type BridgedWorkspace = WorkflowWorkspace | { path: string };
+
 interface BridgedRun {
   detached?: { runId?: string; question: string };
-  workspace?: WorkflowWorkspace;
+  workspace?: BridgedWorkspace;
   requestId: string;
   workflowRunId: string;
   executionId: string;
@@ -332,6 +339,15 @@ export function buildSubagentTask(
       "",
       "You are an INDEPENDENT reviewer: evaluate the implementation against the acceptance criteria and report your verdict as structured output matching the provided schema.",
     );
+    // Only when the core bound the work to trees: the sentence names all
+    // three, and a request without them (tree binding off, or no git
+    // repository) keeps the task text it always had.
+    const { path, baseTree, tree } = msg.workspace;
+    if (path && baseTree && tree) {
+      lines.push(
+        `The change under review is "git diff ${baseTree} ${tree}" in ${path}. Do not modify any file.`,
+      );
+    }
     if (Array.isArray(msg.artifacts) && msg.artifacts.length > 0) {
       lines.push(
         "Artifacts under review:",
@@ -651,7 +667,7 @@ export function registerPiSubagentsExecutor(
       plan?: unknown;
       critique?: unknown;
       finalization?: unknown;
-      workspace?: WorkflowWorkspace;
+      workspace?: BridgedWorkspace;
     } = {
       ...newEnvelope(nowFn),
       workflowRunId: run.workflowRunId,
@@ -768,14 +784,27 @@ export function registerPiSubagentsExecutor(
         return;
       }
 
-      // Planning-time roles read the source checkout: the workflow's
-      // workspace is cut for the implementer, so none exists yet when a
-      // planner or a plan critic runs, and resolving one would reject them.
-      let workspace: WorkflowWorkspace | undefined;
-      if (
-        deps.getConfig().finalization &&
-        msg.role !== "planner" &&
-        msg.role !== "plan_critic"
+      // WHERE THE ROLE RUNS.
+      //  - planner, plan_critic: the source checkout. The workflow's
+      //    workspace is cut for the implementer, so none exists yet.
+      //  - implementer: ALWAYS a workgraph-owned worktree, cut from HEAD and
+      //    retained, whether or not finalization is configured. The core
+      //    snapshots the work where it lives, so it must learn that path,
+      //    and an upstream-owned worktree never reports one. This requires
+      //    a git repository with at least one commit.
+      //  - reviewer, revision, finalizer: the directory the request names
+      //    (`workspace.path`, the implementer's reported workspace). No
+      //    manifest is looked up, which is what lets a bridged reviewer
+      //    judge work an in-session implementer left in the user's checkout.
+      //    A request without a path keeps the older behavior: the retained
+      //    worktree when finalization is configured, else an upstream one.
+      let workspace: BridgedWorkspace | undefined;
+      const planning = msg.role === "planner" || msg.role === "plan_critic";
+      if (!planning && msg.role !== "implementer" && msg.workspace.path) {
+        workspace = { path: msg.workspace.path };
+      } else if (
+        msg.role === "implementer" ||
+        (!planning && deps.getConfig().finalization)
       ) {
         try {
           if (!msg.workspace.repoPath)
