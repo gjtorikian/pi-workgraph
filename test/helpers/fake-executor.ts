@@ -46,6 +46,8 @@ export interface RoleScript {
   behavior?: FakeBehavior;
   outcome?: RunOutcomeT;
   executionError?: string;
+  decisionQuestion?: string;
+  workerPending?: boolean;
   evidence?: string[];
   /** Attached verbatim as the completion's extra `verdict` field (phase-3
    *  verdict transport: non-strict schemas tolerate it). */
@@ -53,6 +55,10 @@ export interface RoleScript {
   /** Attached verbatim as the completion's extra `plan` field (the planner
    *  tier uses the same non-strict transport as the verdict). */
   plan?: unknown;
+  /** Attached verbatim as the completion's extra `critique` field (the
+   *  plan_critic transport). Presence, not truthiness, decides: `null` and
+   *  malformed values are sent as-is so tests can drive the invalid paths. */
+  critique?: unknown;
   finalization?: unknown;
   provenance?: RunCompletedT["provenance"];
   artifacts?: string[];
@@ -172,6 +178,7 @@ export function installFakeExecutor(
     const verdict = overrides.verdict ?? script.verdict;
     const plan = overrides.plan ?? script.plan;
     const finalization = overrides.finalization ?? script.finalization;
+    const critique = script.critique;
     return {
       ...newEnvelope(),
       workflowRunId: request.workflowRunId,
@@ -186,12 +193,19 @@ export function installFakeExecutor(
       ...(script.executionError
         ? { executionError: script.executionError }
         : {}),
+      ...(script.decisionQuestion
+        ? {
+            decisionQuestion: script.decisionQuestion,
+            workerPending: script.workerPending,
+          }
+        : {}),
       provenance: overrides.provenance ??
         script.provenance ??
         opts.provenance ?? { harness: "fake" },
-      // Extra v1-tolerated fields — the verdict and plan transports.
+      // Extra v1-tolerated fields — the verdict, plan, and critique transports.
       ...(verdict !== undefined ? { verdict } : {}),
       ...(plan !== undefined ? { plan } : {}),
+      ...(critique !== undefined ? { critique } : {}),
       ...(finalization !== undefined ? { finalization } : {}),
     } as RunCompletedT;
   }

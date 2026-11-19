@@ -5,7 +5,7 @@
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { resetAuditForTest } from "./audit.ts";
-import { bindExec, listComments } from "./bd.ts";
+import { listComments } from "./store.ts";
 import {
   defaultLeaseActor,
   resetIdentityForTest,
@@ -24,7 +24,7 @@ import {
   verifyHolding,
 } from "./lease.ts";
 import { findExpired, reclaim, resetSweepForTest } from "./sweep.ts";
-import type { BeadsComment } from "./bd.ts";
+import type { WorkComment } from "./store.ts";
 import { makeMockPi, type MockPi } from "../test/helpers/mock-pi.ts";
 import {
   makeScratchGraph,
@@ -48,14 +48,13 @@ async function auditRecords(
   graph: ScratchGraph,
   id: string,
   kind: string,
-): Promise<BeadsComment[]> {
+): Promise<WorkComment[]> {
   const all = await listComments(graph.dir, id);
   return all.filter((c) => c.text.startsWith(`workgraph-lease ${kind} `));
 }
 
 beforeAll(() => {
   mock = makeMockPi();
-  bindExec((command, args, options) => mock.exec(command, args, options));
 }, 60_000);
 
 beforeEach(() => {
@@ -135,7 +134,7 @@ describe("acquireLease", () => {
     const graph = makeScratchGraph({ prefix: "lcf" });
     try {
       const id = graph.createIssue("contested");
-      graph.bd(["update", id, "--claim", "--actor", "someone-else"]);
+      graph.op(["update", id, "--claim", "--actor", "someone-else"]);
       await expect(
         acquireLease(graph.dir, { issueId: id, ttlMs: TTL, actor: defaultLeaseActor() }),
       ).rejects.toThrow(/already claimed/);
@@ -156,7 +155,7 @@ describe("verifyHolding", () => {
 
       // Simulated reclaim: a manual epoch bump — the exact signal a stale
       // holder must abort on.
-      graph.bd(["update", id, "--set-metadata", "lease_epoch=99"]);
+      graph.op(["update", id, "--set-metadata", "lease_epoch=99"]);
       await expect(verifyHolding(graph.dir, outcome.lease, "w-alpha")).resolves.toBe(false);
     } finally {
       graph.cleanup();
@@ -169,7 +168,7 @@ describe("verifyHolding", () => {
       const id = graph.createIssue("stolen holder");
       const outcome = await acquireLease(graph.dir, { issueId: id, ttlMs: TTL, actor: defaultLeaseActor() });
       if (outcome.kind !== "acquired") throw new Error("acquire failed");
-      graph.bd(["update", id, "--set-metadata", "lease_holder=w-other"]);
+      graph.op(["update", id, "--set-metadata", "lease_holder=w-other"]);
       await expect(verifyHolding(graph.dir, outcome.lease, "w-alpha")).resolves.toBe(false);
     } finally {
       graph.cleanup();
@@ -206,7 +205,7 @@ describe("renewLease", () => {
       const id = graph.createIssue("reclaimed under me");
       const outcome = await acquireLease(graph.dir, { issueId: id, ttlMs: TTL, actor: defaultLeaseActor() });
       if (outcome.kind !== "acquired") throw new Error("acquire failed");
-      graph.bd([
+      graph.op([
         "update",
         id,
         "--set-metadata",
@@ -258,7 +257,7 @@ describe("releaseLease", () => {
       const id = graph.createIssue("not yours anymore");
       const outcome = await acquireLease(graph.dir, { issueId: id, ttlMs: TTL, actor: defaultLeaseActor() });
       if (outcome.kind !== "acquired") throw new Error("acquire failed");
-      graph.bd(["update", id, "--set-metadata", "lease_epoch=5"]);
+      graph.op(["update", id, "--set-metadata", "lease_epoch=5"]);
       await expect(releaseLease(graph.dir, outcome.lease, defaultLeaseActor())).rejects.toThrow(
         FencingError,
       );
@@ -321,7 +320,7 @@ describe("sweep", () => {
     const graph = makeScratchGraph({ prefix: "lsw4" });
     try {
       const id = graph.createIssue("manual human claim");
-      graph.bd(["update", id, "--claim", "--actor", "a-human"]);
+      graph.op(["update", id, "--claim", "--actor", "a-human"]);
 
       const opts = { ttlMs: TTL, now: shifted(TTL + 2_000) };
       await expect(findExpired(graph.dir, opts)).resolves.toEqual([]);

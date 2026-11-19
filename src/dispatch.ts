@@ -37,7 +37,7 @@
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { recordLeaseEvent } from "./audit.ts";
-import { bdBinaryAvailable, ensureWorkspace, ready } from "./bd.ts";
+import { ensureWorkspace, ready } from "./store.ts";
 import type { WorkgraphConfig } from "./config.ts";
 import { defaultLeaseActor } from "./identity.ts";
 import {
@@ -48,7 +48,7 @@ import {
   renewLease,
 } from "./lease.ts";
 import { clearLeaseStatus, showLeaseStatus } from "./status.ts";
-import type { BeadsIssue, Lease } from "./types.ts";
+import type { WorkIssue, Lease } from "./types.ts";
 
 /** Kill-switch flag (dash-case, matching `workgraph-worker-id`): pass
  *  `--workgraph-dispatch=false` for tools + context without autonomy. */
@@ -77,7 +77,7 @@ export interface DispatchDeps {
 /** The issue dispatch is currently driving, with its lease. */
 export interface CurrentDispatch {
   lease: Lease;
-  issue: BeadsIssue;
+  issue: WorkIssue;
 }
 
 /** Handle returned by {@link registerDispatch}; tests drive ticks directly. */
@@ -95,7 +95,7 @@ export interface DispatchController {
 }
 
 /** The wake message content. Exported for tests and prompt review. */
-export function buildWorkPrompt(issue: BeadsIssue, lease: Lease): string {
+export function buildWorkPrompt(issue: WorkIssue, lease: Lease): string {
   const lines = [
     `[workgraph dispatch] You are assigned work-graph issue ${issue.id}: "${issue.title}".`,
   ];
@@ -242,16 +242,11 @@ export function registerDispatch(
     }
 
     if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
-
-    if (!bdBinaryAvailable()) {
-      logSkipOnce("bd CLI not found");
-      return;
-    }
     try {
       await ensureWorkspace(ctx.cwd);
     } catch {
-      // No .beads/ here — dispatch stays inert. ensureWorkspace does not
-      // cache failures, so a mid-session `bd init` is picked up.
+      // No workspace here — dispatch stays inert. ensureWorkspace does not
+      // cache failures, so a mid-session workgraph_init is picked up.
       return;
     }
 
@@ -263,7 +258,7 @@ export function registerDispatch(
       return;
     }
 
-    // bd's atomic `ready --claim` path. "empty" (pool drained since the
+    // the store's atomic claim-next path. "empty" (pool drained since the
     // probe) and "lost-race" both mean: no claim this tick, try again later.
     const outcome = await acquireLease(ctx.cwd, {
       ttlMs: config.leaseTtlMs,
@@ -330,7 +325,7 @@ export function registerDispatch(
         }
         return;
       }
-      // Transient bd trouble: keep the lease, retry on the next beat.
+      // Transient the store trouble: keep the lease, retry on the next beat.
       const msg = e instanceof Error ? e.message : String(e);
       logSkipOnce(`heartbeat failed (will retry): ${msg}`);
     }
@@ -358,7 +353,7 @@ export function registerDispatch(
         // Release as the actor stored at acquire time.
         await releaseLease(ctx.cwd, cur.lease, held.actor);
       } catch (e) {
-        // FencingError (reclaimed at shutdown) or bd trouble: either way the
+        // FencingError (reclaimed at shutdown) or the store trouble: either way the
         // lease is no longer ours to strand — log and finish shutting down.
         const msg = e instanceof Error ? e.message : String(e);
         console.error(

@@ -45,6 +45,7 @@ import type {
   SubagentsRoleRoutes,
   WorkgraphConfig,
 } from "../config.ts";
+import { tierFor } from "../tiers.ts";
 import {
   CH,
   newEnvelope,
@@ -61,8 +62,9 @@ import {
   type RunRequestT,
 } from "../protocol.ts";
 import { DEFAULT_WORKFLOW_CLASS, type WorkflowClassT } from "../types.ts";
-import { ISSUE_HALT_EVENT, issueHaltNotice } from "../issue-control.ts";
+import { ISSUE_HALT_EVENT, issueHaltNotice, renderDecision } from "../issue-control.ts";
 import { workflowWorkspace, type WorkflowWorkspace } from "./workspace.ts";
+import { supervisorQuestion } from "./subagent-decision.ts";
 
 export const PI_SUBAGENTS_EXECUTOR_ID = "pi-subagents";
 export const PI_SUBAGENTS_ADAPTER_VERSION = "0.1.0";
@@ -93,6 +95,8 @@ export const UPSTREAM_EVENTS = {
    * which is why the bridge answers unknown-run cancels itself.
    */
   cancel: "subagent:slash:cancel",
+  /** Detached child process has exited (verified against pi-subagents 0.41). */
+  foregroundComplete: "subagent:foreground-complete",
 } as const;
 
 /**
@@ -101,7 +105,9 @@ export const UPSTREAM_EVENTS = {
  * request a worktree-isolated fresh worker; reviewer runs are SEPARATE
  * fresh launches carrying the structured-verdict output schema — never a
  * finalization pass on the implementer's own run. Planner runs use the
- * upstream `planner` profile and structured output. `verifier` is
+ * upstream `planner` profile and structured output. Plan-critic runs use
+ * the upstream `reviewer` profile by default and carry the plan-critique
+ * output schema; they judge a PLAN, never an implementation. `verifier` is
  * deliberately unmapped (and not offered).
  */
 export const ROLE_MAP: Partial<
@@ -112,6 +118,7 @@ export const ROLE_MAP: Partial<
   revision: { agent: "worker", worktree: true },
   reviewer: { agent: "reviewer", worktree: false },
   finalizer: { agent: "worker", worktree: false },
+  plan_critic: { agent: "reviewer", worktree: false },
 };
 
 export const PI_SUBAGENTS_ROLES: ExecutorRoleT[] = [
@@ -119,6 +126,7 @@ export const PI_SUBAGENTS_ROLES: ExecutorRoleT[] = [
   "implementer",
   "reviewer",
   "revision",
+  "plan_critic",
 ];
 
 /** Resolve a named upstream profile without coupling the core to model IDs. */
@@ -223,6 +231,7 @@ export function defaultProbeVersion(): string | undefined {
  *  slash events carry no executionId, so the bridge mints one and keeps the
  *  correlation for update/response/cancel routing. */
 interface BridgedRun {
+  detached?: { runId?: string; question: string };
   workspace?: WorkflowWorkspace;
   requestId: string;
   workflowRunId: string;
@@ -304,7 +313,18 @@ export function buildSubagentTask(
   if (msg.issue.acceptanceCriteria) {
     lines.push("", `Acceptance criteria: ${msg.issue.acceptanceCriteria}`);
   }
-  if (msg.plan) lines.push("", "Accepted implementation plan:", msg.plan);
+  if (msg.plan) {
+    // A critic reads the plan BEFORE the human gate: calling it accepted
+    // would tell the critic the decision it informs was already made.
+    lines.push(
+      "",
+      msg.role === "plan_critic"
+        ? "Proposed implementation plan (not yet approved by a human):"
+        : "Accepted implementation plan:",
+      msg.plan,
+    );
+  }
+  if (msg.decision) lines.push("", ...renderDecision(msg.decision));
   if (msg.instructions)
     lines.push("", "Workflow instructions:", msg.instructions);
   if (msg.role === "reviewer") {
@@ -320,9 +340,31 @@ export function buildSubagentTask(
     }
   }
   if (msg.role === "planner") {
+    if (msg.feedback) {
+      lines.push(
+        "",
+        "A previous plan for this issue was REJECTED with this feedback — address it:",
+        msg.feedback,
+      );
+    }
     lines.push(
       "",
       "Produce a concrete implementation plan as structured output matching the provided schema. Do not modify product code.",
+    );
+  }
+  if (msg.role === "plan_critic") {
+    // The default upstream profile is `reviewer`, whose own prompt reviews
+    // an implementation. The task has to say plainly that none exists, or
+    // the critic goes looking for changes instead of gaps in the plan.
+    lines.push(
+      "",
+      "You are a PLAN CRITIC reading this plan cold. You have the issue, its acceptance criteria, the proposed plan above, and this repository. You did not see how the plan was made. No implementation exists yet: there is nothing to review except the plan.",
+      "Answer one question: what would an implementer who receives only this plan have to guess?",
+      "Report at most 5 gaps, most important first, as structured output matching the provided schema. For each gap, `step` is the 1-based number of the plan step it concerns (omit it for a gap about the plan as a whole), and `note` is the specific question the implementer would have to answer, in one sentence.",
+      "Worth reporting: a step with two plausible readings; a decision the plan leaves open; a file, function, or type the plan names that does not exist in this repository and is not marked as new; an acceptance criterion that no step delivers.",
+      "Not worth reporting: style preferences, alternative designs, general risks, or open questions the plan already lists.",
+      "If the plan can be built as written, return an empty gaps list. An empty list is a valid and useful answer.",
+      "Do not modify any files. Your output is advisory: a human reads it next to the plan and decides.",
     );
   }
   if (msg.priorFindings !== undefined && msg.priorFindings.length > 0) {
@@ -535,7 +577,10 @@ export function registerPiSubagentsExecutor(
         ? "success"
         : "failure";
     const evidence: string[] = [];
-    if (!first) evidence.push("upstream returned no completed child result");
+    if (run.detached)
+      evidence.push(`Needs your decision: ${run.detached.question}`);
+    else if (!first)
+      evidence.push("upstream returned no completed child result");
     else if (outcome !== "success") {
       evidence.push(
         `upstream child did not complete successfully (exitCode: ${String(first.exitCode)})`,
@@ -594,9 +639,17 @@ export function registerPiSubagentsExecutor(
       run.role === "planner" && first?.structuredOutput !== undefined
         ? first.structuredOutput
         : undefined;
+    // The critique rides ONLY a plan-critic run's structured output, under
+    // the same rule: emitted as-is, never synthesized. The coordinator's
+    // critique parser is the validator, and its failure path parks the plan.
+    const critique =
+      run.role === "plan_critic" && first?.structuredOutput !== undefined
+        ? first.structuredOutput
+        : undefined;
     const completed: RunCompletedT & {
       verdict?: unknown;
       plan?: unknown;
+      critique?: unknown;
       finalization?: unknown;
       workspace?: WorkflowWorkspace;
     } = {
@@ -605,7 +658,10 @@ export function registerPiSubagentsExecutor(
       executionId: run.executionId,
       issueId: run.issueId,
       leaseEpoch: run.leaseEpoch,
-      outcome,
+      outcome: run.detached ? "blocked" : outcome,
+      ...(run.detached
+        ? { decisionQuestion: run.detached.question, workerPending: true }
+        : {}),
       artifacts,
       evidence,
       ...(!first || childError
@@ -623,6 +679,7 @@ export function registerPiSubagentsExecutor(
       },
       ...(verdict !== undefined ? { verdict } : {}),
       ...(plan !== undefined ? { plan } : {}),
+      ...(critique !== undefined ? { critique } : {}),
       ...(run.role === "finalizer"
         ? { finalization: first?.structuredOutput }
         : {}),
@@ -711,8 +768,15 @@ export function registerPiSubagentsExecutor(
         return;
       }
 
+      // Planning-time roles read the source checkout: the workflow's
+      // workspace is cut for the implementer, so none exists yet when a
+      // planner or a plan critic runs, and resolving one would reject them.
       let workspace: WorkflowWorkspace | undefined;
-      if (deps.getConfig().finalization && msg.role !== "planner") {
+      if (
+        deps.getConfig().finalization &&
+        msg.role !== "planner" &&
+        msg.role !== "plan_critic"
+      ) {
         try {
           if (!msg.workspace.repoPath)
             throw new Error("workflow request is missing its repository path");
@@ -727,8 +791,15 @@ export function registerPiSubagentsExecutor(
           return;
         }
       }
-      const roleOptions =
-        configured.options?.[msg.role as keyof SubagentsRoleRoutes];
+      // A resolved tier is the default launch model for the role; an explicit
+      // per-role option (model, thinking, skills) still wins.
+      const tier = tierFor(msg.role);
+      const roleOptions = {
+        ...(tier
+          ? { model: tier.id, ...(tier.thinking ? { thinking: tier.thinking } : {}) }
+          : {}),
+        ...configured.options?.[msg.role as keyof SubagentsRoleRoutes],
+      };
       if (roleOptions?.thinking && !roleOptions.model) {
         reject("a thinking override requires an explicit model");
         return;
@@ -759,8 +830,11 @@ export function registerPiSubagentsExecutor(
           task: buildSubagentTask(
             msg as RunRequestT & { artifacts?: string[] },
           ),
-          worktree: workspace ? false : mapping.worktree,
-          ...(workspace ? { cwd: workspace.path } : {}),
+          // Workgraph owns this checkout. Modern upstream runtimes reject
+          // the legacy worktree option even when its value is false.
+          ...(workspace
+            ? { cwd: workspace.path }
+            : { worktree: mapping.worktree }),
           ...(model ? { model } : {}),
           ...(roleOptions?.skills ? { skill: roleOptions.skills } : {}),
           ...(msg.role === "finalizer"
@@ -861,6 +935,21 @@ export function registerPiSubagentsExecutor(
       if (typeof payload.requestId !== "string") return;
       const run = runs.get(payload.requestId);
       if (!run || !run.submitted) return; // not an upstream execution
+      const first = firstResult(payload.result);
+      if (first?.detached === true || first?.exitCode === -2) {
+        if (run.detached) return; // repeated handoff receipt
+        const runId = (payload.result as { details?: { runId?: unknown } })
+          ?.details?.runId;
+        run.detached = {
+          ...(typeof runId === "string" && runId ? { runId } : {}),
+          question: supervisorQuestion(first.artifactPaths),
+        };
+        // A handoff is a request for input, never a reviewable failure. Keep
+        // ownership and the executor slot until the CHILD confirms exit.
+        if (run.cancelPending) cancelDetached(run);
+        else emitCompleted(run, payload as UpstreamResponse);
+        return;
+      }
       const details = (
         payload.result as
           { details?: { asyncId?: unknown; results?: unknown[] } } | undefined
@@ -877,6 +966,7 @@ export function registerPiSubagentsExecutor(
         );
         return;
       }
+      if (run.detached && typeof first?.exitCode !== "number") return;
       runs.delete(run.requestId);
       // Finish emitting this result before starting the next upstream call.
       queueMicrotask(launchNext);
@@ -943,7 +1033,7 @@ export function registerPiSubagentsExecutor(
         emitCancelled(run);
         return;
       }
-      emitCompleted(run, response);
+      if (!run.detached) emitCompleted(run, response);
     }),
   );
 
@@ -965,7 +1055,9 @@ export function registerPiSubagentsExecutor(
           return;
         }
         run.cancelPending = true;
-        pi.events.emit(UPSTREAM_EVENTS.cancel, { requestId: run.requestId });
+        if (run.detached) cancelDetached(run);
+        else
+          pi.events.emit(UPSTREAM_EVENTS.cancel, { requestId: run.requestId });
         return; // the ack follows upstream's post-cancel response
       }
       // Unknown/finished run: upstream parks unknown requestIds in
@@ -979,6 +1071,43 @@ export function registerPiSubagentsExecutor(
           ? { executionId: msg.executionId }
           : {}),
       });
+    }),
+  );
+
+  function cancelDetached(run: BridgedRun): void {
+    if (!run.detached?.runId) return; // No target, no invented acknowledgment.
+    // The original slash controller has gone away after detaching. Target
+    // the retained child, and ignore the management receipt: it is not exit.
+    pi.events.emit(UPSTREAM_EVENTS.request, {
+      requestId: newEnvelope(nowFn).messageId,
+      params: { action: "interrupt", id: run.detached.runId },
+    });
+  }
+  unsubs.push(
+    pi.events.on(UPSTREAM_EVENTS.foregroundComplete, (data) => {
+      if (!data || typeof data !== "object") return;
+      const event = data as {
+        runId?: unknown;
+        taskIndex?: unknown;
+        state?: unknown;
+        source?: unknown;
+      };
+      if (
+        event.source !== "foreground" ||
+        event.taskIndex !== 0 ||
+        !["complete", "completed", "failed", "paused", "stopped"].includes(
+          String(event.state),
+        )
+      )
+        return;
+      for (const run of runs.values()) {
+        if (!run.detached?.runId || run.detached.runId !== event.runId)
+          continue;
+        runs.delete(run.requestId);
+        if (run.cancelPending) emitCancelled(run);
+        queueMicrotask(launchNext);
+        break;
+      }
     }),
   );
 

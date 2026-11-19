@@ -157,6 +157,21 @@ describe("schema validation", () => {
     }
   });
 
+  it("accepts the plan_critic role in offers and run requests; an unknown role still rejects", () => {
+    const offer: ExecutorOfferT = { ...validOffer(), roles: ["planner", "plan_critic"] };
+    expect(parseMessage(CH.offer, ExecutorOffer, offer)).toEqual(offer);
+    const request: RunRequestT = { ...validRequest(), role: "plan_critic" };
+    expect(parseMessage(CH.runRequest, RunRequest, request)).toEqual(request);
+
+    // The enum grew by one member; it did not become open-ended.
+    expect(() =>
+      parseMessage(CH.offer, ExecutorOffer, { ...validOffer(), roles: ["plan_reviewer"] }),
+    ).toThrow(ProtocolError);
+    expect(() =>
+      parseMessage(CH.runRequest, RunRequest, { ...validRequest(), role: "plan_reviewer" }),
+    ).toThrow(ProtocolError);
+  });
+
   it("validates optional workflow topology and risk independently", () => {
     const request = validRequest();
     expect(parseMessage(CH.runRequest, RunRequest, request)).toEqual(request);

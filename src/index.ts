@@ -1,5 +1,5 @@
 /**
- * pi-workgraph — Pi extension exposing the beads (bd) work graph as six
+ * pi-workgraph — Pi extension exposing the work graph as six
  * typed tools for coordinated agent workers, plus (Phase 3) an in-session
  * dispatch loop, per-turn context injection, a compaction takeover, and a
  * status-bar surface.
@@ -10,7 +10,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerInSessionExecutor } from "./adapters/in-session.ts";
 import { isPiSubagentProcess, registerPiSubagentsExecutor } from "./adapters/pi-subagents.ts";
-import { bdBinaryAvailable, bindExec } from "./bd.ts";
 import { registerCompactionTakeover } from "./compaction.ts";
 import { registerConfigFlags, resolveConfig } from "./config.ts";
 import { registerContextInjection } from "./context.ts";
@@ -20,16 +19,47 @@ import { registerCoordinator } from "./coordinator.ts";
 import { MIN_POLL_MS } from "./dispatch.ts";
 import { noteSessionId, setWorkerIdOverride } from "./identity.ts";
 import { heldLeases } from "./lease.ts";
+import { configureStore, initWorkspace } from "./store.ts";
 import { registerSweep } from "./sweep.ts";
+import { effectiveTiers, noteSessionCwd } from "./settings.ts";
+import {
+  describeTiers,
+  parseTiersValue,
+  resolveTiers,
+  setResolvedTiers,
+  storeTiers,
+} from "./tiers.ts";
 import { registerWorkgraphTools } from "./tools.ts";
 
 export default function piWorkgraph(pi: ExtensionAPI): void {
   registerConfigFlags(pi);
-  bindExec((command, args, options) => pi.exec(command, args, options));
   registerWorkgraphTools(pi);
+  registerWorkgraphCommand(pi);
   // Executor children retain tools, while scheduling and recovery belong to
   // the parent coordinator. Pi runtime detection stays in the Pi adapter.
   if (isPiSubagentProcess()) return;
+
+  // Model tiers resolve against the registry FIRST on session_start — this
+  // handler is registered before every adapter and the coordinator, so the
+  // first dispatch already sees the routing table.
+  pi.on("session_start", async (_event, ctx) => {
+    noteSessionCwd(ctx.cwd);
+    configureStore(resolveConfig(pi).store);
+    // Flag/env, else project .pi/settings.json, else what a `workgraph_tiers`
+    // call stored in this workspace, else ~/.pi/agent/settings.json.
+    const effective = await effectiveTiers(resolveConfig(pi).tiers, ctx.cwd);
+    if (!effective) {
+      setResolvedTiers(undefined);
+      return;
+    }
+    const { resolved, unresolved } = resolveTiers(ctx.modelRegistry, effective.tiers);
+    setResolvedTiers(resolved);
+    for (const miss of unresolved) {
+      console.error(
+        `[pi-workgraph] tier ${miss.role}: no available model matches "${miss.pattern}" — that role runs untiered`,
+      );
+    }
+  });
 
   // The in-session compatibility executor MUST register before the
   // coordinator: both listen for `agent_settled`, and registration order
@@ -111,12 +141,58 @@ export default function piWorkgraph(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", (_event, ctx) => {
-    // Probe bd availability up front (the tools throw a one-line install
+    // Probe the store availability up front (the tools throw a one-line install
     // hint when it's missing — the extension itself stays loaded), wire the
     // identity override, and resolve the session-id component of workerId()
     // now that a ctx exists.
-    bdBinaryAvailable(true);
     setWorkerIdOverride(resolveConfig(pi).workerIdOverride);
     noteSessionId(ctx.sessionManager.getSessionId());
+  });
+}
+
+/**
+ * `/workgraph <init [prefix] | tiers | help>` — the few operator actions
+ * that are awkward to route through a model turn.
+ */
+function registerWorkgraphCommand(pi: ExtensionAPI): void {
+  pi.registerCommand("workgraph", {
+    description: "workgraph: init [prefix] (create the workspace here), tiers (show model routing)",
+    async handler(args, ctx) {
+      const [sub, ...rest] = args.trim().split(/\s+/).filter(Boolean);
+      const say = (message: string, type: "info" | "warning" | "error" = "info") => {
+        if (ctx.hasUI) ctx.ui.notify(message, type);
+        else console.log(`[pi-workgraph] ${message}`);
+      };
+      switch (sub) {
+        case "init": {
+          const result = await initWorkspace(ctx.cwd, { prefix: rest[0] });
+          say(
+            `${result.created ? "Initialized" : "Found"} workgraph workspace for ${result.root} — ${result.databasePath} (ids "${result.prefix}-…")`,
+          );
+          return;
+        }
+        case "tiers": {
+          if (rest[0]) {
+            // `/workgraph tiers <json>` (or off) stores the choice here.
+            await storeTiers(ctx.cwd, parseTiersValue(rest.join(" ")));
+          }
+          const effective = await effectiveTiers(resolveConfig(pi).tiers, ctx.cwd);
+          if (!effective) {
+            say(
+              'No model tiers configured. Declare "workgraph": { "tiers": { "planner": "provider/id", ... } } in ~/.pi/agent/settings.json or .pi/settings.json.',
+            );
+            return;
+          }
+          const { resolved, unresolved } = resolveTiers(ctx.modelRegistry, effective.tiers);
+          setResolvedTiers(resolved);
+          const lines = [`(from ${effective.origin})`, ...describeTiers(resolved)];
+          for (const miss of unresolved) lines.push(`${miss.role}: no match for "${miss.pattern}"`);
+          say(lines.length > 0 ? lines.join("\n") : "No tiers resolved");
+          return;
+        }
+        default:
+          say("usage: /workgraph init [prefix] | tiers [json|off]", "warning");
+      }
+    },
   });
 }

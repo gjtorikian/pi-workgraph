@@ -9,14 +9,14 @@
  * "model" immediately completes each dispatched issue via workgraph_close,
  * exactly as the legacy wake prompt instructs.
  *
- * Assertions run against the bd exec log (`getExecLog`): every claim went
+ * Assertions run against the bd exec log (`getOpLog`): every claim went
  * through the atomic `ready --claim` path, and no code path wrote a bare
  * `--assignee` (the collision-freedom invariant).
  *
  * Run via `npm run test:dispatch`.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { bindExec, getExecLog, resetExecLog } from "../src/bd.ts";
+import { getOpLog, resetOpLog } from "../src/store.ts";
 import type { WorkgraphConfig } from "../src/config.ts";
 import {
   DISPATCH_MESSAGE_TYPE,
@@ -57,7 +57,6 @@ let ectx: MockEventContext;
 
 beforeAll(() => {
   mock = makeMockPi();
-  bindExec((command, args, options) => mock.exec(command, args, options));
   registerWorkgraphTools(asExtensionAPI(mock));
   controller = registerDispatch(asExtensionAPI(mock), {
     getConfig: () => TEST_CONFIG,
@@ -68,7 +67,7 @@ beforeAll(() => {
   setWorkerIdOverride(WORKER);
   graph = makeScratchGraph({ seed: POOL_SIZE, prefix: "drain" });
   ectx = makeEventContext(graph.dir);
-  resetExecLog();
+  resetOpLog();
 }, 60_000);
 
 afterAll(async () => {
@@ -88,7 +87,7 @@ afterAll(async () => {
 async function completeCurrentIssue(issueId: string): Promise<void> {
   const close = mock.tools.get("workgraph_close");
   if (!close) throw new Error("workgraph_close not registered");
-  graph.bd([
+  graph.op([
     "update",
     issueId,
     "--set-metadata",
@@ -151,12 +150,12 @@ describe("criterion 4: drain 5 seeded issues", () => {
 
     // Exec-log invariants: all claims via atomic `ready --claim`; zero bare
     // assignee writes anywhere in the drain.
-    const log = getExecLog();
-    const claims = log.filter((entry) => entry.args.includes("--claim"));
+    const log = getOpLog();
+    const claims = log.filter((entry) => (entry.op === "claim" || entry.op === "claimNext"));
     expect(claims).toHaveLength(POOL_SIZE);
     for (const claim of claims) {
-      expect(claim.args[0]).toBe("ready");
+      expect(claim.op).toBe("claimNext");
     }
-    expect(log.some((entry) => entry.args.includes("--assignee"))).toBe(false);
+    expect(log.some((entry) => entry.op === "overwriteAssignee")).toBe(false);
   }, 120_000);
 });

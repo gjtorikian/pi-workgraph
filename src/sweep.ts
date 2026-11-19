@@ -3,28 +3,27 @@
  * by fencing.
  *
  * Detection is dual-condition by design (the clock-skew guard):
- *   1. server-side — `bd list --status in_progress --updated-before
- *      <now - TTL>`; a heartbeating worker bumps `updated_at` (local to bd's
+ *   1. server-side — `store list --status in_progress --updated-before
+ *      <now - TTL>`; a heartbeating worker bumps `updated_at` (local to the store's
  *      clock) on every renewal, so live workers never appear here; and
  *   2. client-side — `lease_expires_at < now()` confirms against the lease
  *      the holder actually wrote.
  * A skewed clock must beat BOTH conditions before work is stolen mid-flight.
  *
- * Reclaim cannot be atomic (bd has no CAS), so it is fenced: the epoch bump
+ * Reclaim cannot be atomic (the metadata merge is last-writer-wins), so it is fenced: the epoch bump
  * lands BEFORE the assignee overwrite, and post-write verification elects
  * exactly one winner when reclaimers race (same shape as acquisition).
  */
 import type { EventBus, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { recordLeaseEvent } from "./audit.ts";
 import {
-  bdBinaryAvailable,
   ensureWorkspace,
   listInProgressUpdatedBefore,
   overwriteAssigneeForReclaim,
   setMetadata,
   show,
   update,
-} from "./bd.ts";
+} from "./store.ts";
 import type { WorkgraphConfig } from "./config.ts";
 import { defaultLeaseActor, workerId } from "./identity.ts";
 import {
@@ -45,7 +44,7 @@ import {
   workflowRunIdOf,
 } from "./lifecycle.ts";
 import { CH, newEnvelope, type RunCancelT } from "./protocol.ts";
-import type { BeadsIssue, Lease } from "./types.ts";
+import type { WorkIssue, Lease } from "./types.ts";
 import {
   LEASE_EPOCH_KEY,
   LEASE_EXPIRES_AT_KEY,
@@ -59,13 +58,13 @@ export interface SweepOptions {
   ttlMs: number;
   /** Clock injection for tests (default Date.now). */
   now?: () => number;
-  /** bd `--actor`; defaults to workerId(). */
+  /** the store actor; defaults to workerId(). */
   actor?: string;
 }
 
 /**
  * Stale in_progress claims with NO lease metadata (claimed by a human's
- * manual `bd update --claim`, or by pre-lease Phase 1 code) are flagged
+ * manual the store, or by pre-lease Phase 1 code) are flagged
  * `expire-detected` but never auto-reclaimed — stealing a human's claim is
  * worse than a stalled issue. Flag once per issue per process, not once per
  * sweep tick (a 500 ms poll would otherwise bury the issue in comments).
@@ -86,11 +85,11 @@ export function resetSweepForTest(): void {
 export async function findExpired(
   cwd: string,
   opts: SweepOptions,
-): Promise<BeadsIssue[]> {
+): Promise<WorkIssue[]> {
   const nowFn = opts.now ?? Date.now;
   const nowMs = nowFn();
   const actor = opts.actor ?? workerId();
-  // bd compares timestamps at SECOND precision; round the cutoff UP so
+  // the store compares timestamps at SECOND precision; round the cutoff UP so
   // flooring it doesn't hide a just-expired lease for an extra second (the
   // reclaim-latency bound is TTL + poll + tolerance, and a rounding second
   // eats most of the tolerance). Being ≤1 s aggressive here is safe: the
@@ -99,7 +98,7 @@ export async function findExpired(
   const cutoff = rfc3339(Math.ceil((nowMs - opts.ttlMs) / 1_000) * 1_000);
 
   const stale = await listInProgressUpdatedBefore(cwd, cutoff);
-  const expired: BeadsIssue[] = [];
+  const expired: WorkIssue[] = [];
   for (const issue of stale) {
     const expiresAt = leaseExpiresAtOf(issue);
     if (expiresAt === undefined) {
@@ -133,7 +132,7 @@ export async function findExpired(
  */
 export async function reclaim(
   cwd: string,
-  issue: BeadsIssue,
+  issue: WorkIssue,
   opts: SweepOptions,
 ): Promise<Lease | null> {
   const nowFn = opts.now ?? Date.now;
@@ -146,7 +145,7 @@ export async function reclaim(
   const epoch = oldEpoch + 1;
   const expiresAt = rfc3339(nowFn() + opts.ttlMs);
 
-  // The takeover: epoch fence and assignee overwrite in ONE bd update, so
+  // The takeover: epoch fence and assignee overwrite in ONE store update, so
   // there is no window where the assignee moved but the epoch did not (and
   // reclaim latency stays inside the contract's TTL + poll + tolerance
   // bound — every extra serialized write here counts against it).
@@ -171,7 +170,7 @@ export async function reclaim(
   trackLease(cwd, lease, { holder: me, bdActor: actor });
   // Deliberately NOT awaited: the reclaim is complete once the fenced
   // takeover verifies; the audit record must never add to (or block) the
-  // reclaim latency. The exec queue still serializes it before any later bd
+  // reclaim latency. The exec queue still serializes it before any later the store
   // call from this process, and recordLeaseEvent never rejects.
   void recordLeaseEvent(
     cwd,
@@ -203,7 +202,7 @@ export async function reclaim(
  * `reclaim()` itself is deliberately untouched (its direct-call takeover
  * behavior is asserted by four suites); this composes around it. The
  * metadata reset clears ONLY `workgraph_phase` (→ ready) and
- * `workgraph_active_execution_id` (→ "" — bd's setMetadata cannot unset;
+ * `workgraph_active_execution_id` (→ "" — the store's setMetadata cannot unset;
  * readers normalize empty to undefined). `workgraph_failure_fingerprint`
  * and `workgraph_attempt` survive by design: fingerprint history must
  * persist across reclaims (decision log).
@@ -215,7 +214,7 @@ export async function reclaim(
  */
 export async function reclaimAndLeaveReady(
   cwd: string,
-  issue: BeadsIssue,
+  issue: WorkIssue,
   opts: SweepOptions,
   events?: EventBus,
 ): Promise<boolean> {
@@ -354,7 +353,7 @@ export function registerSweep(pi: ExtensionAPI, deps: SweepDeps): SweepControlle
     try {
       await tickInner(ctx);
     } catch (e) {
-      // Transient bd trouble: log once, retry next tick.
+      // Transient the store trouble: log once, retry next tick.
       const msg = e instanceof Error ? e.message : String(e);
       logSkipOnce(msg);
     } finally {
@@ -363,15 +362,11 @@ export function registerSweep(pi: ExtensionAPI, deps: SweepDeps): SweepControlle
   }
 
   async function tickInner(ctx: ExtensionContext): Promise<void> {
-    if (!bdBinaryAvailable()) {
-      logSkipOnce("bd CLI not found");
-      return;
-    }
     try {
       await ensureWorkspace(ctx.cwd);
     } catch {
-      // No .beads/ here — the sweep stays inert. ensureWorkspace does not
-      // cache failures, so a mid-session `bd init` is picked up.
+      // No workspace here — the sweep stays inert. ensureWorkspace does not
+      // cache failures, so a mid-session workgraph_init is picked up.
       return;
     }
 
@@ -381,7 +376,7 @@ export function registerSweep(pi: ExtensionAPI, deps: SweepDeps): SweepControlle
       now: nowFn,
       actor: defaultLeaseActor().bdActor,
     };
-    // A nothing-expired tick is read-only: findExpired is one bd list plus
+    // A nothing-expired tick is read-only: findExpired is one store list plus
     // client-side filtering — zero writes.
     const expired = await findExpired(ctx.cwd, opts);
     for (const issue of expired) {

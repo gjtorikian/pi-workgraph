@@ -26,7 +26,7 @@
  *  - APPROVED WORK ONLY: the coordinator claims lifecycle-v1 issues in
  *    phase "ready" (approved via workgraph_approve); legacy issues need the
  *    explicit `compatLegacyIssues` opt-in and receive lifecycle metadata at
- *    claim. Because bd's `ready --claim` is metadata-blind, claims go
+ *    claim. Because the store's `ready --claim` is metadata-blind, claims go
  *    through the equally-atomic claim-by-id path after client-side
  *    filtering; a claim conflict is a lost race, not an error.
  *  - Every claim mints a FRESH workflow-run holder (via the injected
@@ -52,16 +52,24 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { recordLeaseEvent } from "./audit.ts";
 import {
-  BdError,
-  bdBinaryAvailable,
+  StoreError,
   close,
   ensureWorkspace,
   ready,
   setMetadata,
   show,
   update,
-} from "./bd.ts";
+  type MetadataValue,
+} from "./store.ts";
 import type { WorkgraphConfig } from "./config.ts";
+import {
+  critiqueSummary,
+  MAX_GAPS,
+  parsePlanCritique,
+  PlanCritiqueError,
+  recordPlanCritique,
+  unavailableSummary,
+} from "./critique.ts";
 import { DISPATCH_FLAG } from "./dispatch.ts";
 import {
   discoverExecutors,
@@ -71,6 +79,7 @@ import {
 } from "./executor-registry.ts";
 import { FinalizationResult, parseFinalizationResult } from "./finalization.ts";
 import {
+  decisionAnswer,
   ISSUE_HALT_EVENT,
   issueHaltNotice,
   sourceWorkspace,
@@ -97,6 +106,8 @@ import {
   executorIdOf,
   failureFingerprintOf,
   isLifecycleV1,
+  planApprovedOf,
+  planFeedbackOf,
   LifecycleError,
   phaseOf,
   riskTierOf,
@@ -105,6 +116,7 @@ import {
   workflowRunIdOf,
 } from "./lifecycle.ts";
 import {
+  latestPlan,
   parsePlan,
   PlanError,
   planSummary,
@@ -137,16 +149,18 @@ import {
 import { clearLeaseStatus, showLeaseStatus } from "./status.ts";
 import { reclaimAndLeaveReady } from "./sweep.ts";
 import type {
-  BeadsIssue,
+  WorkIssue,
   IdentityProvider,
   Lease,
   LeaseActor,
+  PlanCritiqueT,
   PlanT,
   WorkflowClassT,
   VerdictT,
 } from "./types.ts";
 import {
   Plan,
+  PlanCritique,
   Verdict,
   WORKGRAPH_ACTIVE_EXECUTION_ID_KEY,
   WORKGRAPH_ATTEMPT_KEY,
@@ -155,6 +169,9 @@ import {
   WORKGRAPH_FAILURE_FINGERPRINT_KEY,
   WORKGRAPH_LAST_VERDICT_KEY,
   WORKGRAPH_PHASE_KEY,
+  WORKGRAPH_PLAN_APPROVED_KEY,
+  WORKGRAPH_PLAN_CRITIQUE_KEY,
+  WORKGRAPH_PLAN_FEEDBACK_KEY,
   WORKGRAPH_PLAN_SUMMARY_KEY,
   WORKGRAPH_PLANNER_PROVENANCE_KEY,
   WORKGRAPH_WORKFLOW_RUN_ID_KEY,
@@ -192,6 +209,12 @@ export interface CoordinatorDeps {
    * pattern.
    */
   warn?: (message: string) => void;
+  /**
+   * TEST SEAM. How long a plan critique may run before the plan parks
+   * without one. Default {@link PLAN_CRITIQUE_WAIT_MS}. Not a user setting:
+   * a knob with one exercised value is a constant.
+   */
+  planCritiqueWaitMs?: number;
 }
 
 /**
@@ -203,11 +226,17 @@ export interface CoordinatorDeps {
 export const MAX_REVIEW_RETRIES = 2;
 
 /**
+ * Default bound on a plan critique: one attempt, then the plan parks without
+ * one. A constant for the same reason {@link MAX_REVIEW_RETRIES} is.
+ */
+export const PLAN_CRITIQUE_WAIT_MS = 600_000;
+
+/**
  * Resolve topology defensively. Approval already promotes non-low one-shot
  * requests, but hand-written metadata must not be able to bypass a blocking
  * risk policy.
  */
-function effectiveWorkflowClass(issue: BeadsIssue): WorkflowClassT {
+function effectiveWorkflowClass(issue: WorkIssue): WorkflowClassT {
   const workflowClass = workflowClassOf(issue);
   return workflowClass === "oneshot" && riskTierOf(issue) !== "low"
     ? "reviewed"
@@ -215,7 +244,7 @@ function effectiveWorkflowClass(issue: BeadsIssue): WorkflowClassT {
 }
 
 /** Protocol-safe form of the same conservative risk fallback policy uses. */
-function effectiveRiskTier(issue: BeadsIssue): RiskTier {
+function effectiveRiskTier(issue: WorkIssue): RiskTier {
   const riskTier = riskTierOf(issue);
   return riskTier === "low" || riskTier === "medium" || riskTier === "high"
     ? riskTier
@@ -225,7 +254,7 @@ function effectiveRiskTier(issue: BeadsIssue): RiskTier {
 /** One workflow run the coordinator supervises. */
 export interface CoordinatorRun {
   cwd: string;
-  issue: BeadsIssue;
+  issue: WorkIssue;
   lease: Lease;
   /** Run-scoped identity: holder = the workflow-run id, bdActor = initiator. */
   actor: LeaseActor;
@@ -269,7 +298,41 @@ export interface CoordinatorRun {
   finalizationInFlight?: boolean;
   /** Evidence refs from the latest fenced completion (compaction). */
   evidence?: string[];
+  /**
+   * A recorded plan that has not parked yet: set by acceptPlan when a
+   * critique will run, cleared by parkForPlanReview. While set, the
+   * planner's completion has ALREADY been consumed for this run.
+   */
+  pendingPlan?: {
+    plan: PlanT;
+    completion: RunCompletedT;
+    /** The planner's binding, saved while the run is rebound to the critic,
+     *  so both critiqueThenPark and teardown() can restore it before parking. */
+    planner?: {
+      executorId: string;
+      executionId?: string;
+      isolation: IsolationLevelT;
+      supportsCancellation: boolean;
+    };
+  };
 }
+
+/** What `acceptPlan` tells `onCompleted` to do once the latch is released. */
+type PlanNext = "stop" | "implement" | "critique";
+
+/** How one bounded attempt to obtain a plan critique ended. */
+type CritiqueOutcome =
+  | {
+      kind: "critique";
+      critique: PlanCritiqueT;
+      completion: RunCompletedT;
+      executorId: string;
+    }
+  | { kind: "unavailable"; reason: string }
+  /** The inbox closed: teardown (or a human halt) owns the run now. */
+  | { kind: "abandon" }
+  /** The lease is gone: the run is dropped without parking. */
+  | { kind: "lost" };
 
 /** Handle returned by {@link registerCoordinator}; tests drive ticks directly. */
 export interface CoordinatorController {
@@ -332,7 +395,7 @@ export function registerCoordinator(
    * whose expiry is missing or unparseable cannot be proven expired —
    * treat the issue as leased and warn once per issue.
    */
-  function legacyLiveLease(issue: BeadsIssue): boolean {
+  function legacyLiveLease(issue: WorkIssue): boolean {
     const holder = leaseHolderOf(issue);
     if (holder === undefined) return false;
     const expiresAt = leaseExpiresAtOf(issue);
@@ -494,7 +557,7 @@ export function registerCoordinator(
   /**
    * Abandon a judged run whose durable state moved underneath it (override,
    * re-approve, concurrent writer — every LifecycleError site): attempt a
-   * fenced voluntary release FIRST — without it the Beads lease would sit
+   * fenced voluntary release FIRST — without it the store lease would sit
    * un-heartbeated until the expiry sweep (dropJudgedRun removes the run
    * from heldRuns, so neither the heartbeat nor teardown would ever touch
    * it) and the in-memory registry would keep rendering a stale claim in
@@ -560,7 +623,7 @@ export function registerCoordinator(
   /**
    * Publish a canonical lifecycle change on `workgraph:v1:activity`
    * (phase 5). OBSERVERS-ONLY: nothing in-core subscribes, and emission is
-   * strictly POST-COMMIT — fired only AFTER the corresponding bd write
+   * strictly POST-COMMIT — fired only AFTER the corresponding store writes
    * (transition/escalate/close) resolved, so observers can never see a
    * phantom transition; every LifecycleError path emits nothing. Fire-and-
    * forget like the audit trail: a broken observer must never take the
@@ -569,7 +632,7 @@ export function registerCoordinator(
    * observers needing those read the audit trail (README notes the gap).
    */
   function emitActivity(a: {
-    kind: "claim" | "transition" | "verdict" | "escalation" | "close";
+    kind: "claim" | "transition" | "verdict" | "escalation" | "close" | "plan-review";
     issueId: string;
     phase: string;
     workflowRunId?: string;
@@ -601,6 +664,18 @@ export function registerCoordinator(
    * row). Counted: the active implementation run and any live revision
    * execution, review, or finalization, including executor-owned queues.
    */
+  /**
+   * The executor pin for a role: the per-role table (`executorByRole`, from
+   * settings or flag) wins over the global `executorId`. Either pin is
+   * fail-closed in selectExecutor: a pinned executor that did not offer
+   * means no claim, never a silent fallback to someone else.
+   */
+  function pinFor(role: string): { executorId?: string } {
+    const config = deps.getConfig();
+    const pinned = config.executorByRole?.[role] ?? config.executorId;
+    return pinned !== undefined ? { executorId: pinned } : {};
+  }
+
   function inFlightCounts(): Map<string, number> {
     const counts = new Map<string, number>();
     const bump = (executorId: string): void => {
@@ -647,6 +722,7 @@ export function registerCoordinator(
   function cancelAndAwaitAck(
     run: CoordinatorRun,
     timeoutMs: number,
+    reason = "coordinator shutdown",
   ): Promise<boolean> {
     return new Promise((resolve) => {
       let done = false;
@@ -678,7 +754,7 @@ export function registerCoordinator(
       }
 
       timer = setTimeout(() => finish(false), timeoutMs);
-      publishCancel(run, "coordinator shutdown");
+      publishCancel(run, reason);
     });
   }
 
@@ -844,6 +920,17 @@ export function registerCoordinator(
       return;
     }
 
+    if (run.pendingPlan) {
+      // The planner's completion was already consumed and its plan recorded.
+      // Anything else arriving for this run now (a critic completion after
+      // its inbox closed, a re-delivery) is not a plan and must never reach
+      // acceptPlan, which would record plan-invalid and escalate.
+      logSkipOnce(
+        `ignoring run:completed for ${msg.workflowRunId}: its plan is already recorded`,
+      );
+      return;
+    }
+
     // Idempotency, half 2: the current-phase check. `completing` is the
     // synchronous latch covering the await gap below.
     if (run.phase !== "requested" && run.phase !== "accepted") return;
@@ -851,6 +938,7 @@ export function registerCoordinator(
     state.completing = true;
     let startJudgment = false;
     let startImplementation = false;
+    let startCritique = false;
     try {
       // Fencing triple, part 1: the payload must match the run we supervise.
       const payloadMatches =
@@ -858,19 +946,19 @@ export function registerCoordinator(
         msg.leaseEpoch === run.lease.epoch &&
         msg.workflowRunId === run.workflowRunId;
 
-      // Fencing triple, part 2: re-validate against Beads — the epoch and
+      // Fencing triple, part 2: re-validate against the store — the epoch and
       // holder must still be current AND the persisted workflow-run id must
       // still be ours. Never trust cached lease state across the await gap.
-      let beadsMatches = false;
+      let storeMatches = false;
       if (payloadMatches) {
         if (await verifyHolding(run.cwd, run.lease, run.actor.holder)) {
           const cur = await show(run.cwd, run.lease.issueId);
-          beadsMatches =
+          storeMatches =
             cur.metadata?.[WORKGRAPH_WORKFLOW_RUN_ID_KEY] === run.workflowRunId;
         }
       }
 
-      if (!payloadMatches || !beadsMatches) {
+      if (!payloadMatches || !storeMatches) {
         // Mismatch → ignore + audit; never partial-apply.
         await recordLeaseEvent(
           run.cwd,
@@ -882,12 +970,12 @@ export function registerCoordinator(
             payloadEpoch: msg.leaseEpoch,
             heldEpoch: run.lease.epoch,
             reason: payloadMatches
-              ? "lease no longer current in Beads (reclaimed or rewritten)"
+              ? "lease no longer current in the store (reclaimed or rewritten)"
               : "payload fencing triple does not match the supervised run",
           },
           run.actor.bdActor,
         );
-        if (payloadMatches && !beadsMatches) {
+        if (payloadMatches && !storeMatches) {
           // Our whole run is stale (reclaimed out from under us): drop it —
           // and cancel our own now-stale execution (phase 4): the executor
           // is evidently still live (it just reported), but its lease is
@@ -927,7 +1015,15 @@ export function registerCoordinator(
       // judgment gate. The durable part runs inside the `completing` latch
       // (so a duplicate completion cannot double-transition); the DISPATCH
       // deliberately does not — see the tail of this function.
-      if (msg.executionError) {
+      if (msg.decisionQuestion) {
+        await requestDecision(
+          run,
+          run.role === "planner" ? "planning" : "implementing",
+          msg,
+        );
+        if (state.active === run) state.active = null;
+        if (heldRuns().length === 0) stopHeartbeat();
+      } else if (msg.executionError) {
         await escalateRun(
           run,
           run.role === "planner" ? "planning" : "implementing",
@@ -936,11 +1032,15 @@ export function registerCoordinator(
         if (state.active === run) state.active = null;
         if (heldRuns().length === 0) stopHeartbeat();
       } else if (run.role === "planner") {
-        startImplementation = await acceptPlan(run, msg);
-        // A rejected or invalid plan releases its durable claim, but it
-        // never enters judgment tracking. Clear the active slot as well,
-        // otherwise every later tick returns early and the queue stalls.
-        if (!startImplementation && state.active === run) {
+        const next = await acceptPlan(run, msg);
+        startImplementation = next === "implement";
+        startCritique = next === "critique";
+        // A rejected, invalid, or parked plan releases its durable claim,
+        // but it never enters judgment tracking. Clear the active slot as
+        // well, otherwise every later tick returns early and the queue
+        // stalls. NOT for "critique": that run stays active — its lease is
+        // still held and heartbeated — until critiqueThenPark parks it.
+        if (next === "stop" && state.active === run) {
           state.active = null;
           if (heldRuns().length === 0) stopHeartbeat();
         }
@@ -998,25 +1098,29 @@ export function registerCoordinator(
     } finally {
       state.completing = false;
     }
-    // BOTH continuations run OUTSIDE the `completing` latch, and for the same
+    // ALL continuations run OUTSIDE the `completing` latch, and for the same
     // reason: each emits a request whose executor may answer synchronously on
     // the process-local bus, so the resulting `run:completed` re-enters this
     // handler DURING the call. Dispatching the implementation inside the
     // latch would make that completion hit `if (state.completing) return` and
     // be dropped — the run would then sit in `implementing` until its lease
-    // expired, with the plan already committed. Awaited so the handler's
-    // promise spans the whole chain (test buses drain it; the real bus
-    // ignores the return value).
+    // expired, with the plan already committed. (A critic's completion
+    // dropped the same way would cost every critique its full wait.) Awaited
+    // so the handler's promise spans the whole chain (test buses drain it;
+    // the real bus ignores the return value).
     if (startImplementation) await dispatchImplementation(run);
+    if (startCritique) await critiqueThenPark(run);
     if (startJudgment) await judge(run, msg);
   }
 
   /**
    * A fenced planner completion: validate the reported plan, persist it, and
-   * advance planning → implementing. Returns whether the caller should go on
-   * to dispatch the implementation run — the dispatch itself must happen
-   * OUTSIDE the `completing` latch this runs under (see `onCompleted`'s
-   * tail), so every path here reports its decision rather than acting on it.
+   * either park it for a human or advance planning → implementing. Returns
+   * what the caller should do next — "implement" (dispatch the
+   * implementation run), "critique" (ask a plan_critic, then park), or
+   * "stop". The dispatch itself must happen OUTSIDE the `completing` latch
+   * this runs under (see `onCompleted`'s tail), so every path here reports
+   * its decision rather than acting on it.
    *
    * FAILURE IS ESCALATION, NOT DEGRADATION. A planner that reports
    * `failure`/`blocked`, or returns a payload that is not a valid plan, does
@@ -1035,10 +1139,10 @@ export function registerCoordinator(
   async function acceptPlan(
     run: CoordinatorRun,
     msg: RunCompletedT,
-  ): Promise<boolean> {
+  ): Promise<PlanNext> {
     if (msg.outcome !== "success") {
       await escalateRun(run, "planning", completionFailure("planner", msg));
-      return false;
+      return "stop";
     }
 
     let plan: PlanT;
@@ -1063,7 +1167,7 @@ export function registerCoordinator(
         "planning",
         `planner returned an invalid plan: ${detail}`,
       );
-      return false;
+      return "stop";
     }
 
     // Persist the plan trail BEFORE the transition: a crash between the two
@@ -1083,6 +1187,19 @@ export function registerCoordinator(
       run.actor.bdActor,
     );
 
+    // THE HUMAN GATE (default): park the plan for review and release the
+    // lease. Only `planApproval: "auto"` lets a plan flow straight on.
+    if ((deps.getConfig().planApproval ?? "required") !== "auto") {
+      if (wantsPlanCritique(run)) {
+        // Decide here, act in onCompleted's tail: the critic's request must
+        // not be sent from inside the completion latch.
+        run.pendingPlan = { plan, completion: msg };
+        return "critique";
+      }
+      await parkForPlanReview(run, msg, plan);
+      return "stop";
+    }
+
     try {
       await transition(run.cwd, run.lease.issueId, "planning", "implementing", {
         fields: {
@@ -1099,7 +1216,7 @@ export function registerCoordinator(
         untrackLease(run.cwd, run.lease.issueId);
         state.active = null;
         if (heldRuns().length === 0) stopHeartbeat();
-        return false;
+        return "stop";
       }
       throw e;
     }
@@ -1121,7 +1238,104 @@ export function registerCoordinator(
     run.plan = renderPlan(plan);
     run.phase = "requested";
     delete run.executionId;
-    return true;
+    return "implement";
+  }
+
+  /**
+   * Whether a recorded plan gets an advisory critique before it parks:
+   * `planCritique: "high-risk"` and a high-risk issue. The tier is read
+   * through the conservative fallback, so an unreadable tier means no
+   * critique. No workflow-class check: only `planned` issues reach a
+   * planner run. Never consulted on the `planApproval: "auto"` path, where
+   * nobody would read the result before the plan is built.
+   */
+  function wantsPlanCritique(run: CoordinatorRun): boolean {
+    return (
+      deps.getConfig().planCritique === "high-risk" &&
+      effectiveRiskTier(run.issue) === "high"
+    );
+  }
+
+  /**
+   * Park a recorded plan for a human: planning → plan_review, then RELEASE
+   * the lease — nobody is working the issue while it waits, so a lease would
+   * only expire into a pointless reclaim. The approval tool sends the issue
+   * back to `ready`; the claim path then implements the recorded plan
+   * (approved) or plans again with the feedback (rejected). Always returns
+   * false: the implementation never starts from here.
+   *
+   * `critiqueValue` is the `workgraph_plan_critique` value. It is written
+   * on EVERY park, defaulting to "", so a plan parked without a critique
+   * clears whatever an earlier plan's critique left there.
+   *
+   * `msg` is the PLANNER's completion and `run` must carry the planner's
+   * binding: the audit below names the plan's source, not the critic.
+   */
+  async function parkForPlanReview(
+    run: CoordinatorRun,
+    msg: RunCompletedT,
+    plan: PlanT,
+    critiqueValue = "",
+  ): Promise<boolean> {
+    try {
+      await transition(run.cwd, run.lease.issueId, "planning", "plan_review", {
+        fields: {
+          [WORKGRAPH_PLAN_SUMMARY_KEY]: planSummary(plan),
+          [WORKGRAPH_PLANNER_PROVENANCE_KEY]: JSON.stringify(msg.provenance),
+          [WORKGRAPH_PLAN_APPROVED_KEY]: false,
+          [WORKGRAPH_PLAN_FEEDBACK_KEY]: "",
+          [WORKGRAPH_PLAN_CRITIQUE_KEY]: critiqueValue,
+        },
+        actor: run.actor.bdActor,
+      });
+    } catch (e) {
+      if (e instanceof LifecycleError) {
+        delete run.pendingPlan;
+        logSkipOnce(e.message);
+        untrackLease(run.cwd, run.lease.issueId);
+        if (state.active === run) state.active = null;
+        if (heldRuns().length === 0) stopHeartbeat();
+        return false;
+      }
+      throw e;
+    }
+    // The plan is parked: nothing is pending any more, and a completion
+    // arriving for this run from here on is simply late.
+    delete run.pendingPlan;
+    emitActivity({
+      kind: "plan-review",
+      issueId: run.lease.issueId,
+      phase: "plan_review",
+      workflowRunId: run.workflowRunId,
+      actor: run.actor.bdActor,
+      summary: `plan recorded (${plan.steps.length} steps) from ${run.executorId} — awaiting workgraph_approve_plan`,
+    });
+    await recordLeaseEvent(
+      run.cwd,
+      "plan-review",
+      run.lease.issueId,
+      {
+        workflowRunId: run.workflowRunId,
+        executionId: msg.executionId,
+        executorId: run.executorId,
+        steps: plan.steps.length,
+      },
+      run.actor.bdActor,
+    );
+    // Only OUR slot: a park that finishes after this run was detached (a
+    // critique wait that outlived its lease, or teardown) must not clear a
+    // run a later tick claimed.
+    if (state.active === run) state.active = null;
+    if (heldRuns().length === 0) stopHeartbeat();
+    try {
+      await releaseLease(run.cwd, run.lease, run.actor);
+    } catch (e) {
+      if (!(e instanceof FencingError)) {
+        const detail = e instanceof Error ? e.message : String(e);
+        logSkipOnce(`could not release ${run.lease.issueId}: ${detail}`);
+      }
+    }
+    return false;
   }
 
   /**
@@ -1156,7 +1370,7 @@ export function registerCoordinator(
       implementer = selectExecutor(
         offers,
         { role: "implementer", requiresIsolation: false },
-        { executorId: config.executorId },
+        pinFor("implementer"),
         counts,
       );
     } catch (e) {
@@ -1204,6 +1418,7 @@ export function registerCoordinator(
       leaseEpoch: run.lease.epoch,
       role: "implementer",
       attempt: run.attempt,
+      ...decisionAnswer(run.issue.metadata),
       workspace: {
         repoPath: run.cwd,
         ...sourceWorkspace(run.issue.metadata),
@@ -1285,6 +1500,416 @@ export function registerCoordinator(
   }
 
   // -------------------------------------------------------------------------
+  // The plan critique. ADVISORY: one bounded attempt to get a plan_critic's
+  // gaps in front of the human, between the planner's completion and the
+  // park. Nothing here may reject, escalate, or re-plan because of what a
+  // critic said or failed to say — every way it can fail ends where the plan
+  // was going anyway: plan_review, lease released, human in charge.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Whether this run still holds its lease in the STORE and is still the
+   * run the issue records — the store half of the fencing triple, for the
+   * critique exits that have no completion message to fence.
+   */
+  async function holdsPlanningLease(run: CoordinatorRun): Promise<boolean> {
+    if (!(await verifyHolding(run.cwd, run.lease, run.actor.holder)))
+      return false;
+    const cur = await show(run.cwd, run.lease.issueId);
+    return cur.metadata?.[WORKGRAPH_WORKFLOW_RUN_ID_KEY] === run.workflowRunId;
+  }
+
+  /** Put the planner's binding back on a run that was rebound to a critic. */
+  function restorePlannerBinding(run: CoordinatorRun): void {
+    const planner = run.pendingPlan?.planner;
+    if (!planner) return;
+    run.executorId = planner.executorId;
+    run.isolation = planner.isolation;
+    run.supportsCancellation = planner.supportsCancellation;
+    if (planner.executionId !== undefined)
+      run.executionId = planner.executionId;
+    else delete run.executionId;
+  }
+
+  /**
+   * Ask one plan_critic for a critique of the pending plan and wait a
+   * bounded time for it. EXACTLY ONE REQUEST: there is no loop here — a
+   * rejected, timed-out, failed, or invalid critique is not retried and no
+   * second executor is tried.
+   *
+   * Two things are re-checked after EVERY await, in this order:
+   *
+   *  - `box.closed` — teardown (or a human halt) took the run. That path
+   *    returns "abandon" having mutated nothing and written nothing:
+   *    teardown reads this run's binding after its own first await, and a
+   *    store call here could land after the workspace is gone.
+   *  - `state.active !== run` — the lease was lost underneath the wait (the
+   *    heartbeat drops an active run on a fencing loss without closing its
+   *    inbox, since before the critique no active run had one). Parking
+   *    then would write `plan_review` over whatever claimed the issue next.
+   *
+   * A critic left running is canceled with `publishCancel`, never
+   * `cancelAndAwaitAck`: the critic is read-only and the park does not
+   * depend on it having stopped — deliberately unlike `finalize`, whose
+   * executor may be mutating the checkout. The cancel only frees the slot.
+   */
+  async function obtainCritique(
+    run: CoordinatorRun,
+    pending: NonNullable<CoordinatorRun["pendingPlan"]>,
+    box: JudgmentInbox,
+  ): Promise<CritiqueOutcome> {
+    const config = deps.getConfig();
+    const offers = await discoverExecutors(pi.events, {
+      timeoutMs: config.discoveryTimeoutMs,
+      now: nowFn,
+      onInvalid,
+    });
+    if (box.closed) return { kind: "abandon" };
+    if (state.active !== run) return { kind: "lost" };
+
+    // The planner's execution has finished but `state.active` still counts
+    // it: release that slot before selecting, exactly as
+    // dispatchImplementation does, or one executor offering both roles at
+    // `maxConcurrency: 1` could never critique its own plan. Computed while
+    // `run.executorId` is still the planner's.
+    const counts = new Map(inFlightCounts());
+    const held = counts.get(run.executorId);
+    if (held !== undefined) {
+      if (held <= 1) counts.delete(run.executorId);
+      else counts.set(run.executorId, held - 1);
+    }
+    let critic;
+    try {
+      critic = selectExecutor(
+        offers,
+        { role: "plan_critic", requiresIsolation: false },
+        pinFor("plan_critic"),
+        counts,
+      );
+    } catch (e) {
+      if (!(e instanceof ExecutorSelectionError)) throw e;
+      critic = undefined;
+    }
+    // A pin overrides registry filters (and `pinFor` falls back to the
+    // global executor pin), so re-check the role: a pinned executor that
+    // does not critique is "no critic", not a request it will reject.
+    if (!critic || !critic.roles.includes("plan_critic"))
+      return { kind: "unavailable", reason: "no plan_critic executor" };
+
+    // Rebind the run to the critic for the wait — this is what makes
+    // `publishCancel`, the heartbeat's lease-loss cancel, and teardown
+    // address the critic rather than the finished planner. In memory only:
+    // recovery abandons any run found in `planning`, so there is nothing to
+    // reconcile, and a metadata write would have to be undone before parking.
+    run.executorId = critic.executorId;
+    run.isolation = critic.isolation;
+    run.supportsCancellation = critic.supportsCancellation;
+    delete run.executionId;
+
+    const request: RunRequestT = {
+      ...newEnvelope(nowFn),
+      executorId: critic.executorId,
+      workflowRunId: run.workflowRunId,
+      leaseEpoch: run.lease.epoch,
+      issue: {
+        id: run.issue.id,
+        title: run.issue.title,
+        workflowClass: effectiveWorkflowClass(run.issue),
+        riskTier: effectiveRiskTier(run.issue),
+        ...(run.issue.description !== undefined
+          ? { description: run.issue.description }
+          : {}),
+        ...(run.issue.acceptance_criteria !== undefined
+          ? { acceptanceCriteria: run.issue.acceptance_criteria }
+          : {}),
+      },
+      role: "plan_critic",
+      attempt: run.attempt,
+      workspace: {
+        repoPath: run.cwd,
+        ...sourceWorkspace(run.issue.metadata),
+        baseRevision: "",
+        requiresIsolation: false,
+      },
+      outputSchema: PlanCritique,
+      // What the implementer would receive — the critic judges exactly that.
+      plan: renderPlan(pending.plan),
+    };
+    const result = await requestRun(pi.events, request, {
+      timeoutMs: config.acceptTimeoutMs,
+      onInvalid,
+    });
+    const acceptedId =
+      result.kind === "accepted" ? result.message.executionId : undefined;
+    if (box.closed || state.active !== run) {
+      // Whoever took the run did not know this execution id yet (teardown
+      // sees no accepted critic; the heartbeat's cancel carried none), so
+      // address the critic here. Built from a COPY: on the closed path the
+      // run itself is teardown's now and must not be touched.
+      if (result.kind !== "rejected")
+        publishCancel(
+          { ...run, executionId: acceptedId },
+          "plan critique abandoned during acceptance",
+        );
+      return box.closed ? { kind: "abandon" } : { kind: "lost" };
+    }
+    if (result.kind === "rejected") {
+      return {
+        kind: "unavailable",
+        reason: `plan_critic rejected the request: ${result.message.reason}`,
+      };
+    }
+    if (result.kind === "timeout") {
+      publishCancel(run, "plan critique was not accepted in time");
+      return {
+        kind: "unavailable",
+        reason: "plan_critic did not accept in time",
+      };
+    }
+    run.executionId = result.message.executionId;
+
+    const waitMs = deps.planCritiqueWaitMs ?? PLAN_CRITIQUE_WAIT_MS;
+    const completion = await awaitCompletion(
+      box,
+      result.message.executionId,
+      waitMs,
+    );
+    // A critique that arrived as teardown began is lost: the plan parks as
+    // unavailable there. Accepted — it beats racing teardown to the park.
+    if (box.closed) return { kind: "abandon" };
+    if (state.active !== run) return { kind: "lost" };
+    if (!completion) {
+      publishCancel(run, "plan critique timed out");
+      return {
+        kind: "unavailable",
+        reason: `no critique within ${waitMs / 1000} s`,
+      };
+    }
+
+    // Fencing at consumption, as every sub-run completion gets: payload
+    // triple, store lease, stored workflow-run id. A failure means the
+    // lease is gone and the whole run is stale.
+    const fenced = await fencedForJudgment(run, completion);
+    if (box.closed) return { kind: "abandon" };
+    if (!fenced || state.active !== run) return { kind: "lost" };
+
+    // A critic may not ask the human anything: a question (or `blocked`)
+    // is an unavailable critique, and its pending worker is canceled so it
+    // cannot hold the bridge's upstream slot. Never requestDecision.
+    if (completion.decisionQuestion || completion.outcome === "blocked") {
+      publishCancel(run, "plan critique cannot ask for a decision");
+      return {
+        kind: "unavailable",
+        reason: "plan_critic asked a question instead of reporting",
+      };
+    }
+    // Never escalateRun: a failed critic costs the human a critique, not
+    // the plan.
+    if (completion.outcome !== "success" || completion.executionError) {
+      return {
+        kind: "unavailable",
+        reason: completionFailure("plan_critic", completion),
+      };
+    }
+    try {
+      const critique = parsePlanCritique(
+        (completion as RunCompletedT & { critique?: unknown }).critique,
+      );
+      return {
+        kind: "critique",
+        critique,
+        completion,
+        executorId: critic.executorId,
+      };
+    } catch (e) {
+      if (!(e instanceof PlanCritiqueError)) throw e;
+      return {
+        kind: "unavailable",
+        reason: `invalid critique: ${e.detail}`,
+      };
+    }
+  }
+
+  /**
+   * Record what the critique attempt produced and park the plan with it.
+   * Runs under the PLANNER's binding (restored first), so the park audit
+   * names the plan's source. Returns without parking only when the run is
+   * no longer this coordinator's to park.
+   */
+  async function recordCritiqueAndPark(
+    run: CoordinatorRun,
+    pending: NonNullable<CoordinatorRun["pendingPlan"]>,
+    box: JudgmentInbox,
+    outcome: CritiqueOutcome,
+  ): Promise<void> {
+    if (outcome.kind === "abandon" || box.closed) return;
+    if (outcome.kind === "lost" || state.active !== run) return;
+    restorePlannerBinding(run);
+
+    let summary: string;
+    if (outcome.kind === "critique") {
+      const { critique, completion } = outcome;
+      await recordPlanCritique(
+        run.cwd,
+        run.lease.issueId,
+        critique,
+        {
+          planExecutionId: pending.completion.executionId,
+          workflowRunId: run.workflowRunId,
+          executionId: completion.executionId,
+          executorId: outcome.executorId,
+          provenance: completion.provenance,
+        },
+        run.actor.bdActor,
+      );
+      const shown = Math.min(critique.gaps.length, MAX_GAPS);
+      await recordLeaseEvent(
+        run.cwd,
+        "plan-critique",
+        run.lease.issueId,
+        {
+          workflowRunId: run.workflowRunId,
+          executionId: completion.executionId,
+          executorId: outcome.executorId,
+          gaps: shown,
+          ...(critique.gaps.length > shown
+            ? { foldedGaps: critique.gaps.length - shown }
+            : {}),
+        },
+        run.actor.bdActor,
+      );
+      // A NOTE, not a gate: said only when both sides reported a model and
+      // they match. Missing on either side means no note — the opposite of
+      // checkIndependence's fail-closed rule, on purpose.
+      const plannerModel = pending.completion.provenance?.model;
+      const criticModel = completion.provenance?.model;
+      summary = critiqueSummary(critique, {
+        sameModel:
+          typeof plannerModel === "string" &&
+          plannerModel !== "" &&
+          plannerModel === criticModel,
+      });
+    } else {
+      // No completion fenced this exit (no executor, rejection, timeout,
+      // internal error), or it was fenced a wait ago: confirm the lease in
+      // the store before writing a park over the issue.
+      if (!(await holdsPlanningLease(run))) {
+        if (box.closed) return;
+        // Lease lost: dropped by critiqueThenPark's cleanup, not parked.
+        delete run.pendingPlan;
+        return;
+      }
+      if (box.closed || state.active !== run) return;
+      await recordLeaseEvent(
+        run.cwd,
+        "plan-critique-unavailable",
+        run.lease.issueId,
+        { workflowRunId: run.workflowRunId, reason: outcome.reason },
+        run.actor.bdActor,
+      );
+      summary = unavailableSummary(outcome.reason);
+    }
+    // Teardown may have started during the writes above; it parks the run.
+    if (box.closed || state.active !== run) return;
+    await parkForPlanReview(run, pending.completion, pending.plan, summary);
+  }
+
+  /**
+   * The continuation `onCompleted` runs for a plan `acceptPlan` marked
+   * pending: one bounded attempt to get a critique, then park. It runs
+   * inside the `planning` phase under the planner run's lease, workflow-run
+   * id, and fencing triple, with the run still `state.active` — so the
+   * heartbeat keeps renewing the lease and the tick claims nothing else.
+   *
+   * THE INBOX OPENS BEFORE ANYTHING IS SENT: `run:completed` carries no
+   * role, so the critic's completion is told apart from the planner's by
+   * routing every completion for this workflow run into the inbox and
+   * awaiting by execution id — a critic may complete inside the request
+   * emit. It closes LAST, so stragglers are swallowed for as long as
+   * possible; `run.pendingPlan` guards the gap after that.
+   *
+   * Exits that do not park: teardown/halt took the run (inbox closed —
+   * nothing here touches it), or the lease is gone (dropped, as the planner
+   * path drops a stale completion). Everything else parks, including an
+   * unexpected throw: a bug in the critique path must not strand a recorded
+   * plan in `planning`, and must never leave `state.active` set — no issue
+   * would be claimed again this session.
+   */
+  async function critiqueThenPark(run: CoordinatorRun): Promise<void> {
+    const pending = run.pendingPlan;
+    // Detached while the plan was being recorded (teardown, halt): whoever
+    // detached the run owns its lease, and teardown parks a pending plan.
+    if (!pending || state.active !== run) return;
+    pending.planner = {
+      executorId: run.executorId,
+      // From the completion, not `run.executionId`: that is only bound by
+      // the tick's post-accept continuation, which may not have run yet.
+      executionId: pending.completion.executionId,
+      isolation: run.isolation,
+      supportsCancellation: run.supportsCancellation,
+    };
+    const box: JudgmentInbox = { messages: [], waiters: [], closed: false };
+    state.inboxes.set(run.workflowRunId, box);
+    try {
+      let outcome: CritiqueOutcome;
+      try {
+        outcome = await obtainCritique(run, pending, box);
+      } catch (e) {
+        const detail = e instanceof Error ? e.message : String(e);
+        console.error(
+          `[pi-workgraph] plan critique failed for ${run.lease.issueId}: ${detail}`,
+        );
+        // An execution may be in flight behind the throw; free its slot.
+        if (
+          !box.closed &&
+          run.executionId !== undefined &&
+          run.executionId !== pending.completion.executionId
+        )
+          publishCancel(run, "plan critique failed");
+        outcome = { kind: "unavailable", reason: `internal error: ${detail}` };
+      }
+      await recordCritiqueAndPark(run, pending, box, outcome);
+    } catch (e) {
+      // Recording or parking threw. Park once more with nothing but the
+      // summary — unless the park already ran (pendingPlan cleared) or the
+      // run is no longer ours.
+      const detail = e instanceof Error ? e.message : String(e);
+      console.error(
+        `[pi-workgraph] could not park ${run.lease.issueId} after its plan critique: ${detail}`,
+      );
+      if (!box.closed && state.active === run && run.pendingPlan === pending) {
+        try {
+          restorePlannerBinding(run);
+          await parkForPlanReview(
+            run,
+            pending.completion,
+            pending.plan,
+            unavailableSummary(`internal error: ${detail}`),
+          );
+        } catch (again) {
+          const msg = again instanceof Error ? again.message : String(again);
+          logSkipOnce(`could not park ${run.lease.issueId}: ${msg}`);
+        }
+      }
+    } finally {
+      // A closed inbox means teardown or a halt owns the run: leave the run
+      // and the coordinator state exactly as they are.
+      if (!box.closed) {
+        if (state.active === run) {
+          // Neither parked nor taken over — the lease was lost, or the park
+          // itself failed. Drop the run: untracked and un-heartbeated, its
+          // lease expires and the sweep returns the issue to `ready`.
+          untrackLease(run.cwd, run.lease.issueId);
+          state.active = null;
+        }
+        delete run.pendingPlan;
+        if (heldRuns().length === 0) stopHeartbeat();
+        closeInbox(run.workflowRunId);
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // The judgment gate (phase 3). Every gate is a CODE check — tool and
   // context text only explain it. The loop: independent review → verdict
   // validation → independence check → apply (revise / verify / escalate) →
@@ -1293,7 +1918,7 @@ export function registerCoordinator(
 
   /**
    * Re-validate a judgment sub-run completion against the fencing triple
-   * AND Beads (never trust cached lease state across an await gap). A
+   * AND the store (never trust cached lease state across an await gap). A
    * mismatch is audited and means the whole run is stale.
    */
   async function fencedForJudgment(
@@ -1304,15 +1929,15 @@ export function registerCoordinator(
       msg.issueId === run.lease.issueId &&
       msg.leaseEpoch === run.lease.epoch &&
       msg.workflowRunId === run.workflowRunId;
-    let beadsMatches = false;
+    let storeMatches = false;
     if (payloadMatches) {
       if (await verifyHolding(run.cwd, run.lease, run.actor.holder)) {
         const cur = await show(run.cwd, run.lease.issueId);
-        beadsMatches =
+        storeMatches =
           cur.metadata?.[WORKGRAPH_WORKFLOW_RUN_ID_KEY] === run.workflowRunId;
       }
     }
-    if (payloadMatches && beadsMatches) return true;
+    if (payloadMatches && storeMatches) return true;
     await recordLeaseEvent(
       run.cwd,
       "stale-result-rejected",
@@ -1324,7 +1949,7 @@ export function registerCoordinator(
         heldEpoch: run.lease.epoch,
         via: "judgment",
         reason: payloadMatches
-          ? "lease no longer current in Beads (reclaimed or rewritten)"
+          ? "lease no longer current in the store (reclaimed or rewritten)"
           : "payload fencing triple does not match the supervised run",
       },
       run.actor.bdActor,
@@ -1332,19 +1957,61 @@ export function registerCoordinator(
     return false;
   }
 
-  /**
-   * Escalate a run out of the gate: phase → `escalated` (CAS-guarded, any
-   * active phase — a coordinator-owned recovery edge like override and
-   * lease loss), audited with the reason and an immutable actor snapshot,
-   * lease released, and bd status → `blocked` so the issue leaves the ready
-   * pool. Recoverable via re-approve.
-   */
+  /** Park an explicit question without sending unfinished work for review. */
+  async function requestDecision(
+    run: CoordinatorRun,
+    phase: "planning" | "implementing" | "judging" | "revising" | "verifying",
+    completion: RunCompletedT,
+  ): Promise<void> {
+    const stopped =
+      !completion.workerPending ||
+      (run.supportsCancellation &&
+        (await cancelAndAwaitAck(
+          run,
+          deps.getConfig().acceptTimeoutMs,
+          "waiting for a human decision",
+        )));
+    // Cancellation can overlap a human halt or a reclaimed lease.
+    if (!(await fencedForJudgment(run, completion))) {
+      untrackLease(run.cwd, run.lease.issueId);
+      dropJudgedRun(run);
+      return;
+    }
+    const saved = await escalateRun(
+      run,
+      phase,
+      `Needs your decision: ${completion.decisionQuestion}`,
+      {
+        workgraph_decision_pending: true,
+        workgraph_decision_id: completion.executionId,
+        workgraph_decision_question: completion.decisionQuestion!,
+        workgraph_decision_requested_at: new Date(nowFn()).toISOString(),
+        workgraph_workspace_run_id: run.workflowRunId,
+        workgraph_halt_unconfirmed: !stopped,
+      },
+    );
+    if (!saved) return;
+    await recordLeaseEvent(
+      run.cwd,
+      "decision-needed",
+      run.lease.issueId,
+      {
+        workflowRunId: run.workflowRunId,
+        decisionId: completion.executionId,
+        question: completion.decisionQuestion,
+        workerStopped: stopped,
+      },
+      run.actor.bdActor,
+    );
+  }
+
+  /** Escalate with a guarded phase write, audit, lease release, and blocked status. */
   async function escalateRun(
     run: CoordinatorRun,
     expect: "planning" | "implementing" | "judging" | "revising" | "verifying",
     reason: string,
-    fields: Record<string, string> = {},
-  ): Promise<void> {
+    fields: Record<string, MetadataValue> = {},
+  ): Promise<boolean> {
     try {
       await escalate(run.cwd, run.lease.issueId, expect, {
         fields,
@@ -1354,7 +2021,7 @@ export function registerCoordinator(
       if (e instanceof LifecycleError) {
         logSkipOnce(e.message);
         await abandonJudgedRun(run);
-        return;
+        return false;
       }
       throw e;
     }
@@ -1379,14 +2046,14 @@ export function registerCoordinator(
       summary: reason,
     });
     // Release first (fenced — clears holder/expiry, briefly reopens), then
-    // block: `bd ready` excludes blocked issues, and the open window is
+    // block: the ready query excludes blocked issues, and the open window is
     // invisible to approved-only claiming (the phase is already escalated).
     try {
       await releaseLease(run.cwd, run.lease, run.actor);
     } catch (e) {
       if (!(e instanceof FencingError)) throw e;
       dropJudgedRun(run); // reclaimed mid-escalation: no longer ours to block
-      return;
+      return false;
     }
     await update(
       run.cwd,
@@ -1395,6 +2062,7 @@ export function registerCoordinator(
       run.actor.bdActor,
     );
     dropJudgedRun(run);
+    return true;
   }
 
   /**
@@ -1405,7 +2073,7 @@ export function registerCoordinator(
   async function promoteReviewedToPlanned(
     run: CoordinatorRun,
     reason: string,
-    fields: Record<string, string> = {},
+    fields: Record<string, MetadataValue> = {},
   ): Promise<void> {
     const cur = await show(run.cwd, run.lease.issueId);
     const actual = phaseOf(cur);
@@ -1486,7 +2154,7 @@ export function registerCoordinator(
       revisor = selectExecutor(
         offers,
         { role: "revision", requiresIsolation: false },
-        { executorId: config.executorId },
+        pinFor("revision"),
         inFlightCounts(),
       );
     } catch (e) {
@@ -1517,6 +2185,7 @@ export function registerCoordinator(
       leaseEpoch: run.lease.epoch,
       role: "revision",
       attempt,
+      ...decisionAnswer(run.issue.metadata),
       workspace: {
         repoPath: run.cwd,
         ...sourceWorkspace(run.issue.metadata),
@@ -1620,6 +2289,10 @@ export function registerCoordinator(
       },
       run.actor.bdActor,
     );
+    if (completion.decisionQuestion) {
+      await requestDecision(run, "revising", completion);
+      return "aborted";
+    }
     if (completion.executionError) {
       await escalateRun(
         run,
@@ -1685,7 +2358,7 @@ export function registerCoordinator(
       executor = selectExecutor(
         offers,
         { role: "finalizer", requiresIsolation: false },
-        { executorId: config.executorId },
+        pinFor("finalizer"),
         inFlightCounts(),
       );
     } catch (error) {
@@ -1819,6 +2492,10 @@ export function registerCoordinator(
       dropJudgedRun(run);
       return false;
     }
+    if (completion.decisionQuestion) {
+      await requestDecision(run, "verifying", completion);
+      return false;
+    }
     if (completion.outcome !== "success" || completion.executionError) {
       await escalateRun(
         run,
@@ -1927,7 +2604,7 @@ export function registerCoordinator(
         reviewer = selectExecutor(
           offers.filter((o) => !excluded.has(o.executorId)),
           { role: "reviewer", requiresIsolation: false },
-          { executorId: config.executorId },
+          pinFor("reviewer"),
           inFlightCounts(),
         );
       } catch (e) {
@@ -1976,6 +2653,7 @@ export function registerCoordinator(
         leaseEpoch: run.lease.epoch,
         role: "reviewer",
         attempt,
+        ...decisionAnswer(run.issue.metadata),
         workspace: {
           repoPath: run.cwd,
           ...sourceWorkspace(run.issue.metadata),
@@ -2045,6 +2723,10 @@ export function registerCoordinator(
         return;
       }
 
+      if (completion.decisionQuestion) {
+        await requestDecision(run, "judging", completion);
+        return;
+      }
       if (completion.outcome !== "success" || completion.executionError) {
         await escalateRun(
           run,
@@ -2260,7 +2942,7 @@ export function registerCoordinator(
         run.actor.bdActor,
       );
       untrackLease(run.cwd, run.lease.issueId);
-      // POST-COMMIT: the bd close resolved above.
+      // POST-COMMIT: the store close resolved above.
       emitActivity({
         kind: "close",
         issueId: run.lease.issueId,
@@ -2321,23 +3003,18 @@ export function registerCoordinator(
     }
 
     if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
-
-    if (!bdBinaryAvailable()) {
-      logSkipOnce("bd CLI not found");
-      return;
-    }
     try {
       await ensureWorkspace(ctx.cwd);
     } catch {
-      // No .beads/ here — the coordinator stays inert.
+      // No workspace here — the coordinator stays inert.
       return;
     }
 
     // ARRAY LENGTH is the readiness signal, never exit codes. Fetch
     // UNBOUNDED (`-n 0`, the workgraph_ready pattern) and filter
-    // client-side: lifecycle phase is metadata, which bd's ready query
+    // client-side: lifecycle phase is metadata, which the store's ready query
     // cannot see — a capped probe would let a page of legacy issues ahead
-    // in bd's ordering starve newly approved work indefinitely (the
+    // in the store's ordering starve newly approved work indefinitely (the
     // all-legacy rollout scenario).
     const pool = await ready(ctx.cwd, 0);
     if (pool.length === 0) {
@@ -2354,7 +3031,9 @@ export function registerCoordinator(
     const eligible = pool.filter((issue) => {
       if (
         issue.metadata?.workgraph_halted === true ||
-        issue.metadata?.workgraph_halted === "true"
+        issue.metadata?.workgraph_halted === "true" ||
+        issue.metadata?.workgraph_decision_pending === true ||
+        issue.metadata?.workgraph_decision_pending === "true"
       )
         return false;
       if (isLifecycleV1(issue)) return phaseOf(issue) === "ready";
@@ -2409,8 +3088,16 @@ export function registerCoordinator(
     const candidate = eligible[0]!;
     const haltGeneration = haltGenerations.get(candidate.id) ?? 0;
     const workflowClass = effectiveWorkflowClass(candidate);
+    // An APPROVED plan skips the planner: the claim goes straight to an
+    // implementer with the recorded plan attached. An approval flag whose
+    // plan trail is unreadable re-plans rather than implementing blind.
+    const approvedPlan =
+      isLifecycleV1(candidate) && workflowClass === "planned" && planApprovedOf(candidate)
+        ? await latestPlan(ctx.cwd, candidate.id)
+        : undefined;
+    const planFeedback = planFeedbackOf(candidate);
     let role: "planner" | "implementer" =
-      isLifecycleV1(candidate) && workflowClass === "planned"
+      isLifecycleV1(candidate) && workflowClass === "planned" && approvedPlan === undefined
         ? "planner"
         : "implementer";
     let selected;
@@ -2423,7 +3110,7 @@ export function registerCoordinator(
         // token-burning loop with no forward progress.
         const canImplement =
           offers.some((o) => o.roles.includes("implementer")) ||
-          config.executorId !== undefined;
+          pinFor("implementer").executorId !== undefined;
         selected = canImplement
           ? selectExecutor(
               offers,
@@ -2432,7 +3119,7 @@ export function registerCoordinator(
               // lets the in-session compat adapter (isolation "none") stay
               // eligible.
               { role: "planner", requiresIsolation: false },
-              { executorId: config.executorId },
+              pinFor("planner"),
               inFlightCounts(),
             )
           : undefined;
@@ -2448,7 +3135,7 @@ export function registerCoordinator(
         selected = selectExecutor(
           offers,
           { role: "implementer", requiresIsolation: false },
-          { executorId: config.executorId },
+          pinFor("implementer"),
           inFlightCounts(),
         );
         if (selected && !selected.roles.includes("implementer")) {
@@ -2481,7 +3168,7 @@ export function registerCoordinator(
       bdActor: ids.initiator().id,
     };
 
-    // Claim BY ID (bd's equally-atomic `update --claim`): `ready --claim`
+    // Claim BY ID (the store's atomic claim-by-id): `ready --claim`
     // is metadata-blind and cannot honor the approved-only filter. A
     // conflicting claim exits 1 — a lost race, not an error. (`candidate`
     // was bound above — role selection needs it to keep legacy issues out
@@ -2495,10 +3182,10 @@ export function registerCoordinator(
         actor,
       });
     } catch (e) {
-      if (e instanceof BdError) {
-        // bd's claim conflict surfaces its stderr verbatim ("already
+      if (e instanceof StoreError) {
+        // the store's claim conflict surfaces its stderr verbatim ("already
         // claimed by ..."): a lost race, retried next tick. Any OTHER
-        // BdError (broken binary, workspace corruption) must not be
+        // StoreError (broken binary, workspace corruption) must not be
         // silently swallowed on every tick — log it once.
         if (!/already claimed/i.test(e.message)) {
           logSkipOnce(`claim failed for ${candidate.id}: ${e.message}`);
@@ -2508,11 +3195,13 @@ export function registerCoordinator(
       throw e;
     }
     if (outcome.kind !== "acquired") return;
-    // A halt may arrive while bd is still acquiring a lease, before there
+    // A halt may arrive while the store is still acquiring a lease, before there
     // is a tracked run for the synchronous control listener to detach.
     if (
       outcome.issue.metadata?.workgraph_halted === true ||
       outcome.issue.metadata?.workgraph_halted === "true" ||
+      outcome.issue.metadata?.workgraph_decision_pending === true ||
+      outcome.issue.metadata?.workgraph_decision_pending === "true" ||
       (haltGenerations.get(candidate.id) ?? 0) !== haltGeneration
     ) {
       try {
@@ -2532,6 +3221,7 @@ export function registerCoordinator(
       executorId: selected.executorId,
       phase: "requested",
       role,
+      ...(approvedPlan !== undefined ? { plan: renderPlan(approvedPlan) } : {}),
       attempt: 1,
       isolation: selected.isolation,
       supportsCancellation: selected.supportsCancellation,
@@ -2608,6 +3298,7 @@ export function registerCoordinator(
       leaseEpoch: run.lease.epoch,
       role,
       attempt: 1,
+      ...decisionAnswer(run.issue.metadata),
       workspace: {
         repoPath: run.cwd,
         ...sourceWorkspace(run.issue.metadata),
@@ -2615,6 +3306,8 @@ export function registerCoordinator(
         requiresIsolation: false,
       },
       ...(role === "planner" ? { outputSchema: Plan } : {}),
+      ...(role === "planner" && planFeedback !== undefined ? { feedback: planFeedback } : {}),
+      ...(run.plan !== undefined ? { plan: run.plan } : {}),
     };
 
     // Bounded accept window; the correlated subscription is registered
@@ -2780,6 +3473,55 @@ export function registerCoordinator(
     for (const run of runs) {
       const held = getHeldLease(run.cwd, run.lease.issueId);
       if (!held) continue;
+      // A recorded plan whose critique was still in flight: closing Pi must
+      // not throw a finished plan away. Cancel the critic (best effort, not
+      // awaited — it is read-only, so the park does not depend on it having
+      // stopped) and park the plan as it would have parked without one. The
+      // inbox closed above, so critiqueThenPark's wait has abandoned the run
+      // to this branch. Any failure falls through to the ordinary
+      // reset-and-release below: a re-plan, never a stranded lease.
+      const pending = run.pendingPlan;
+      if (pending) {
+        try {
+          const issue = await show(run.cwd, run.lease.issueId);
+          const stillOurs =
+            leaseEpochOf(issue) === run.lease.epoch &&
+            leaseHolderOf(issue) === run.actor.holder;
+          if (stillOurs && phaseOf(issue) === "planning") {
+            // Only a CRITIC execution is canceled: until the run is rebound
+            // it still carries the planner's finished execution id.
+            if (
+              run.executionId !== undefined &&
+              run.executionId !== pending.completion.executionId
+            )
+              publishCancel(run, "coordinator stopped during plan critique");
+            // After the cancel (which had to address the critic): the park
+            // audit names the plan's source.
+            restorePlannerBinding(run);
+            const reason = "session ended during the critique";
+            await recordLeaseEvent(
+              run.cwd,
+              "plan-critique-unavailable",
+              run.lease.issueId,
+              { workflowRunId: run.workflowRunId, reason },
+              run.actor.bdActor,
+            );
+            // Performs the transition and the lease release itself.
+            await parkForPlanReview(
+              run,
+              pending.completion,
+              pending.plan,
+              unavailableSummary(reason),
+            );
+            continue;
+          }
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          console.error(
+            `[pi-workgraph] coordinator teardown could not park the pending plan for ${run.lease.issueId}: ${msg}`,
+          );
+        }
+      }
       // Cancel-first is scoped to runs with an IN-FLIGHT execution on an
       // ISOLATED executor: the active implementation run (accepted,
       // uncompleted) and a supervised run whose downstream execution is live
@@ -2883,11 +3625,10 @@ export function registerCoordinator(
     state.reconciling = true; // synchronous — gates ticks before any await
     const resumed: Promise<void>[] = [];
     try {
-      if (!bdBinaryAvailable()) return report;
       try {
         await ensureWorkspace(ctx.cwd);
       } catch {
-        return report; // no .beads/ here — nothing persisted to recover
+        return report; // no workspace here — nothing persisted to recover
       }
       const config = deps.getConfig();
       const nowMs = nowFn();
@@ -2975,7 +3716,7 @@ export function registerCoordinator(
         // AND the persisted run id unmoved (the onCompleted double-check) —
         // a hijacked run (another coordinator reclaimed while we were
         // down) is dropped silently, never double-supervised.
-        let cur: BeadsIssue;
+        let cur: WorkIssue;
         try {
           if (!(await verifyHolding(ctx.cwd, lease, workflowRunId))) {
             report.abandoned.push(issue.id);
@@ -3213,7 +3954,7 @@ export function registerCoordinator(
     // Reconciliation BEFORE the first coordination pass: the `reconciling`
     // latch is set synchronously inside reconcile(), so a settle-tick (or
     // the poll timer) arriving mid-recovery no-ops until adoption is done.
-    // Cost for the common (empty) case: one bd list. The report is for
+    // Cost for the common (empty) case: one store list. The report is for
     // reconcile()'s direct callers; the event contract wants void.
     return reconcile(ctx).then(() => undefined);
   });

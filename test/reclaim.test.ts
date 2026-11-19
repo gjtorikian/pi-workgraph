@@ -7,7 +7,7 @@
  * the reclaim latency is the contract's bound.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { bindExec, listComments, type BeadsComment } from "../src/bd.ts";
+import { getOpLog, listComments, type WorkComment } from "../src/store.ts";
 import { resetIdentityForTest, setWorkerIdOverride } from "../src/identity.ts";
 import piWorkgraph from "../src/index.ts";
 import {
@@ -35,7 +35,6 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 beforeAll(() => {
   const mock = makeMockPi();
-  bindExec((command, args, options) => mock.exec(command, args, options));
 });
 
 afterAll(() => {
@@ -94,7 +93,7 @@ describe("reclaim after worker death (contract criterion 3)", () => {
       expect(leaseEpochOf(shown)).toBe(2);
 
       // Audit record exists and names the dead holder.
-      const comments: BeadsComment[] = await listComments(graph.dir, id);
+      const comments: WorkComment[] = await listComments(graph.dir, id);
       const reclaims = comments.filter((c) =>
         c.text.startsWith("workgraph-lease reclaim "),
       );
@@ -148,8 +147,8 @@ describe("production sweep wiring (phase 1)", () => {
         // that blocks the event loop).
         const deadline = Date.now() + 45_000;
         let shown = graph.showIssue(id);
-        let comments: BeadsComment[] = [];
-        let releases: BeadsComment[] = [];
+        let comments: WorkComment[] = [];
+        let releases: WorkComment[] = [];
         while (Date.now() < deadline) {
           shown = graph.showIssue(id);
           if (shown.status === "open") {
@@ -229,7 +228,7 @@ describe("production sweep wiring (phase 1)", () => {
 
       // Read through the exec queue: reclaim's audit is fire-and-forget,
       // and queue ordering guarantees it landed before this read.
-      const comments: BeadsComment[] = await listComments(graph.dir, id);
+      const comments: WorkComment[] = await listComments(graph.dir, id);
       const reclaims = comments.filter((c) =>
         c.text.startsWith("workgraph-lease reclaim "),
       );
@@ -244,7 +243,6 @@ describe("production sweep wiring (phase 1)", () => {
     resetLeasesForTest();
     const graph = makeScratchGraph({ prefix: "rcl3" });
     const mock = makeMockPi();
-    bindExec((command, args, options) => mock.exec(command, args, options));
     const ectx = makeEventContext(graph.dir);
     try {
       const controller = registerSweep(asExtensionAPI(mock), {
@@ -263,27 +261,27 @@ describe("production sweep wiring (phase 1)", () => {
 
       // Warm-up tick (one-time workspace probes), then measure a solo tick.
       await controller.tick(ectx.ctx);
-      const beforeSolo = mock.execCalls.length;
+      const beforeSolo = getOpLog().length;
       await controller.tick(ectx.ctx);
-      const soloCalls = mock.execCalls.length - beforeSolo;
+      const soloCalls = getOpLog().length - beforeSolo;
       expect(soloCalls).toBeGreaterThan(0);
 
-      // Nothing expired → the tick is read-only: zero bd writes.
-      const idleCalls = mock.execCalls.slice(beforeSolo);
+      // Nothing expired → the tick is read-only: zero store writes.
+      const idleCalls = getOpLog().slice(beforeSolo);
       expect(
         idleCalls.filter(
-          (c) => c.args.includes("update") || c.args.includes("comment"),
+          (c) => c.op !== "ready" && c.op !== "show" && c.op !== "listInProgressUpdatedBefore" && c.op !== "listComments" && c.op !== "listIssues",
         ),
       ).toHaveLength(0);
 
       // Reentrancy: the guard is set synchronously before any await, so a
-      // tick fired while one is in flight adds ZERO bd calls — suppressed,
+      // tick fired while one is in flight adds ZERO store calls — suppressed,
       // not queued behind it.
-      const beforePair = mock.execCalls.length;
+      const beforePair = getOpLog().length;
       const inFlight = controller.tick(ectx.ctx);
       const suppressed = controller.tick(ectx.ctx);
       await Promise.all([inFlight, suppressed]);
-      expect(mock.execCalls.length - beforePair).toBe(soloCalls);
+      expect(getOpLog().length - beforePair).toBe(soloCalls);
 
       // Timer lifecycle mirrors dispatch: session_start starts (idempotent
       // restart), session_shutdown tears down.

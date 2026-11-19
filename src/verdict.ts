@@ -22,7 +22,7 @@
  */
 import { createHash } from "node:crypto";
 import { Value } from "typebox/value";
-import { addComment } from "./bd.ts";
+import { addComment } from "./store.ts";
 import type { FindingT, VerdictT } from "./types.ts";
 import { Verdict } from "./types.ts";
 

@@ -17,7 +17,7 @@
  * Run via `npm run test:recovery`.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { bindExec, listComments } from "../src/bd.ts";
+import { listComments } from "../src/store.ts";
 import { buildCompactionInstructions, registerCompactionTakeover } from "../src/compaction.ts";
 import type { WorkgraphConfig } from "../src/config.ts";
 import {
@@ -79,7 +79,6 @@ function makeHarness(
   now?: () => number,
 ): Harness {
   const mock = makeMockPi();
-  bindExec((command, args, options) => mock.exec(command, args, options));
   const config: WorkgraphConfig = { ...CONFIG, ...overrides };
   setWorkerIdOverride(WORKER);
   const coordinator = registerCoordinator(asExtensionAPI(mock), {
@@ -158,7 +157,7 @@ interface DeadRunOptions {
  * does NOT create is any in-process state — exactly what a crash loses.
  */
 function stampDeadRun(graph: ScratchGraph, id: string, opts: DeadRunOptions): void {
-  graph.bd(["update", id, "--claim", "--actor", "dead-coordinator"]);
+  graph.op(["update", id, "--claim", "--actor", "dead-coordinator"]);
   const expires = rfc3339((opts.nowMs ?? Date.now()) + (opts.expiresInMs ?? TTL));
   const args = [
     "update",
@@ -189,7 +188,7 @@ function stampDeadRun(graph: ScratchGraph, id: string, opts: DeadRunOptions): vo
     args.push("--set-metadata", `workgraph_attempt=${String(opts.attempt)}`);
   }
   args.push("--actor", "dead-coordinator");
-  graph.bd(args);
+  graph.op(args);
 }
 
 /** A well-formed completion echoing a stamped run's fencing triple. */
@@ -504,7 +503,7 @@ describe("startup reconciliation", () => {
     });
     // Another coordinator reclaimed while we were down: epoch bumped,
     // holder replaced — but the OLD workflow-run id metadata still names us.
-    graph.bd([
+    graph.op([
       "update",
       id,
       "--set-metadata",
@@ -696,7 +695,7 @@ describe("startup reconciliation", () => {
     // The anomaly: a run holder whose expiry was lost or never written
     // ("" reads undefined). The sweep NEVER auto-reclaims a no-expiry
     // claim, so a silent recovery skip would strand it in_progress forever.
-    graph.bd([
+    graph.op([
       "update",
       id,
       "--set-metadata",
@@ -744,7 +743,7 @@ describe("startup reconciliation", () => {
     });
     // A durable trail EXISTS but its outcome is corrupted — reconstruction
     // must never infer success (or ANY outcome) from a garbled record.
-    graph.bd([
+    graph.op([
       "comment",
       id,
       `workgraph-lease run-completed ${JSON.stringify({
@@ -798,7 +797,6 @@ describe("sweep reclaim publishes cancel and clears execution state", () => {
     const graph = makeScratchGraph({ prefix: "rcvsweep", seed: 1 });
     const id = graph.seededIds[0]!;
     const mock = makeMockPi();
-    bindExec((command, args, options) => mock.exec(command, args, options));
     setWorkerIdOverride(WORKER);
     const nowMs = Date.now();
     stampDeadRun(graph, id, {
@@ -952,7 +950,6 @@ describe("graceful shutdown", () => {
     const graph = makeScratchGraph({ prefix: "rcvshins", seed: 1 });
     const id = graph.seededIds[0]!;
     const mock = makeMockPi();
-    bindExec((command, args, options) => mock.exec(command, args, options));
     setWorkerIdOverride(WORKER);
     const config: WorkgraphConfig = { ...CONFIG, compatInSessionExecutor: true };
     // Registration order mirrors index.ts: adapter first.
@@ -996,7 +993,7 @@ describe("graceful shutdown", () => {
       const heldEpoch = leaseEpochOf(graph.showIssue(id));
 
       // A reclaimer takes the lease while the executor still runs.
-      graph.bd([
+      graph.op([
         "update",
         id,
         "--set-metadata",

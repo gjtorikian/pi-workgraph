@@ -9,7 +9,7 @@
  */
 import type { compact } from "@earendil-works/pi-coding-agent";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { bindExec, resetExecLog } from "../src/bd.ts";
+import { resetOpLog } from "../src/store.ts";
 import { registerCompactionTakeover } from "../src/compaction.ts";
 import {
   CONTEXT_CACHE_TTL_MS,
@@ -44,7 +44,6 @@ const compactInstructions: (string | undefined)[] = [];
 
 beforeAll(async () => {
   mock = makeMockPi();
-  bindExec((command, args, options) => mock.exec(command, args, options));
   setWorkerIdOverride(WORKER);
   graph = makeScratchGraph({ seed: 3, prefix: "ctxi" });
   ectx = makeEventContext(graph.dir, { model: {} });
@@ -67,7 +66,7 @@ beforeAll(async () => {
     throw new Error(`expected a claim, got ${outcome.kind}`);
   }
   heldLease = outcome.lease;
-  resetExecLog();
+  resetOpLog();
 }, 60_000);
 
 afterAll(() => {

@@ -80,6 +80,14 @@ export function newEnvelope(now: () => number = Date.now): EnvelopeT {
  * the planning phase when some offer advertises the role (README "The planner
  * tier"). Order is narrative — the lifecycle runs planner → implementer →
  * reviewer, with `revision`/`verifier` as the gate's own sub-roles.
+ *
+ * `plan_critic` is the same kind of v1-safe addition: an adapter that never
+ * offers it is unaffected, because a role is only requested from an executor
+ * that advertises it. The one hazard is version skew: a build that validates
+ * against the shorter enum rejects a whole offer naming `plan_critic`. Both
+ * sides of the protocol ship in this repository, so they upgrade together.
+ * It is listed last because it is an advisory sub-step of planning, not a
+ * lifecycle stage.
  */
 export const ExecutorRole = StringEnum([
   "planner",
@@ -88,6 +96,7 @@ export const ExecutorRole = StringEnum([
   "revision",
   "verifier",
   "finalizer",
+  "plan_critic",
 ]);
 export type ExecutorRoleT = Static<typeof ExecutorRole>;
 
@@ -183,6 +192,19 @@ export const RunRequest = Type.Object({
    * executor needs is the prompt-ready rendering.
    */
   plan: Type.Optional(Type.String()),
+  /**
+   * Human feedback from a rejected plan, attached to the NEXT planner run of
+   * the same issue (planner role only). Optional and v1-safe.
+   */
+  feedback: Type.Optional(Type.String()),
+  /**
+   * A question an earlier run of this issue parked for a human, with the
+   * answer (workgraph_answer_decision). Attached to every later run of the
+   * issue so no role re-asks it. Optional and v1-safe.
+   */
+  decision: Type.Optional(
+    Type.Object({ question: Type.String(), answer: Type.String() }),
+  ),
 });
 export type RunRequestT = Static<typeof RunRequest>;
 
@@ -242,7 +264,7 @@ export type RunProgressT = Static<typeof RunProgress>;
 
 /**
  * adapter → core: structured result, artifacts, evidence, provenance —
- * plus the full fencing triple the coordinator re-validates against Beads.
+ * plus the full fencing triple the coordinator re-validates against the store.
  */
 export const RunCompleted = Type.Object({
   ...envelopeProps,
@@ -253,6 +275,12 @@ export const RunCompleted = Type.Object({
   outcome: RunOutcome,
   /** Executor failed before producing a child result; no artifact to judge. */
   executionError: Type.Optional(Type.String()),
+  /** Explicit human input request; bypass judgment and revision budgets. */
+  decisionQuestion: Type.Optional(
+    Type.String({ minLength: 1, maxLength: 20000 }),
+  ),
+  /** A detached child still exists. Cancellation must be confirmed before resuming. */
+  workerPending: Type.Optional(Type.Boolean()),
   /** Changed files / patch refs. */
   artifacts: Type.Array(Type.String()),
   evidence: Type.Array(Type.String()),
@@ -328,7 +356,7 @@ export type RunStatusT = Static<typeof RunStatus>;
 
 /**
  * core → observers: canonical lifecycle changes for UI/presence (phase 5).
- * Emitted strictly POST-COMMIT (after the corresponding bd write resolved)
+ * Emitted strictly POST-COMMIT (after the corresponding store writes resolved)
  * from the coordinator's transition/escalation/close choke points; nothing
  * in-core subscribes. The optional fields are v1-safe additions for
  * presence/kanban overlays:

@@ -69,6 +69,16 @@ export interface MockPi {
   // ---- the ExtensionAPI subset this phase exercises ----
   exec(command: string, args: string[], options?: ExecOptions): Promise<ExecResult>;
   registerTool(tool: AnyToolDefinition): void;
+  registerCommand(name: string, options: unknown): void;
+  setModel(model: unknown): Promise<boolean>;
+  getThinkingLevel(): string;
+  setThinkingLevel(level: string): void;
+  /** Every `setModel` argument, in order. */
+  modelCalls: unknown[];
+  /** Every `setThinkingLevel` argument, in order. */
+  thinkingCalls: string[];
+  /** Registered slash commands by name. */
+  commands: Map<string, unknown>;
   registerFlag(
     name: string,
     options: { description?: string; type: "boolean" | "string"; default?: boolean | string },
@@ -187,6 +197,10 @@ export function makeMockPi(): MockPi {
   const handlers = new Map<string, ((...args: unknown[]) => unknown)[]>();
   const flagValues = new Map<string, boolean | string | undefined>();
   const flagDefaults = new Map<string, boolean | string | undefined>();
+  const commands = new Map<string, unknown>();
+  const modelCalls: unknown[] = [];
+  const thinkingCalls: string[] = [];
+  let thinkingLevel = "medium";
   const sendMessages: RecordedMessage[] = [];
   const entries: RecordedEntry[] = [];
   const systemPrompts: string[] = [];
@@ -212,6 +226,23 @@ export function makeMockPi(): MockPi {
     registerFlag(name, options) {
       flagDefaults.set(name, options.default);
     },
+    registerCommand(name, options) {
+      commands.set(name, options);
+    },
+    async setModel(model) {
+      modelCalls.push(model);
+      return true;
+    },
+    getThinkingLevel() {
+      return thinkingLevel;
+    },
+    setThinkingLevel(level) {
+      thinkingLevel = level;
+      thinkingCalls.push(level);
+    },
+    modelCalls,
+    thinkingCalls,
+    commands,
     getFlag(name) {
       return flagValues.has(name) ? flagValues.get(name) : flagDefaults.get(name);
     },

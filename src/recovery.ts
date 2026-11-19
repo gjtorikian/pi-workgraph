@@ -1,7 +1,7 @@
 /**
  * Startup reconciliation (phase 4): the read side of phase 2's
  * persist-intent-before-emit. A coordinator that dies mid-run leaves its
- * truth in Beads — `workgraph_workflow_run_id` + `workgraph_executor_id`
+ * truth in the store — `workgraph_workflow_run_id` + `workgraph_executor_id`
  * written at claim, `workgraph_active_execution_id` at accept, the lease
  * trio on every renewal, and the `run-completed` audit comment at each
  * fenced completion. On restart the coordinator enumerates that state,
@@ -27,7 +27,7 @@
  */
 import type { EventBus } from "@earendil-works/pi-coding-agent";
 import { AUDIT_PREFIX } from "./audit.ts";
-import { listComments, listInProgressUpdatedBefore } from "./bd.ts";
+import { listComments, listInProgressUpdatedBefore } from "./store.ts";
 import { leaseExpiresAtOf, leaseHolderOf, rfc3339 } from "./lease.ts";
 import { workflowRunIdOf } from "./lifecycle.ts";
 import {
@@ -41,7 +41,7 @@ import {
   type RunStatusRequestT,
   type RunStatusT,
 } from "./protocol.ts";
-import type { BeadsIssue, Lease } from "./types.ts";
+import type { WorkIssue, Lease } from "./types.ts";
 import {
   WORKFLOW_RUN_PREFIX,
   WORKGRAPH_AUTHOR_PROVENANCE_KEY,
@@ -77,7 +77,7 @@ export function emptyReport(): ReconcileReport {
  * assumption; concurrent coordinators are fenced-safe, merely duplicating
  * idempotent status requests).
  */
-export function isRunHeld(issue: BeadsIssue): boolean {
+export function isRunHeld(issue: WorkIssue): boolean {
   const holder = leaseHolderOf(issue);
   return (
     holder !== undefined &&
@@ -88,7 +88,7 @@ export function isRunHeld(issue: BeadsIssue): boolean {
 
 /**
  * Enumerate every in_progress issue held by a workflow run. The cutoff is
- * pushed one TTL into the FUTURE so bd's `--updated-before` filter passes
+ * pushed one TTL into the FUTURE so the store's `--updated-before` filter passes
  * everything currently in progress (the sweep uses the same query with a
  * past cutoff as its staleness signal; recovery wants the full set and
  * partitions client-side on the lease expiry the holder actually wrote).
@@ -97,7 +97,7 @@ export async function listRunHeldInProgress(
   cwd: string,
   nowMs: number,
   ttlMs: number,
-): Promise<BeadsIssue[]> {
+): Promise<WorkIssue[]> {
   const cutoff = rfc3339(nowMs + ttlMs);
   const issues = await listInProgressUpdatedBefore(cwd, cutoff);
   return issues.filter(isRunHeld);
@@ -112,11 +112,11 @@ export async function listRunHeldInProgress(
  * silent skip would strand the issue in_progress indefinitely.
  */
 export function partitionByExpiry(
-  issues: readonly BeadsIssue[],
+  issues: readonly WorkIssue[],
   nowMs: number,
-): { expired: BeadsIssue[]; live: BeadsIssue[] } {
-  const expired: BeadsIssue[] = [];
-  const live: BeadsIssue[] = [];
+): { expired: WorkIssue[]; live: WorkIssue[] } {
+  const expired: WorkIssue[] = [];
+  const live: WorkIssue[] = [];
   for (const issue of issues) {
     const expiresAt = leaseExpiresAtOf(issue);
     if (expiresAt !== undefined && Date.parse(expiresAt) < nowMs) {
@@ -224,7 +224,7 @@ const OUTCOMES: readonly string[] = ["success", "failure", "blocked"];
  */
 export async function reconstructAuthorCompletion(
   cwd: string,
-  issue: BeadsIssue,
+  issue: WorkIssue,
   lease: Lease,
   now: () => number = Date.now,
 ): Promise<RunCompletedT | undefined> {

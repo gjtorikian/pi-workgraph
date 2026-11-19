@@ -15,7 +15,7 @@
  * Run via `npm run test:judgment`.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { bindExec, listComments, getExecLog, resetExecLog } from "../src/bd.ts";
+import { listComments, getOpLog, resetOpLog } from "../src/store.ts";
 import type { WorkgraphConfig } from "../src/config.ts";
 import {
   registerCoordinator,
@@ -54,12 +54,14 @@ import {
   type VerdictT,
 } from "../src/types.ts";
 import { installFakeExecutor } from "./helpers/fake-executor.ts";
+import { registerWorkgraphTools } from "../src/tools.ts";
 import { registerPiSubagentsExecutor } from "../src/adapters/pi-subagents.ts";
 import { installFakeSubagents } from "./helpers/fake-subagents.ts";
 import {
   asExtensionAPI,
   makeEventContext,
   makeMockPi,
+  makeToolContext,
   type MockPi,
 } from "./helpers/mock-pi.ts";
 import { makeScratchGraph, type ScratchGraph } from "./helpers/scratch.ts";
@@ -109,7 +111,6 @@ interface Harness {
 
 function makeHarness(overrides: Partial<WorkgraphConfig> = {}): Harness {
   const mock = makeMockPi();
-  bindExec((command, args, options) => mock.exec(command, args, options));
   const config: WorkgraphConfig = { ...CONFIG, ...overrides };
   setWorkerIdOverride(WORKER);
   const coordinator = registerCoordinator(asExtensionAPI(mock), {
@@ -155,7 +156,7 @@ function approve(
   ];
   if (opts.acceptance) args.push("--acceptance", opts.acceptance);
   args.push("--actor", "approver");
-  graph.bd(args);
+  graph.op(args);
 }
 
 async function auditCount(
@@ -186,7 +187,6 @@ afterEach(() => {
 describe("lifecycle transitions", () => {
   it("walks every legal edge, stamping lifecycle v1 lazily at the entry edges", async () => {
     const mock = makeMockPi();
-    bindExec((command, args, options) => mock.exec(command, args, options));
     const graph = makeScratchGraph({ prefix: "lcwalk" });
     try {
       // Legacy entry: <none> → ready stamps v1 (workgraph_approve's edge).
@@ -217,7 +217,7 @@ describe("lifecycle transitions", () => {
 
       // Companion fields ride the SAME write as the phase.
       const second = graph.createIssue("draft entry");
-      graph.bd(["update", second, "--set-metadata", "workgraph_phase=draft"]);
+      graph.op(["update", second, "--set-metadata", "workgraph_phase=draft"]);
       await transition(graph.dir, second, "draft", "ready", {
         fields: { workgraph_risk_tier: "high" },
       });
@@ -232,11 +232,10 @@ describe("lifecycle transitions", () => {
 
   it("throws LifecycleError on every illegal edge", async () => {
     const mock = makeMockPi();
-    bindExec((command, args, options) => mock.exec(command, args, options));
     const graph = makeScratchGraph({ prefix: "lcbad" });
     try {
       const id = graph.createIssue("illegal edges");
-      graph.bd([
+      graph.op([
         "update",
         id,
         "--set-metadata",
@@ -249,12 +248,12 @@ describe("lifecycle transitions", () => {
         transition(graph.dir, id, "implementing", "accepted"),
       ).rejects.toThrow(LifecycleError);
       // judging → accepted skips verification.
-      graph.bd(["update", id, "--set-metadata", "workgraph_phase=judging"]);
+      graph.op(["update", id, "--set-metadata", "workgraph_phase=judging"]);
       await expect(
         transition(graph.dir, id, "judging", "accepted"),
       ).rejects.toThrow(LifecycleError);
       // accepted is terminal as a phase (close is a status change).
-      graph.bd(["update", id, "--set-metadata", "workgraph_phase=accepted"]);
+      graph.op(["update", id, "--set-metadata", "workgraph_phase=accepted"]);
       await expect(
         transition(graph.dir, id, "accepted", "ready"),
       ).rejects.toThrow(LifecycleError);
@@ -273,11 +272,10 @@ describe("lifecycle transitions", () => {
 
   it("loses the compare-and-set race: a stale expect throws and writes nothing", async () => {
     const mock = makeMockPi();
-    bindExec((command, args, options) => mock.exec(command, args, options));
     const graph = makeScratchGraph({ prefix: "lccas" });
     try {
       const id = graph.createIssue("raced transition");
-      graph.bd([
+      graph.op([
         "update",
         id,
         "--set-metadata",
@@ -298,11 +296,10 @@ describe("lifecycle transitions", () => {
 
   it("escalate() is guarded to active phases with the same CAS discipline", async () => {
     const mock = makeMockPi();
-    bindExec((command, args, options) => mock.exec(command, args, options));
     const graph = makeScratchGraph({ prefix: "lcesc" });
     try {
       const id = graph.createIssue("escalation");
-      graph.bd([
+      graph.op([
         "update",
         id,
         "--set-metadata",
@@ -795,7 +792,7 @@ describe("approved-only claiming", () => {
     });
     const ectx = makeEventContext(graph.dir);
     try {
-      resetExecLog();
+      resetOpLog();
       await settle(mock, ectx.ctx);
       await mock.flushEvents();
 
@@ -804,9 +801,9 @@ describe("approved-only claiming", () => {
       const shown = graph.showIssue(graph.seededIds[0]!);
       expect(shown.status).toBe("open");
       expect(shown.assignee ?? "").toBe("");
-      const log = getExecLog();
-      expect(log.some((e) => e.args.includes("--claim"))).toBe(false);
-      expect(log.some((e) => e.args[0] === "ready")).toBe(true);
+      const log = getOpLog();
+      expect(log.some((e) => (e.op === "claim" || e.op === "claimNext"))).toBe(false);
+      expect(log.some((e) => e.op === "ready")).toBe(true);
     } finally {
       fake.uninstall();
       await coordinator.teardown(ectx.ctx);
@@ -828,7 +825,7 @@ describe("approved-only claiming", () => {
     });
     const ectx = makeEventContext(graph.dir);
     try {
-      resetExecLog();
+      resetOpLog();
       await settle(mock, ectx.ctx);
       await mock.flushEvents();
 
@@ -841,12 +838,12 @@ describe("approved-only claiming", () => {
       expect(graph.showIssue(graph.seededIds[0]!).status).toBe("open");
 
       // Claim-by-id: atomic `update <id> --claim`, zero bare assignee writes.
-      const log = getExecLog();
-      const claims = log.filter((e) => e.args.includes("--claim"));
+      const log = getOpLog();
+      const claims = log.filter((e) => (e.op === "claim" || e.op === "claimNext"));
       expect(claims).toHaveLength(1);
-      expect(claims[0]!.args[0]).toBe("update");
-      expect(claims[0]!.args[1]).toBe(approved);
-      expect(log.some((e) => e.args.includes("--assignee"))).toBe(false);
+      expect(claims[0]!.op).toBe("claim");
+      expect(claims[0]!.issueId).toBe(approved);
+      expect(log.some((e) => e.op === "overwriteAssignee")).toBe(false);
 
       // Parked in judging with the lease heartbeat-held until shutdown.
       expect(heldLeases(graph.dir)).toHaveLength(1);
@@ -967,6 +964,150 @@ describe("executor failure diagnostics", () => {
     },
     60_000,
   );
+
+  it.each(["ack", "ignore"] as const)(
+    "parks a detached decision request without review and records cancellation %s",
+    async (cancel) => {
+      const { mock, coordinator } = makeHarness();
+      const graph = makeScratchGraph({ prefix: "decision" });
+      const id = graph.createIssue("choose password compatibility policy");
+      approve(graph, id);
+      const fake = installFakeExecutor(mock.events, {
+        roles: ["implementer", "reviewer"],
+        supportsCancellation: true,
+        cancel,
+        roleScripts: {
+          implementer: {
+            outcome: "blocked",
+            decisionQuestion: "Allow a breaking change?",
+            workerPending: true,
+          },
+        },
+      });
+      const ectx = makeEventContext(graph.dir);
+      try {
+        await settle(mock, ectx.ctx);
+        await mock.flushEvents();
+        expect(graph.showIssue(id).status).toBe("blocked");
+        const metadata = metadataOf(graph, id);
+        expect(metadata.workgraph_decision_pending).toBe(true);
+        expect(metadata.workgraph_decision_question).toBe(
+          "Allow a breaking change?",
+        );
+        expect(metadata.workgraph_halt_unconfirmed).toBe(cancel === "ignore");
+        expect(metadata.workgraph_workspace_run_id).toBe(
+          fake.requests[0]!.workflowRunId,
+        );
+        expect(fake.requests.map((r) => r.role)).toEqual(["implementer"]);
+        expect(await auditCount(graph.dir, id, "decision-needed")).toBe(1);
+        expect(await auditCount(graph.dir, id, "revision-requested")).toBe(0);
+        expect(heldLeases(graph.dir)).toHaveLength(0);
+        expect(coordinator.current()).toBeNull();
+        await settle(mock, ectx.ctx);
+        expect(fake.requests).toHaveLength(1);
+      } finally {
+        fake.uninstall();
+        await coordinator.teardown(ectx.ctx);
+        graph.cleanup();
+      }
+    },
+    60_000,
+  );
+
+  it("stops the revision loop when a revisor requests a human decision", async () => {
+    const { mock, coordinator } = makeHarness();
+    const graph = makeScratchGraph({ prefix: "revdecision" });
+    const id = graph.createIssue("revision needs a policy choice");
+    approve(graph, id);
+    const fake = installFakeExecutor(mock.events, {
+      roles: ["implementer", "reviewer", "revision"],
+      roleScripts: {
+        implementer: { provenance: IMPL_PROV },
+        reviewer: {
+          provenance: REV_PROV,
+          verdict: blockingVerdict("compatibility"),
+        },
+        revision: {
+          outcome: "blocked",
+          decisionQuestion: "Keep the legacy API?",
+        },
+      },
+    });
+    const ectx = makeEventContext(graph.dir);
+    try {
+      await settle(mock, ectx.ctx);
+      await mock.flushEvents();
+      expect(fake.requests.map((r) => r.role)).toEqual([
+        "implementer",
+        "reviewer",
+        "revision",
+      ]);
+      expect(metadataOf(graph, id).workgraph_decision_pending).toBe(true);
+      expect(await auditCount(graph.dir, id, "decision-needed")).toBe(1);
+      expect(graph.showIssue(id).status).toBe("blocked");
+    } finally {
+      fake.uninstall();
+      await coordinator.teardown(ectx.ctx);
+      graph.cleanup();
+    }
+  }, 60_000);
+
+  it("an answered decision re-approves into a run that carries the answer and the retained workspace", async () => {
+    const { mock, coordinator } = makeHarness();
+    registerWorkgraphTools(asExtensionAPI(mock));
+    const runTool = (name: string, params: unknown, cwd: string) =>
+      mock.tools.get(name)!.execute(`call-${name}`, params, undefined, undefined, makeToolContext(cwd));
+    const graph = makeScratchGraph({ prefix: "answered" });
+    const id = graph.createIssue("choose password compatibility policy");
+    approve(graph, id);
+    const fake = installFakeExecutor(mock.events, {
+      roles: ["implementer", "reviewer"],
+      roleScripts: {
+        implementer: [
+          { outcome: "blocked", decisionQuestion: "Allow a breaking change?" },
+          { provenance: IMPL_PROV },
+        ],
+        reviewer: { provenance: REV_PROV, verdict: CLEAN_VERDICT },
+      },
+    });
+    const ectx = makeEventContext(graph.dir);
+    try {
+      await settle(mock, ectx.ctx);
+      await mock.flushEvents();
+      expect(metadataOf(graph, id).workgraph_decision_pending).toBe(true);
+      await expect(runTool("workgraph_approve", { id }, graph.dir)).rejects.toThrow(
+        /workgraph_answer_decision/,
+      );
+
+      await expect(
+        runTool("workgraph_answer_decision", { id: graph.createIssue("other"), answer: "yes" }, graph.dir),
+      ).rejects.toThrow(/no pending decision/);
+      await runTool("workgraph_answer_decision", { id, answer: "Yes, bump the major." }, graph.dir);
+      expect(metadataOf(graph, id).workgraph_decision_pending).toBe(false);
+      expect(metadataOf(graph, id).workgraph_decision_answer).toBe("Yes, bump the major.");
+      expect(await auditCount(graph.dir, id, "decision-answered")).toBe(1);
+
+      await runTool("workgraph_approve", { id }, graph.dir);
+      expect(phaseOf(graph.showIssue(id))).toBe("ready");
+      await settle(mock, ectx.ctx);
+      await mock.flushEvents();
+      expect(fake.requests.map((r) => r.role)).toEqual(["implementer", "implementer", "reviewer"]);
+      expect(fake.requests[0]!.decision).toBeUndefined();
+      for (const request of fake.requests.slice(1)) {
+        expect(request.decision).toEqual({
+          question: "Allow a breaking change?",
+          answer: "Yes, bump the major.",
+        });
+        expect(request.workspace.sourceWorkflowRunId).toBe(fake.requests[0]!.workflowRunId);
+      }
+      expect(phaseOf(graph.showIssue(id))).toBe("accepted");
+      expect(graph.showIssue(id).status).toBe("closed");
+    } finally {
+      fake.uninstall();
+      await coordinator.teardown(ectx.ctx);
+      graph.cleanup();
+    }
+  }, 60_000);
 
   it("never accepts a failed review even when it includes a valid clean verdict", async () => {
     const { mock, coordinator } = makeHarness();

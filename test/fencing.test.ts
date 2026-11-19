@@ -8,7 +8,7 @@
  * remains B's.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { bindExec, listComments, type BeadsComment } from "../src/bd.ts";
+import { listComments, type WorkComment } from "../src/store.ts";
 import { resetIdentityForTest, setWorkerIdOverride } from "../src/identity.ts";
 import {
   acquireLease,
@@ -53,7 +53,6 @@ function runTool(name: string, params: unknown, cwd: string) {
 
 beforeAll(() => {
   mock = makeMockPi();
-  bindExec((command, args, options) => mock.exec(command, args, options));
   // The run-scoped suite drives workgraph_close/workgraph_heartbeat — the
   // tool-level holder writes — through their fencing gates.
   registerWorkgraphTools(asExtensionAPI(mock));
@@ -115,7 +114,7 @@ describe("fencing (contract criterion 2)", () => {
       expect(leaseEpochOf(shown)).toBe(2);
 
       // The audit trail shows the reclaim, naming A as the previous holder.
-      const comments: BeadsComment[] = await listComments(graph.dir, id);
+      const comments: WorkComment[] = await listComments(graph.dir, id);
       const reclaims = comments.filter((c) =>
         c.text.startsWith("workgraph-lease reclaim "),
       );
@@ -166,7 +165,7 @@ describe("run-scoped fencing (phase 1)", () => {
 
       // Run B's fenced takeover: epoch bump + holder overwrite — the exact
       // state a reclaim leaves behind.
-      graph.bd([
+      graph.op([
         "update",
         id,
         "--set-metadata",
@@ -229,7 +228,7 @@ describe("run-scoped fencing (phase 1)", () => {
       // The epoch moves on while the holder NAME stays identical (an
       // expire/re-acquire round-trip elsewhere ends with the same run name
       // at a higher epoch). The stale lease's epoch is what must fail.
-      graph.bd([
+      graph.op([
         "update",
         id,
         "--set-metadata",
