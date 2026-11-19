@@ -22,6 +22,7 @@ import { listComments } from "../src/store.ts";
 import { loadStoredTiers, resolveTiers, setResolvedTiers, tierFor } from "../src/tiers.ts";
 import { registerWorkgraphTools } from "../src/tools.ts";
 import { WORKGRAPH_PLAN_SUMMARY_KEY, type PlanT } from "../src/types.ts";
+import { preProofConfig } from "./helpers/config.ts";
 import { installFakeExecutor } from "./helpers/fake-executor.ts";
 import {
   asExtensionAPI,
@@ -34,16 +35,7 @@ import { makeScratchGraph, type ScratchGraph } from "./helpers/scratch.ts";
 
 const WORKER = "plan-gate-worker";
 
-const CONFIG: WorkgraphConfig = {
-  leaseTtlMs: 300_000,
-  heartbeatMs: 600_000,
-  pollMs: 600_000,
-  sweepIntervalMs: 600_000,
-  discoveryTimeoutMs: 40,
-  acceptTimeoutMs: 150,
-  compatInSessionExecutor: false,
-  workerIdOverride: WORKER,
-};
+const CONFIG = preProofConfig({ workerIdOverride: WORKER });
 
 const PLAN_PROV = { harness: "fake", model: "plan-model", provider: "prov-plan" };
 const IMPL_PROV = { harness: "fake", model: "impl-model", provider: "prov-impl" };
@@ -71,7 +63,7 @@ interface Harness {
 
 function makeHarness(overrides: Partial<WorkgraphConfig> = {}): Harness {
   const mock = makeMockPi();
-  const config: WorkgraphConfig = { ...CONFIG, ...overrides };
+  const config = preProofConfig({ ...CONFIG, ...overrides });
   setWorkerIdOverride(WORKER);
   registerWorkgraphTools(asExtensionAPI(mock));
   const coordinator = registerCoordinator(asExtensionAPI(mock), { getConfig: () => config });
@@ -299,7 +291,7 @@ describe("in-session planner", () => {
     const id = graph.seededIds[0]!;
     approvePlanned(graph, id);
     const mock = makeMockPi();
-    const config: WorkgraphConfig = { ...CONFIG, compatInSessionExecutor: true };
+    const config = preProofConfig({ ...CONFIG, compatInSessionExecutor: true });
     setWorkerIdOverride(WORKER);
     registerWorkgraphTools(asExtensionAPI(mock));
     const adapter = registerInSessionExecutor(asExtensionAPI(mock), { getConfig: () => config });
@@ -339,7 +331,7 @@ describe("in-session planner", () => {
     const id = graph.seededIds[0]!;
     approvePlanned(graph, id);
     const mock = makeMockPi();
-    const config: WorkgraphConfig = { ...CONFIG, compatInSessionExecutor: true };
+    const config = preProofConfig({ ...CONFIG, compatInSessionExecutor: true });
     setWorkerIdOverride(WORKER);
     registerWorkgraphTools(asExtensionAPI(mock));
     const adapter = registerInSessionExecutor(asExtensionAPI(mock), { getConfig: () => config });
@@ -392,7 +384,7 @@ describe("model tiers in-session", () => {
       },
     });
     const mock = makeMockPi();
-    const config: WorkgraphConfig = { ...CONFIG, compatInSessionExecutor: true };
+    const config = preProofConfig({ ...CONFIG, compatInSessionExecutor: true });
     setWorkerIdOverride(WORKER);
     const adapter = registerInSessionExecutor(asExtensionAPI(mock), { getConfig: () => config });
     const coordinator = registerCoordinator(asExtensionAPI(mock), { getConfig: () => config });

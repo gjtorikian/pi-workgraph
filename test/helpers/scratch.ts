@@ -25,14 +25,44 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import {
   closeWorkspace,
+  databasePathFor,
   initWorkspaceSync,
   sync,
   type MetadataValue,
   type UpdateFields,
 } from "../../src/store.ts";
 import type { WorkIssue } from "../../src/types.ts";
+
+/** What a comment write rejected by {@link failCommentWrites} reports. */
+export const COMMENT_WRITE_FAILURE = "comment trail refused the write";
+
+let failTriggers = 0;
+
+/**
+ * Make the REAL store reject every comment whose text starts with `prefix`,
+ * from now until the graph is cleaned up; every other write still lands. A
+ * trigger on the scratch database raises the failure, so the store's own
+ * `addComment` throws exactly as it would on a full disk or a locked file —
+ * nothing is mocked. Tests use it to fail one trail (`workgraph-verdict`,
+ * `workgraph-proof`) while the audit trail next to it keeps recording.
+ */
+export function failCommentWrites(dir: string, prefix: string): void {
+  const db = new DatabaseSync(databasePathFor(dir));
+  try {
+    failTriggers += 1;
+    const literal = `'${prefix.replace(/'/g, "''")}'`;
+    db.exec(
+      `CREATE TRIGGER fail_comment_writes_${failTriggers} BEFORE INSERT ON comments ` +
+        `WHEN substr(NEW.text, 1, ${prefix.length}) = ${literal} ` +
+        `BEGIN SELECT RAISE(ABORT, '${COMMENT_WRITE_FAILURE}'); END`,
+    );
+  } finally {
+    db.close();
+  }
+}
 
 export interface CreateIssueOptions {
   priority?: number;

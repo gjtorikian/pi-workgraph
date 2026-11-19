@@ -50,19 +50,11 @@ import {
   type RunCompletedT,
   type RunRequestT,
 } from "../src/protocol.ts";
+import { preProofConfig } from "./helpers/config.ts";
 import { installFakeSubagents } from "./helpers/fake-subagents.ts";
 import { asExtensionAPI, makeMockPi, type MockPi } from "./helpers/mock-pi.ts";
 
-const CONFIG: WorkgraphConfig = {
-  leaseTtlMs: 300_000,
-  heartbeatMs: 600_000,
-  pollMs: 600_000,
-  sweepIntervalMs: 600_000,
-  discoveryTimeoutMs: 40,
-  acceptTimeoutMs: 150,
-  compatInSessionExecutor: false,
-  subagentsExecutor: { enabled: true },
-};
+const CONFIG = preProofConfig({ subagentsExecutor: { enabled: true } });
 
 interface BridgeHarness {
   mock: MockPi;
@@ -77,7 +69,7 @@ function makeBridgeHarness(
 ): BridgeHarness {
   const mock = makeMockPi();
   const warnings: string[] = [];
-  const config: WorkgraphConfig = { ...CONFIG, ...overrides };
+  const config = preProofConfig({ ...CONFIG, ...overrides });
   const bridge = registerPiSubagentsExecutor(asExtensionAPI(mock), {
     getConfig: () => config,
     probeVersion: probe,
@@ -167,7 +159,7 @@ describe("bridge registration gating", () => {
   it("unconfigured: no offer AND zero bus subscriptions (the inner gate)", () => {
     const mock = makeMockPi();
     const warnings: string[] = [];
-    const config: WorkgraphConfig = { ...CONFIG };
+    const config = preProofConfig({ ...CONFIG });
     delete (config as Partial<WorkgraphConfig>).subagentsExecutor;
     const bridge = registerPiSubagentsExecutor(asExtensionAPI(mock), {
       getConfig: () => config,
@@ -925,11 +917,11 @@ describe("serial foreground execution", () => {
 describe("two executors: selection determinism", () => {
   function makeTwoExecutorHarness(): { mock: MockPi; cleanup: () => void } {
     const mock = makeMockPi();
-    const config: WorkgraphConfig = {
+    const config = preProofConfig({
       ...CONFIG,
       compatInSessionExecutor: true,
       subagentsExecutor: { enabled: true },
-    };
+    });
     const inSession = registerInSessionExecutor(asExtensionAPI(mock), {
       getConfig: () => config,
     });

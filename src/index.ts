@@ -11,7 +11,11 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerInSessionExecutor } from "./adapters/in-session.ts";
 import { isPiSubagentProcess, registerPiSubagentsExecutor } from "./adapters/pi-subagents.ts";
 import { registerCompactionTakeover } from "./compaction.ts";
-import { registerConfigFlags, resolveConfig } from "./config.ts";
+import {
+  registerConfigFlags,
+  resolveConfig,
+  resolveConfigWithoutPolicy,
+} from "./config.ts";
 import { registerContextInjection } from "./context.ts";
 import { registerCoordinator } from "./coordinator.ts";
 // registerDispatch is DEPRECATED (phase 2) and no longer wired here — the
@@ -39,15 +43,24 @@ export default function piWorkgraph(pi: ExtensionAPI): void {
   // the parent coordinator. Pi runtime detection stays in the Pi adapter.
   if (isPiSubagentProcess()) return;
 
+  // WHICH CONFIG READER. `resolveConfig` throws on an invalid policy, and
+  // only the coordinator (and the tools) should be stopped by that: it is
+  // what starts and judges work under the policy. Everything else wired
+  // here reads timers, routing or the store location, never the policy, and
+  // runs in event handlers where a throw would be an unhandled rejection —
+  // so it reads through `resolveConfigWithoutPolicy`, which cannot fail on
+  // a policy typo.
+
   // Model tiers resolve against the registry FIRST on session_start — this
   // handler is registered before every adapter and the coordinator, so the
   // first dispatch already sees the routing table.
   pi.on("session_start", async (_event, ctx) => {
     noteSessionCwd(ctx.cwd);
-    configureStore(resolveConfig(pi).store);
+    const config = resolveConfigWithoutPolicy(pi);
+    configureStore(config.store);
     // Flag/env, else project .pi/settings.json, else what a `workgraph_tiers`
     // call stored in this workspace, else ~/.pi/agent/settings.json.
-    const effective = await effectiveTiers(resolveConfig(pi).tiers, ctx.cwd);
+    const effective = await effectiveTiers(config.tiers, ctx.cwd);
     if (!effective) {
       setResolvedTiers(undefined);
       return;
@@ -68,7 +81,9 @@ export default function piWorkgraph(pi: ExtensionAPI): void {
   // next one, never instantly (see the adapter's header). It gates itself
   // on `compatInSessionExecutor` (default true) at every event, so a
   // disabled adapter never offers.
-  registerInSessionExecutor(pi, { getConfig: () => resolveConfig(pi) });
+  registerInSessionExecutor(pi, {
+    getConfig: () => resolveConfigWithoutPolicy(pi),
+  });
 
   // The OPTIONAL pi-subagents bridge (phase 5) — DOUBLE-gated: this outer
   // gate never calls the register function unless `subagentsExecutor` is
@@ -80,9 +95,13 @@ export default function piWorkgraph(pi: ExtensionAPI): void {
   let subagentsRegistered = false;
   pi.on("session_start", () => {
     if (subagentsRegistered) return;
-    if (resolveConfig(pi).subagentsExecutor?.enabled !== true) return;
+    if (resolveConfigWithoutPolicy(pi).subagentsExecutor?.enabled !== true) {
+      return;
+    }
     subagentsRegistered = true;
-    registerPiSubagentsExecutor(pi, { getConfig: () => resolveConfig(pi) });
+    registerPiSubagentsExecutor(pi, {
+      getConfig: () => resolveConfigWithoutPolicy(pi),
+    });
   });
 
   // The coordinator resolves config lazily; the 5 s poll floor lives HERE
@@ -93,6 +112,9 @@ export default function piWorkgraph(pi: ExtensionAPI): void {
   // the reconciling latch), then the poll timer; plus an agent_settled tick
   // and an idempotent session_shutdown graceful teardown (in-session runs
   // release immediately; isolated executions get cancel-first semantics).
+  // The one policy reader here: `resolveConfig` throws on an invalid policy,
+  // and the coordinator turns that into "no dispatch, no judgment, the bad
+  // key logged once" while still heartbeating and releasing what it holds.
   const coordinator = registerCoordinator(pi, {
     getConfig: () => {
       const config = resolveConfig(pi);
@@ -108,7 +130,7 @@ export default function piWorkgraph(pi: ExtensionAPI): void {
   // tiny intervals.
   registerSweep(pi, {
     getConfig: () => {
-      const config = resolveConfig(pi);
+      const config = resolveConfigWithoutPolicy(pi);
       return {
         ...config,
         sweepIntervalMs: Math.max(config.sweepIntervalMs, MIN_POLL_MS),
@@ -145,7 +167,7 @@ export default function piWorkgraph(pi: ExtensionAPI): void {
     // hint when it's missing — the extension itself stays loaded), wire the
     // identity override, and resolve the session-id component of workerId()
     // now that a ctx exists.
-    setWorkerIdOverride(resolveConfig(pi).workerIdOverride);
+    setWorkerIdOverride(resolveConfigWithoutPolicy(pi).workerIdOverride);
     noteSessionId(ctx.sessionManager.getSessionId());
   });
 }
@@ -176,7 +198,10 @@ function registerWorkgraphCommand(pi: ExtensionAPI): void {
             // `/workgraph tiers <json>` (or off) stores the choice here.
             await storeTiers(ctx.cwd, parseTiersValue(rest.join(" ")));
           }
-          const effective = await effectiveTiers(resolveConfig(pi).tiers, ctx.cwd);
+          const effective = await effectiveTiers(
+            resolveConfigWithoutPolicy(pi).tiers,
+            ctx.cwd,
+          );
           if (!effective) {
             say(
               'No model tiers configured. Declare "workgraph": { "tiers": { "planner": "provider/id", ... } } in ~/.pi/agent/settings.json or .pi/settings.json.',

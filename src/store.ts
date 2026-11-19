@@ -89,6 +89,7 @@ export type StoreOp =
   | "overwriteAssignee"
   | "addComment"
   | "listComments"
+  | "listCommentsByPrefix"
   | "createIssue"
   | "addDependency"
   | "listIssues";
@@ -792,25 +793,47 @@ function addCommentSync(cwd: string, id: string, text: string, actor?: string): 
   );
 }
 
-function listCommentsSync(cwd: string, id: string): WorkComment[] {
-  recordOp("listComments", id);
-  const db = openDb(cwd, "listComments");
-  const rows = db
-    .prepare("SELECT id, issue_id, author, text, created_at FROM comments WHERE issue_id = ? ORDER BY id ASC")
-    .all(id) as unknown as {
-    id: number;
-    issue_id: string;
-    author: string | null;
-    text: string;
-    created_at: string;
-  }[];
-  return rows.map((r) => ({
+interface CommentRow {
+  id: number;
+  issue_id: string;
+  author: string | null;
+  text: string;
+  created_at: string;
+}
+
+function rowToComment(r: CommentRow): WorkComment {
+  return {
     id: String(r.id),
     issue_id: r.issue_id,
     ...(r.author ? { author: r.author } : {}),
     text: r.text,
     created_at: r.created_at,
-  }));
+  };
+}
+
+function listCommentsSync(cwd: string, id: string): WorkComment[] {
+  recordOp("listComments", id);
+  const db = openDb(cwd, "listComments");
+  const rows = db
+    .prepare("SELECT id, issue_id, author, text, created_at FROM comments WHERE issue_id = ? ORDER BY id ASC")
+    .all(id) as unknown as CommentRow[];
+  return rows.map(rowToComment);
+}
+
+function listCommentsByPrefixSync(cwd: string, prefix: string): WorkComment[] {
+  recordOp("listCommentsByPrefix");
+  const db = openDb(cwd, "listCommentsByPrefix");
+  // LIKE only narrows the scan: it ignores ASCII case, and `%`/`_` in the
+  // prefix are wildcards unless escaped. The exact, case-sensitive match is
+  // the `startsWith` below. No index serves a text prefix (the one comments
+  // index is on issue_id), so this reads the whole table once.
+  const pattern = `${prefix.replace(/[\\%_]/g, "\\$&")}%`;
+  const rows = db
+    .prepare(
+      "SELECT id, issue_id, author, text, created_at FROM comments WHERE text LIKE ? ESCAPE '\\' ORDER BY id ASC",
+    )
+    .all(pattern) as unknown as CommentRow[];
+  return rows.filter((r) => r.text.startsWith(prefix)).map(rowToComment);
 }
 
 /** Input for {@link createIssue}. */
@@ -964,6 +987,7 @@ export const sync: {
   overwriteAssigneeForReclaim: typeof overwriteAssigneeForReclaimSync;
   addComment: typeof addCommentSync;
   listComments: typeof listCommentsSync;
+  listCommentsByPrefix: typeof listCommentsByPrefixSync;
   createIssue: typeof createIssueSync;
   addDependency: typeof addDependencySync;
   listIssues: typeof listIssuesSync;
@@ -984,6 +1008,7 @@ export const sync: {
   overwriteAssigneeForReclaim: overwriteAssigneeForReclaimSync,
   addComment: addCommentSync,
   listComments: listCommentsSync,
+  listCommentsByPrefix: listCommentsByPrefixSync,
   createIssue: createIssueSync,
   addDependency: addDependencySync,
   listIssues: listIssuesSync,
@@ -1095,6 +1120,15 @@ export async function addComment(cwd: string, id: string, text: string, actor?: 
 /** Read all comments on an issue, oldest first (`[]` when there are none). */
 export async function listComments(cwd: string, id: string): Promise<WorkComment[]> {
   return listCommentsSync(cwd, id);
+}
+
+/**
+ * Read every comment, on any issue, whose text starts with `prefix`, oldest
+ * first: one query for a report over a whole trail (e.g. every
+ * `workgraph-proof gate` record). The match is exact and case-sensitive.
+ */
+export async function listCommentsByPrefix(cwd: string, prefix: string): Promise<WorkComment[]> {
+  return listCommentsByPrefixSync(cwd, prefix);
 }
 
 /** Create a new issue and return it. */

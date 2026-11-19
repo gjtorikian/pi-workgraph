@@ -255,8 +255,8 @@ export type LeaseEvent =
 export const Finding = Type.Object({
   /** The acceptance criterion (or invariant) this finding is about. */
   criterion: Type.String(),
-  /** `blocking` findings gate continuation under a blocking policy;
-   *  `advisory` findings are persisted but never block. */
+  /** `blocking` findings gate continuation when the `review` gate
+   *  enforces; `advisory` findings are persisted but never block. */
   severity: StringEnum(["blocking", "advisory"]),
   note: Type.Optional(Type.String()),
   evidence: Type.Optional(Type.String()),
@@ -422,7 +422,7 @@ export const ApproveParams = Type.Object({
   riskTier: Type.Optional(
     StringEnum(["low", "medium", "high"], {
       description:
-        "Judgment-gate risk tier (default medium: blocking gate + author independence)",
+        "Judgment-gate risk tier (default medium: every gate enforced + author independence)",
     }),
   ),
   workflowClass: Type.Optional(WorkflowClass),
@@ -454,6 +454,16 @@ export const StatusParams = Type.Object({
   id: Type.String({ description: "Issue id to inspect" }),
 });
 export type StatusParamsT = Static<typeof StatusParams>;
+
+export const GatesParams = Type.Object({
+  id: Type.Optional(
+    Type.String({
+      description:
+        "Narrow the report to one issue. Omit to report every issue in the graph.",
+    }),
+  ),
+});
+export type GatesParamsT = Static<typeof GatesParams>;
 
 export const InitParams = Type.Object({
   prefix: Type.Optional(

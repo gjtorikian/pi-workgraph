@@ -37,6 +37,7 @@ import {
   type PlanCritiqueT,
   type PlanT,
 } from "../src/types.ts";
+import { preProofConfig } from "./helpers/config.ts";
 import { installFakeSubagents } from "./helpers/fake-subagents.ts";
 import {
   asExtensionAPI,
@@ -49,16 +50,7 @@ import { makeScratchGraph, type ScratchGraph } from "./helpers/scratch.ts";
 
 const WORKER = "bridge-critic-worker";
 
-const CONFIG: WorkgraphConfig = {
-  leaseTtlMs: 300_000,
-  heartbeatMs: 600_000,
-  pollMs: 600_000,
-  sweepIntervalMs: 600_000,
-  discoveryTimeoutMs: 40,
-  acceptTimeoutMs: 150,
-  compatInSessionExecutor: false,
-  subagentsExecutor: { enabled: true },
-};
+const CONFIG = preProofConfig({ subagentsExecutor: { enabled: true } });
 
 const PLAN: PlanT = {
   summary: "add retry backoff to the client",
@@ -90,7 +82,7 @@ function makeBridgeHarness(
   overrides: Partial<WorkgraphConfig> = {},
 ): BridgeHarness {
   const mock = makeMockPi();
-  const config: WorkgraphConfig = { ...CONFIG, ...overrides };
+  const config = preProofConfig({ ...CONFIG, ...overrides });
   const bridge = registerPiSubagentsExecutor(asExtensionAPI(mock), {
     getConfig: () => config,
     probeVersion: () => "0.34.8",
@@ -686,11 +678,11 @@ describe("plan critique through the bridge, under the coordinator", () => {
     const id = graph.seededIds[0]!;
     approvePlanned(graph, id);
     const mock = makeMockPi();
-    const config: WorkgraphConfig = {
+    const config = preProofConfig({
       ...CONFIG,
       workerIdOverride: WORKER,
       planCritique: "high-risk",
-    };
+    });
     setWorkerIdOverride(WORKER);
     registerWorkgraphTools(asExtensionAPI(mock));
     const coordinator = registerCoordinator(asExtensionAPI(mock), {

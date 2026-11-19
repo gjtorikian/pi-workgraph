@@ -40,6 +40,7 @@ import {
   WORKGRAPH_ATTEMPT_KEY,
   WORKGRAPH_FAILURE_FINGERPRINT_KEY,
 } from "../src/types.ts";
+import { preProofConfig } from "./helpers/config.ts";
 import { installFakeExecutor } from "./helpers/fake-executor.ts";
 import {
   asExtensionAPI,
@@ -52,18 +53,14 @@ import { makeScratchGraph, type ScratchGraph } from "./helpers/scratch.ts";
 const WORKER = "recovery-test-worker";
 const TTL = 300_000;
 
-/** Huge scheduling timers (event-driven only), tiny REAL protocol timeouts. */
-const CONFIG: WorkgraphConfig = {
+/** The shared timers — huge scheduling timers (event-driven only), tiny REAL
+ *  protocol timeouts — with the lease TTL named, because tests do arithmetic
+ *  on it. */
+const CONFIG = preProofConfig({
   leaseTtlMs: TTL,
-  heartbeatMs: 600_000,
-  pollMs: 600_000,
-  sweepIntervalMs: 600_000,
-  discoveryTimeoutMs: 40,
-  acceptTimeoutMs: 150,
-  compatInSessionExecutor: false,
   compatLegacyIssues: true,
   workerIdOverride: WORKER,
-};
+});
 
 const IMPL_PROV = { harness: "fake", model: "impl-model", provider: "prov-impl" };
 const REV_PROV = { harness: "fake", model: "rev-model", provider: "prov-rev" };
@@ -79,7 +76,7 @@ function makeHarness(
   now?: () => number,
 ): Harness {
   const mock = makeMockPi();
-  const config: WorkgraphConfig = { ...CONFIG, ...overrides };
+  const config = preProofConfig({ ...CONFIG, ...overrides });
   setWorkerIdOverride(WORKER);
   const coordinator = registerCoordinator(asExtensionAPI(mock), {
     getConfig: () => config,
@@ -951,7 +948,7 @@ describe("graceful shutdown", () => {
     const id = graph.seededIds[0]!;
     const mock = makeMockPi();
     setWorkerIdOverride(WORKER);
-    const config: WorkgraphConfig = { ...CONFIG, compatInSessionExecutor: true };
+    const config = preProofConfig({ ...CONFIG, compatInSessionExecutor: true });
     // Registration order mirrors index.ts: adapter first.
     registerInSessionExecutor(asExtensionAPI(mock), { getConfig: () => config });
     const coordinator = registerCoordinator(asExtensionAPI(mock), {

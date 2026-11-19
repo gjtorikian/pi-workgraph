@@ -385,7 +385,7 @@ work, or judgment cannot pass.
 
 ## Tools
 
-Fourteen typed tools, all schema-validated and race-safe. Agents are
+Fifteen typed tools, all schema-validated and race-safe. Agents are
 instructed to use these instead of touching the store from bash — bare
 assignee writes are how leases get corrupted.
 
@@ -404,11 +404,13 @@ assignee writes are how leases get corrupted.
 | `workgraph_answer_decision` | Answer the question a run parked for a human; re-approve, and every later run of the issue carries the answer |
 | `workgraph_tiers`           | Set or show per-role model tiers for this repository (a role → model table, or clear)                         |
 | `workgraph_override`        | Explicit human override: force-close or force-release, bypassing guards — always audited                      |
-| `workgraph_status`          | One issue's full control-plane state: phase, plan, lease, attempt, verdict, acceptance criteria               |
+| `workgraph_status`          | One issue's full control-plane state: phase, plan, lease, attempt, verdict, gate modes and results, criteria  |
+| `workgraph_gates`           | Per gate, the issues it blocked and the issues it would have blocked; `id` narrows the report to one issue    |
 
 The in-session executor adds `workgraph_submit_plan`, valid only during a
 planning turn. `/workgraph init [prefix]` and `/workgraph tiers` are the
-slash-command forms of the two operator actions.
+slash-command forms of the two operator actions. What `workgraph_gates`
+reports is described under [Gates](#gates).
 
 ## Configuration
 
@@ -430,12 +432,97 @@ Resolution order per value: CLI flag > environment variable > default.
 | `--workgraph-compat-in-session-executor` | `WORKGRAPH_COMPAT_IN_SESSION_EXECUTOR` | `true`                          | Register the in-session executor (planner + implementer in the chat session)                                                            |
 | `--workgraph-executor-id`                | `WORKGRAPH_EXECUTOR_ID`                | —                               | Pin executor selection to one executorId (errors when it's absent)                                                                      |
 | `--workgraph-compat-legacy-issues`       | `WORKGRAPH_COMPAT_LEGACY_ISSUES`       | `false`                         | Opt-in: auto-dispatch issues without lifecycle metadata (warned once)                                                                   |
-| `--workgraph-policy`                     | `WORKGRAPH_POLICY`                     | low advisory, med/high blocking | Per-risk-tier judgment-gate policy overrides (JSON)                                                                                     |
+| `--workgraph-policy`                     | `WORKGRAPH_POLICY`                     | settings `policy`, else below   | Per-risk-tier policy overrides as JSON: gate modes, author independence, revision bound (see [Gates](#gates))                           |
 | `--workgraph-compaction-reasoning-level` | `WORKGRAPH_COMPACTION_REASONING_LEVEL` | the session's thinking level    | Opt-in: reasoning level for the compaction summary (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`)                          |
 | `--workgraph-subagents-executor`         | `WORKGRAPH_SUBAGENTS_EXECUTOR`         | settings `subagentsExecutor`    | Opt-in: the experimental pi-subagents bridge (`true` or its JSON block)                                                                 |
 | `--workgraph-finalization`               | `WORKGRAPH_FINALIZATION`               | —                               | Optional post-verification task (JSON with `instructions`, `timeoutMs`)                                                                 |
 | `--workgraph-worker-id`                  | `WORKGRAPH_WORKER_ID`                  | `{user}@{host}/{short-session}` | Worker identity used for claims, audit records, and fencing checks                                                                      |
 | `--workgraph-dispatch`                   | —                                      | `true`                          | Kill switch: `false` keeps tools + context injection, no autonomy (the flag name predates the coordinator; it disables the coordinator) |
+
+### Gates
+
+A gate is one named check on work before it closes. The policy gives each
+of seven gates a mode, per risk tier.
+
+| Gate                | Passes when                                                                           |
+| ------------------- | ------------------------------------------------------------------------------------- |
+| `review`            | The reviewer's verdict has no blocking findings                                       |
+| `tree-binding`      | The verdict, the check receipt, and the close all name the same git tree              |
+| `check`             | The issue's check command passed on the accepted tree                                 |
+| `criteria-evidence` | The verdict answers every acceptance criterion, with evidence for each one marked met |
+| `weakened-tests`    | The change deletes no tests and skips none                                            |
+| `unproven-tests`    | Every new test fails without the change                                               |
+| `scope`             | The change stays inside the approved plan's path targets                              |
+
+Only `review` is evaluated in this release. The other six are already part
+of the policy, so a policy written today keeps working as each gate gains
+its check. Until then they record nothing, whatever their mode.
+
+Each gate has one of three modes:
+
+| Mode      | What the gate does                                                         |
+| --------- | -------------------------------------------------------------------------- |
+| `enforce` | Evaluates, records the result, and blocks the close on a failing result    |
+| `observe` | Evaluates and records the result, including that it would have blocked     |
+| `off`     | Does not evaluate and records nothing                                      |
+
+Defaults:
+
+| Risk tier | `check`   | The other six gates |
+| --------- | --------- | ------------------- |
+| low       | `enforce` | `observe`           |
+| medium    | `enforce` | `enforce`           |
+| high      | `enforce` | `enforce`           |
+
+A policy overrides any subset of tiers and gates. Whatever it leaves out
+keeps its default:
+
+```bash
+pi --workgraph-policy='{"medium":{"gates":{"review":"observe"}},"low":{"gates":{"scope":"off"}}}'
+```
+
+The same object can live in Pi settings, under `"workgraph": { "policy":
+{ ... } }` in `.pi/settings.json` (this repository) or
+`~/.pi/agent/settings.json` (every repository). The flag wins over the
+environment variable, which wins over settings; a project file replaces
+the global one whole. Next to `gates`, a tier accepts `maxRevisions`
+(default 3) and `requireAuthorIndependence` (default `{"model": true}` at
+medium and high).
+
+With `review` set to `off`, no reviewer is asked and reviewed work closes
+on the implementer's reported success alone; a reported failure escalates.
+`workgraph_status` shows `review=off` on every issue the mode applies to.
+
+**An invalid policy stops dispatch.** An unknown tier, key, gate, or mode
+is an error that names it, as is JSON that does not parse. Until the
+policy is fixed the coordinator claims nothing and judges nothing, logs
+the message once, and the [tools](#tools) fail with the same message
+(all fifteen except `workgraph_init`). Leases the coordinator already
+holds keep renewing, and a run already in flight proceeds as far as
+judgment and waits there.
+
+**`gateMode` was removed.** It is now the `review` gate's mode:
+`"advisory"` is `"observe"` and `"blocking"` is `"enforce"`. A policy that
+still sets `gateMode` is invalid and stops dispatch with an error naming
+the replacement. Change `{"low":{"gateMode":"blocking"}}` to
+`{"low":{"gates":{"review":"enforce"}}}`.
+
+**Reading the results.** Each evaluation is recorded on the issue as a
+`workgraph-proof gate {json}` comment. `workgraph_gates` reports the whole
+graph, one line per gate:
+
+```text
+review: 1 blocked (bdx-003), 2 would block (bdx-001, bdx-004)
+check: no records
+```
+
+An issue counts as blocked if the gate ever blocked it, even when a later
+revision passed. `workgraph_status` prints the modes that apply to one
+issue and each gate's latest result on it.
+
+**The verdict record has no mode.** If a reviewer's verdict cannot be
+written to the issue, the run escalates with the write failure as the
+reason. It does not close under `observe` either.
 
 ## How it works
 
@@ -665,6 +752,12 @@ Audit writes never block lease operations: the protocol stays correct
 without the trail, and a broken audit surface must not take claiming down
 with it.
 
+Two more trails ride the same comments under their own prefixes.
+`workgraph-verdict` holds each reviewer verdict, and is the one write
+judgment waits on: a verdict that cannot be recorded escalates the run.
+`workgraph-proof` holds each gate result (see [Gates](#gates)) and, like
+the audit trail, never blocks.
+
 ## Experimental: Control-Plane Protocol v1
 
 > **Experimental — may change without semver ceremony until 1.0.** Unlike
@@ -722,9 +815,10 @@ implementing --oneshot success--> verifying --> accepted --> closed
 implementing --oneshot failure/blocked--> ready (promoted to reviewed)
 implementing --implementation completed--> judging
 implementing --failed/blocked--> revising | escalated
-judging --hard-gate reject--> revising
-judging --advisory verdict--> verifying
-judging --hard-gate accept--> verifying
+judging --review gate blocks (enforce, blocking findings)--> revising
+judging --review gate passes (no blocking findings, or observe)--> verifying
+judging --review gate off (no review requested)--> verifying
+judging --verdict record could not be written--> escalated
 revising --new execution accepted--> revising
 revising --implementation completed--> judging
 verifying --pass--> accepted --close--> closed

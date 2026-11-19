@@ -53,6 +53,7 @@ import {
   WORKGRAPH_WORKFLOW_CLASS_KEY,
   type VerdictT,
 } from "../src/types.ts";
+import { preProofConfig } from "./helpers/config.ts";
 import { installFakeExecutor } from "./helpers/fake-executor.ts";
 import { registerWorkgraphTools } from "../src/tools.ts";
 import { registerPiSubagentsExecutor } from "../src/adapters/pi-subagents.ts";
@@ -68,18 +69,10 @@ import { makeScratchGraph, type ScratchGraph } from "./helpers/scratch.ts";
 
 const WORKER = "judgment-test-worker";
 
-/** Huge scheduling timers (event-driven ticks only), tiny REAL protocol
- *  timeouts (bounded discovery/accept waits resolve fast). */
-const CONFIG: WorkgraphConfig = {
-  leaseTtlMs: 300_000,
-  heartbeatMs: 600_000,
-  pollMs: 600_000,
-  sweepIntervalMs: 600_000,
-  discoveryTimeoutMs: 40,
-  acceptTimeoutMs: 150,
-  compatInSessionExecutor: false,
-  workerIdOverride: WORKER,
-};
+/** The shared timers — huge scheduling timers (event-driven ticks only),
+ *  tiny REAL protocol timeouts (bounded discovery/accept waits resolve
+ *  fast). */
+const CONFIG = preProofConfig({ workerIdOverride: WORKER });
 
 /** Distinct author/reviewer provenance — independent under every policy. */
 const IMPL_PROV = {
@@ -111,7 +104,9 @@ interface Harness {
 
 function makeHarness(overrides: Partial<WorkgraphConfig> = {}): Harness {
   const mock = makeMockPi();
-  const config: WorkgraphConfig = { ...CONFIG, ...overrides };
+  // A `policy` override merges over the pre-proof pin per tier and per gate:
+  // `{ high: { maxRevisions: 1 } }` changes one knob and keeps the pin.
+  const config = preProofConfig({ ...CONFIG, ...overrides });
   setWorkerIdOverride(WORKER);
   const coordinator = registerCoordinator(asExtensionAPI(mock), {
     getConfig: () => config,
@@ -331,18 +326,18 @@ describe("lifecycle transitions", () => {
 describe("policy and independence", () => {
   it("resolvePolicy: tier defaults, per-knob merge, conservative fallback", () => {
     expect(resolvePolicy("low")).toEqual(DEFAULT_POLICY.low);
-    expect(resolvePolicy("low").gateMode).toBe("advisory");
-    expect(resolvePolicy("medium").gateMode).toBe("blocking");
+    expect(resolvePolicy("low").gates.review).toBe("observe");
+    expect(resolvePolicy("medium").gates.review).toBe("enforce");
     expect(resolvePolicy("high").requireAuthorIndependence).toEqual({
       model: true,
     });
-    // Unknown/missing tier falls back to medium (blocking — conservative).
-    expect(resolvePolicy(undefined).gateMode).toBe("blocking");
-    expect(resolvePolicy("bogus").gateMode).toBe("blocking");
+    // Unknown/missing tier falls back to medium (enforce — conservative).
+    expect(resolvePolicy(undefined).gates.review).toBe("enforce");
+    expect(resolvePolicy("bogus").gates.review).toBe("enforce");
     // A partial override changes ONE knob and drops none.
     const merged = resolvePolicy("high", { high: { maxRevisions: 1 } });
     expect(merged.maxRevisions).toBe(1);
-    expect(merged.gateMode).toBe("blocking");
+    expect(merged.gates.review).toBe("enforce");
     expect(merged.requireAuthorIndependence).toEqual({
       model: true,
     });

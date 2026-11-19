@@ -61,7 +61,7 @@ import {
   update,
   type MetadataValue,
 } from "./store.ts";
-import type { WorkgraphConfig } from "./config.ts";
+import { DEFAULT_CONFIG, type WorkgraphConfig } from "./config.ts";
 import {
   critiqueSummary,
   MAX_GAPS,
@@ -124,6 +124,7 @@ import {
   renderPlan,
 } from "./plan.ts";
 import { checkIndependence, resolvePolicy, type RiskTier } from "./policy.ts";
+import { decideGate, recordGate, type GateResult } from "./proof.ts";
 import {
   CH,
   newEnvelope,
@@ -186,6 +187,7 @@ import {
   recordVerdict,
   VerdictError,
   verdictSummary,
+  VerdictWriteError,
 } from "./verdict.ts";
 
 /**
@@ -196,7 +198,12 @@ import {
 export const COORDINATOR_FLAG = DISPATCH_FLAG;
 
 export interface CoordinatorDeps {
-  /** Effective config; resolved lazily (flags are not readable at load). */
+  /**
+   * Effective config; resolved lazily (flags are not readable at load). May
+   * THROW: an invalid policy raises `PolicyConfigError`, which stops
+   * dispatch and judgment but not the work already under a lease (see
+   * `currentConfig` / `heldConfig` in {@link registerCoordinator}).
+   */
   getConfig: () => WorkgraphConfig;
   /** Clock injection for tests (default Date.now). */
   now?: () => number;
@@ -485,6 +492,44 @@ export function registerCoordinator(
     state.lastSkipLog = null;
   }
 
+  /**
+   * CONFIG UNDER AN INVALID POLICY. `deps.getConfig()` throws when the policy
+   * does not validate, and it resolves afresh on every call, so an edit to a
+   * settings file can break it in the middle of a session. Two readers:
+   *
+   *  - `currentConfig()` THROWS. For the paths that start work or judge it —
+   *    the tick, startup reconciliation, the judgment loop — whose wrappers
+   *    log the message once and do nothing. This is how an invalid policy
+   *    stops dispatch and stops judgment.
+   *  - `heldConfig()` never throws. For the paths that protect or finish
+   *    work ALREADY under a lease — the heartbeat, teardown, completion
+   *    handling, an in-flight revision — which read timers and routing,
+   *    never the policy. It logs the message and keeps the last config that
+   *    resolved, because stopping these over a typo would let a live lease
+   *    lapse or strand an issue between two transitions.
+   *
+   * `DEFAULT_CONFIG` stands in when nothing has resolved yet. Only the poll
+   * timer's start can see it: no run is held before a tick or a
+   * reconciliation resolved the config, and both go through `currentConfig`.
+   */
+  let lastConfig: WorkgraphConfig | undefined;
+
+  function currentConfig(): WorkgraphConfig {
+    const config = deps.getConfig();
+    lastConfig = config;
+    return config;
+  }
+
+  function heldConfig(): WorkgraphConfig {
+    try {
+      return currentConfig();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      logSkipOnce(msg);
+      return lastConfig ?? DEFAULT_CONFIG;
+    }
+  }
+
   function onInvalid(channel: string, error: ProtocolError): void {
     // Invalid payload → log once with channel + reason; no state change.
     logSkipOnce(`invalid message on ${channel}: ${error.detail}`);
@@ -671,7 +716,7 @@ export function registerCoordinator(
    * means no claim, never a silent fallback to someone else.
    */
   function pinFor(role: string): { executorId?: string } {
-    const config = deps.getConfig();
+    const config = heldConfig();
     const pinned = config.executorByRole?.[role] ?? config.executorId;
     return pinned !== undefined ? { executorId: pinned } : {};
   }
@@ -833,7 +878,7 @@ export function registerCoordinator(
       actor: run.actor.bdActor,
       summary: `one-shot implementation completed by ${run.executorId}`,
     });
-    if (deps.getConfig().finalization) {
+    if (heldConfig().finalization) {
       state.active = null;
       state.judged.push(run);
       state.inboxes.set(run.workflowRunId, {
@@ -1189,7 +1234,7 @@ export function registerCoordinator(
 
     // THE HUMAN GATE (default): park the plan for review and release the
     // lease. Only `planApproval: "auto"` lets a plan flow straight on.
-    if ((deps.getConfig().planApproval ?? "required") !== "auto") {
+    if ((heldConfig().planApproval ?? "required") !== "auto") {
       if (wantsPlanCritique(run)) {
         // Decide here, act in onCompleted's tail: the critic's request must
         // not be sent from inside the completion latch.
@@ -1251,7 +1296,7 @@ export function registerCoordinator(
    */
   function wantsPlanCritique(run: CoordinatorRun): boolean {
     return (
-      deps.getConfig().planCritique === "high-risk" &&
+      heldConfig().planCritique === "high-risk" &&
       effectiveRiskTier(run.issue) === "high"
     );
   }
@@ -1345,7 +1390,7 @@ export function registerCoordinator(
    * lease it already holds.
    */
   async function dispatchImplementation(run: CoordinatorRun): Promise<void> {
-    const config = deps.getConfig();
+    const config = heldConfig();
     const offers = await discoverExecutors(pi.events, {
       timeoutMs: config.discoveryTimeoutMs,
       now: nowFn,
@@ -1558,7 +1603,7 @@ export function registerCoordinator(
     pending: NonNullable<CoordinatorRun["pendingPlan"]>,
     box: JudgmentInbox,
   ): Promise<CritiqueOutcome> {
-    const config = deps.getConfig();
+    const config = heldConfig();
     const offers = await discoverExecutors(pi.events, {
       timeoutMs: config.discoveryTimeoutMs,
       now: nowFn,
@@ -1968,7 +2013,7 @@ export function registerCoordinator(
       (run.supportsCancellation &&
         (await cancelAndAwaitAck(
           run,
-          deps.getConfig().acceptTimeoutMs,
+          heldConfig().acceptTimeoutMs,
           "waiting for a human decision",
         )));
     // Cancellation can overlap a human halt or a reclaimed lease.
@@ -2141,7 +2186,7 @@ export function registerCoordinator(
     attempt: number,
     acceptanceCriteria: string | undefined,
   ): Promise<RunCompletedT | "parked" | "aborted"> {
-    const config = deps.getConfig();
+    const config = heldConfig();
     if (box.closed) return "aborted";
 
     const offers = await discoverExecutors(pi.events, {
@@ -2342,7 +2387,7 @@ export function registerCoordinator(
     run: CoordinatorRun,
     author: RunCompletedT,
   ): Promise<boolean> {
-    const config = deps.getConfig();
+    const config = heldConfig();
     const task = config.finalization;
     if (!task) return true;
     const box = state.inboxes.get(run.workflowRunId);
@@ -2550,6 +2595,93 @@ export function registerCoordinator(
     return true;
   }
 
+  /**
+   * The judgment gate's pass tail: judging → verifying → (finalization) →
+   * accepted → closed, releasing the run. Reached two ways, which is why it
+   * is its own function: the review gate passed (a clean verdict, advisory
+   * findings only, or blocking findings under `observe`), or the review gate
+   * is `off` and no review ran.
+   *
+   * `summary` lands in `workgraph_last_verdict` and the close audit: the
+   * verdict summary, or `review off`. `executionId` is the execution the
+   * close is attributed to: the review's, or the implementation's when
+   * there was no review.
+   */
+  async function acceptAndClose(
+    run: CoordinatorRun,
+    author: RunCompletedT,
+    summary: string,
+    executionId: string,
+  ): Promise<void> {
+    try {
+      await transition(run.cwd, run.lease.issueId, "judging", "verifying", {
+        fields: { [WORKGRAPH_LAST_VERDICT_KEY]: summary },
+        actor: run.actor.bdActor,
+      });
+      run.phase = "verifying";
+      // POST-COMMIT: emitted between the two writes — if the SECOND
+      // transition fails, the verifying activity still described a
+      // committed write (activity count == committed transitions).
+      emitActivity({
+        kind: "verdict",
+        issueId: run.lease.issueId,
+        phase: "verifying",
+        workflowRunId: run.workflowRunId,
+        actor: run.actor.bdActor,
+        summary,
+      });
+      if (!(await finalize(run, author))) return;
+      await transition(run.cwd, run.lease.issueId, "verifying", "accepted", {
+        actor: run.actor.bdActor,
+      });
+      emitActivity({
+        kind: "transition",
+        issueId: run.lease.issueId,
+        phase: "accepted",
+        workflowRunId: run.workflowRunId,
+        actor: run.actor.bdActor,
+        summary: "verification passed",
+      });
+    } catch (e) {
+      if (e instanceof LifecycleError) {
+        logSkipOnce(e.message);
+        await abandonJudgedRun(run);
+        return;
+      }
+      throw e;
+    }
+    // The policy-approved close: the ONLY happy-path exit to closed.
+    await close(
+      run.cwd,
+      run.lease.issueId,
+      "accepted by the judgment gate",
+      run.actor.bdActor,
+    );
+    untrackLease(run.cwd, run.lease.issueId);
+    // POST-COMMIT: the store close resolved above.
+    emitActivity({
+      kind: "close",
+      issueId: run.lease.issueId,
+      phase: "accepted",
+      workflowRunId: run.workflowRunId,
+      actor: run.actor.bdActor,
+      summary: `closed: ${summary}`,
+    });
+    await recordLeaseEvent(
+      run.cwd,
+      "judgment-closed",
+      run.lease.issueId,
+      {
+        workflowRunId: run.workflowRunId,
+        executionId,
+        verdictSummary: summary,
+        actor: identitySnapshot(run.actor),
+      },
+      run.actor.bdActor,
+    );
+    dropJudgedRun(run);
+  }
+
   /** Error-isolated wrapper: a judgment failure never unwinds the bus. */
   async function judge(
     run: CoordinatorRun,
@@ -2589,9 +2721,34 @@ export function registerCoordinator(
 
     for (;;) {
       if (box.closed) return; // teardown
-      const config = deps.getConfig();
+      // Throws on an invalid policy: judge() logs the message and the run
+      // stays parked in judging under its lease. Work is never judged on a
+      // policy that did not validate.
+      const config = currentConfig();
       const issue = await show(run.cwd, run.lease.issueId);
       const policy = resolvePolicy(riskTierOf(issue), config.policy);
+      const mode = policy.gates.review;
+      const attempt = attemptOf(issue) ?? 1;
+
+      // ---- review gate off: not evaluated, so no reviewer is selected, no
+      // verdict exists, and no gate result is recorded. The work is accepted
+      // on the implementation alone — which also means an off tier never
+      // parks for want of a reviewer-capable executor. ----
+      if (mode === "off") {
+        if (author.outcome !== "success") {
+          // Everywhere else "any outcome is judged": the reviewer decides
+          // what a reported failure means. With the gate off nobody does,
+          // so only a reported success is accepted (the one-shot rule).
+          await escalateRun(
+            run,
+            "judging",
+            `${completionFailure("implementer", author)}; the review gate is off, so nothing judges a reported ${author.outcome}`,
+          );
+          return;
+        }
+        await acceptAndClose(run, author, "review off", author.executionId);
+        return;
+      }
 
       // ---- select an independent review executor ----
       const offers = await discoverExecutors(pi.events, {
@@ -2633,7 +2790,6 @@ export function registerCoordinator(
 
       // ---- request the review ----
       if (box.closed) return;
-      const attempt = attemptOf(issue) ?? 1;
       const reviewRequest: RunRequestT & { artifacts: string[] } = {
         ...newEnvelope(nowFn),
         executorId: reviewer.executorId,
@@ -2798,24 +2954,57 @@ export function registerCoordinator(
       }
 
       // ---- persist the verdict (ALWAYS — advisory findings included) ----
-      await recordVerdict(
+      // The verdict is the record the close rests on. If it cannot be
+      // written the run escalates, under observe exactly as under enforce:
+      // durability is a rule with no mode.
+      try {
+        await recordVerdict(
+          run.cwd,
+          run.lease.issueId,
+          verdict,
+          {
+            workflowRunId: run.workflowRunId,
+            executionId: completion.executionId,
+            executorId: reviewer.executorId,
+            attempt,
+            reviewerProvenance: completion.provenance,
+          },
+          run.actor.bdActor,
+        );
+      } catch (e) {
+        if (!(e instanceof VerdictWriteError)) throw e;
+        await escalateRun(
+          run,
+          "judging",
+          `verdict record could not be written: ${e.detail}`,
+        );
+        return;
+      }
+      const summary = verdictSummary(verdict);
+
+      // ---- apply the review gate ----
+      // Blocking findings are a violation; the gate's mode decides whether
+      // that blocks (enforce) or is only recorded (observe). One gate record
+      // per iteration, so a revision loop leaves a violation, then a pass.
+      const blocking = blockingFindings(verdict);
+      const gateResult: GateResult =
+        blocking.length > 0 ? "violation" : "pass";
+      const decision = decideGate("review", mode, gateResult);
+      await recordGate(
         run.cwd,
         run.lease.issueId,
-        verdict,
         {
+          gate: "review",
+          mode,
+          result: gateResult,
+          ...decision,
+          ...(gateResult === "violation" ? { reason: summary } : {}),
           workflowRunId: run.workflowRunId,
-          executionId: completion.executionId,
-          executorId: reviewer.executorId,
           attempt,
-          reviewerProvenance: completion.provenance,
         },
         run.actor.bdActor,
       );
-      const summary = verdictSummary(verdict);
-
-      // ---- apply the gate ----
-      const blocking = blockingFindings(verdict);
-      if (blocking.length > 0 && policy.gateMode === "blocking") {
+      if (decision.blocked) {
         const digest = artifactDigest(author.artifacts);
         const fingerprint = failureFingerprint(blocking, digest);
         if (failureFingerprintOf(issue) === fingerprint) {
@@ -2896,74 +3085,8 @@ export function registerCoordinator(
         continue; // re-review the revised implementation
       }
 
-      // ---- gate passed (clean, advisory findings, or advisory mode) ----
-      try {
-        await transition(run.cwd, run.lease.issueId, "judging", "verifying", {
-          fields: { [WORKGRAPH_LAST_VERDICT_KEY]: summary },
-          actor: run.actor.bdActor,
-        });
-        run.phase = "verifying";
-        // POST-COMMIT: emitted between the two writes — if the SECOND
-        // transition fails, the verifying activity still described a
-        // committed write (activity count == committed transitions).
-        emitActivity({
-          kind: "verdict",
-          issueId: run.lease.issueId,
-          phase: "verifying",
-          workflowRunId: run.workflowRunId,
-          actor: run.actor.bdActor,
-          summary,
-        });
-        if (!(await finalize(run, author))) return;
-        await transition(run.cwd, run.lease.issueId, "verifying", "accepted", {
-          actor: run.actor.bdActor,
-        });
-        emitActivity({
-          kind: "transition",
-          issueId: run.lease.issueId,
-          phase: "accepted",
-          workflowRunId: run.workflowRunId,
-          actor: run.actor.bdActor,
-          summary: "verification passed",
-        });
-      } catch (e) {
-        if (e instanceof LifecycleError) {
-          logSkipOnce(e.message);
-          await abandonJudgedRun(run);
-          return;
-        }
-        throw e;
-      }
-      // The policy-approved close: the ONLY happy-path exit to closed.
-      await close(
-        run.cwd,
-        run.lease.issueId,
-        "accepted by the judgment gate",
-        run.actor.bdActor,
-      );
-      untrackLease(run.cwd, run.lease.issueId);
-      // POST-COMMIT: the store close resolved above.
-      emitActivity({
-        kind: "close",
-        issueId: run.lease.issueId,
-        phase: "accepted",
-        workflowRunId: run.workflowRunId,
-        actor: run.actor.bdActor,
-        summary: `closed: ${summary}`,
-      });
-      await recordLeaseEvent(
-        run.cwd,
-        "judgment-closed",
-        run.lease.issueId,
-        {
-          workflowRunId: run.workflowRunId,
-          executionId: completion.executionId,
-          verdictSummary: summary,
-          actor: identitySnapshot(run.actor),
-        },
-        run.actor.bdActor,
-      );
-      dropJudgedRun(run);
+      // ---- gate passed (clean, advisory findings, or observe mode) ----
+      await acceptAndClose(run, author, summary, completion.executionId);
       return;
     }
   }
@@ -2991,7 +3114,9 @@ export function registerCoordinator(
   }
 
   async function tickInner(ctx: ExtensionContext): Promise<void> {
-    const config = deps.getConfig();
+    // Throws on an invalid policy, before anything is read or claimed: the
+    // tick wrapper logs the message once and dispatch stays stopped.
+    const config = currentConfig();
 
     // A run in flight (requested/accepted): capacity is 1 — supervise only.
     // Judged runs don't consume capacity; their leases are heartbeated until
@@ -3382,7 +3507,8 @@ export function registerCoordinator(
       stopHeartbeat();
       return;
     }
-    const config = deps.getConfig();
+    // Never throws: a lease must keep renewing under an invalid policy.
+    const config = heldConfig();
     for (const run of runs) {
       const held = getHeldLease(run.cwd, run.lease.issueId);
       if (!held) continue; // released/lost between beats
@@ -3464,7 +3590,8 @@ export function registerCoordinator(
     for (const workflowRunId of [...state.inboxes.keys()]) {
       closeInbox(workflowRunId);
     }
-    const config = deps.getConfig();
+    // Never throws: every held lease below must still be released.
+    const config = heldConfig();
     const active = state.active;
     const runs = heldRuns();
     state.active = null;
@@ -3630,7 +3757,7 @@ export function registerCoordinator(
       } catch {
         return report; // no workspace here — nothing persisted to recover
       }
-      const config = deps.getConfig();
+      const config = currentConfig();
       const nowMs = nowFn();
       const issues = await listRunHeldInProgress(
         ctx.cwd,
@@ -3949,7 +4076,9 @@ export function registerCoordinator(
   pi.on("session_start", (_event, ctx) => {
     if (!enabled()) return;
     if (state.timer) clearInterval(state.timer); // idempotent restart
-    const config = deps.getConfig();
+    // Never throws: under an invalid policy the timer still starts, so each
+    // tick reports the bad key and dispatch resumes once it is fixed.
+    const config = heldConfig();
     state.timer = setInterval(() => void tick(ctx), config.pollMs);
     // Reconciliation BEFORE the first coordination pass: the `reconciling`
     // latch is set synchronously inside reconcile(), so a settle-tick (or

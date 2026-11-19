@@ -9,12 +9,16 @@
  * verdict causes zero state change (the coordinator discards the attempt,
  * audits it, and re-requests within a bounded retry).
  *
- * PERSISTENCE follows the audit-trail pattern (`src/audit.ts`): one
- * machine-readable comment per verdict under a stable prefix, written
- * fire-and-forget (a broken comment surface must not take judgment down),
- * read back via `listComments`. Metadata is NOT an event store (decision
- * log): only the compact summary lands in `workgraph_last_verdict`, riding
- * the same `setMetadata` call as the phase transition.
+ * PERSISTENCE borrows the audit trail's shape (`src/audit.ts`): one
+ * machine-readable comment per verdict under a stable prefix, read back via
+ * `listComments`. It does NOT borrow the audit trail's fire-and-forget
+ * write. The verdict is the record a close rests on, so `recordVerdict`
+ * rejects with {@link VerdictWriteError} when the write fails and the
+ * judgment gate escalates instead of closing: an issue never closes on a
+ * verdict nobody can read back. No gate mode relaxes this. Metadata is NOT
+ * an event store (decision log): only the compact summary lands in
+ * `workgraph_last_verdict`, riding the same `setMetadata` call as the phase
+ * transition.
  *
  * SIZE CAPS (failure-modes table): findings are capped and evidence strings
  * truncated with a marker before serialization, so a reviewer returning
@@ -48,6 +52,20 @@ export class VerdictError extends Error {
   constructor(detail: string) {
     super(`Invalid verdict payload: ${detail}`);
     this.name = "VerdictError";
+    this.detail = detail;
+  }
+}
+
+/** Thrown when a verdict could not be written to the comment trail. */
+export class VerdictWriteError extends Error {
+  readonly issueId: string;
+  /** The underlying write failure. */
+  readonly detail: string;
+
+  constructor(issueId: string, detail: string) {
+    super(`Verdict record for ${issueId} could not be written: ${detail}`);
+    this.name = "VerdictWriteError";
+    this.issueId = issueId;
     this.detail = detail;
   }
 }
@@ -161,8 +179,9 @@ export function verdictSummary(verdict: VerdictT): string {
  * Persist one verdict as a machine-readable comment:
  * `workgraph-verdict verdict {json}` — findings capped/truncated, extra
  * context (`details`: workflowRunId, executionId, reviewer provenance,
- * attempt) folded in. Resolves (never rejects) even when the write fails,
- * mirroring `recordLeaseEvent`.
+ * attempt) folded in. REJECTS with {@link VerdictWriteError} when the write
+ * fails, unlike `recordLeaseEvent`: the caller must not close an issue whose
+ * verdict was not recorded (see the module comment).
  */
 export async function recordVerdict(
   cwd: string,
@@ -184,9 +203,10 @@ export async function recordVerdict(
     await addComment(cwd, issueId, text, actor);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    // Loud, but non-blocking — judgment proceeds without the trail.
+    // Loud AND blocking — judgment must not proceed without the record.
     console.error(
       `[pi-workgraph] VERDICT WRITE FAILED (${issueId}): ${msg}`,
     );
+    throw new VerdictWriteError(issueId, msg);
   }
 }

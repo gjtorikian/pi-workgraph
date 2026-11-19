@@ -258,8 +258,8 @@ export function renderPlanForReview(plan: PlanT, critique?: PlanCritiqueT): stri
  * `workgraph-plan plan {json}` — steps capped/truncated, extra context
  * (`details`: workflowRunId, executionId, planner provenance, attempt)
  * folded in. Resolves (never rejects) even when the write fails, mirroring
- * `recordVerdict` and `recordLeaseEvent`: a broken comment surface must not
- * take the lifecycle down.
+ * `recordLeaseEvent`: a broken comment surface must not take the lifecycle
+ * down.
  */
 export async function recordPlan(
   cwd: string,

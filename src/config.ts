@@ -3,15 +3,27 @@
  * override. Resolution order per value: CLI flag, then environment variable,
  * then default. The timers are consumed by the Phase 2 lease layer; only the
  * identity override is load-bearing in Phase 1.
+ *
+ * A value that does not parse is ignored and logged, with two exceptions
+ * that THROW instead: `finalization` and `policy`. Both decide what may
+ * close, so a typo must not quietly become "the default". `resolveConfig`
+ * runs on every `getConfig()` call, which is where an invalid policy stops
+ * dispatch; readers that never consult the policy use
+ * {@link resolveConfigWithoutPolicy} and are not stopped by it.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { PolicyOverrides } from "./policy.ts";
+import {
+  PolicyConfigError,
+  validatePolicyOverrides,
+  type PolicyOverrides,
+} from "./policy.ts";
 import type { WorkflowClassT } from "./types.ts";
 import {
   parseExecutorPins,
   settingsExecutors,
   settingsPlanApproval,
   settingsPlanCritique,
+  settingsPolicy,
   settingsStore,
   settingsSubagentsExecutor,
 } from "./settings.ts";
@@ -106,11 +118,13 @@ export interface WorkgraphConfig {
   /** Optional worker identity override; wins over the derived id. */
   workerIdOverride?: string;
   /**
-   * Per-risk-tier judgment-gate policy overrides, merged over
-   * `DEFAULT_POLICY` by `resolvePolicy` (defaults: low = advisory,
-   * medium/high = blocking with author independence, maxRevisions 3).
-   * Optional so existing config literals keep compiling; a partial object
-   * never drops a knob.
+   * Per-risk-tier policy overrides, merged over `DEFAULT_POLICY` by
+   * `resolvePolicy` (defaults: the `check` gate enforces at every tier, the
+   * other six gates enforce at medium/high and observe at low; medium/high
+   * require author independence; maxRevisions 3). From the flag/env, else
+   * Pi settings; validated by `validatePolicyOverrides`, which throws on an
+   * unknown tier, knob, gate or mode. Optional so config literals keep
+   * compiling; a partial object never drops a knob or a gate.
    */
   policy?: PolicyOverrides;
   /**
@@ -164,6 +178,21 @@ export const DEFAULT_POLL_MS = 30_000;
 export const DEFAULT_DISCOVERY_TIMEOUT_MS = 2_000;
 export const DEFAULT_ACCEPT_TIMEOUT_MS = 10_000;
 
+/**
+ * Every required value at its default, with nothing optional set. What the
+ * coordinator runs its timers on when no configuration has resolved yet
+ * (an invalid policy at session start).
+ */
+export const DEFAULT_CONFIG = {
+  leaseTtlMs: DEFAULT_LEASE_TTL_MS,
+  heartbeatMs: DEFAULT_HEARTBEAT_MS,
+  pollMs: DEFAULT_POLL_MS,
+  sweepIntervalMs: DEFAULT_POLL_MS,
+  discoveryTimeoutMs: DEFAULT_DISCOVERY_TIMEOUT_MS,
+  acceptTimeoutMs: DEFAULT_ACCEPT_TIMEOUT_MS,
+  compatInSessionExecutor: true,
+} satisfies WorkgraphConfig;
+
 const FLAGS = [
   {
     name: "workgraph-lease-ttl-ms",
@@ -207,7 +236,7 @@ const FLAGS = [
   {
     name: "workgraph-policy",
     description:
-      'Per-risk-tier judgment-gate policy overrides as a JSON object, e.g. {"low":{"maxRevisions":1}} (env WORKGRAPH_POLICY; defaults: low advisory, medium/high blocking)',
+      'Per-risk-tier policy overrides as a JSON object, e.g. {"low":{"gates":{"review":"enforce"}}}; each gate is off, observe or enforce (headless override of Pi settings; env WORKGRAPH_POLICY; defaults: check enforces everywhere, the other gates enforce at medium/high and observe at low; an invalid policy stops dispatch)',
   },
   {
     name: "workgraph-compat-legacy-issues",
@@ -292,30 +321,37 @@ function timerValue(
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+/**
+ * The policy overrides: flag, then environment, then the `workgraph.policy`
+ * settings key. THROWS {@link PolicyConfigError} on anything that is not a
+ * valid policy, unparseable JSON included, naming the bad key and where the
+ * value came from. Never falls back to the defaults (see the module comment).
+ */
 function policyValue(
   pi: ExtensionAPI,
   flag: string,
   envVar: string,
 ): PolicyOverrides | undefined {
-  const raw = stringValue(pi, flag, envVar);
+  const fromFlag = stringValue(pi, flag, envVar);
+  const raw = fromFlag ?? settingsPolicy();
   if (raw === undefined) return undefined;
+  const source =
+    fromFlag !== undefined
+      ? `${flag}/${envVar}`
+      : 'the "workgraph.policy" setting';
+  let parsed: unknown;
   try {
-    const parsed: unknown = JSON.parse(raw);
-    if (
-      parsed === null ||
-      typeof parsed !== "object" ||
-      Array.isArray(parsed)
-    ) {
-      return undefined;
-    }
-    // Structural trust boundary ends here: resolvePolicy merges per-knob
-    // over the defaults, so a partially-shaped override degrades safely.
-    return parsed as PolicyOverrides;
+    parsed = JSON.parse(raw);
   } catch {
-    console.error(
-      `[pi-workgraph] ignoring unparseable ${flag}/${envVar} value (not JSON)`,
+    throw new PolicyConfigError(
+      `policy is not valid JSON (set by ${source})`,
     );
-    return undefined;
+  }
+  try {
+    return validatePolicyOverrides(parsed);
+  } catch (e) {
+    if (!(e instanceof PolicyConfigError)) throw e;
+    throw new PolicyConfigError(`${e.message} (set by ${source})`);
   }
 }
 
@@ -504,8 +540,31 @@ function boolValue(
   return fallback;
 }
 
-/** Resolve the effective configuration (flag > env > default). */
+/**
+ * Resolve the effective configuration (flag > env > settings > default).
+ * THROWS `PolicyConfigError` when the policy is invalid: this is the reader
+ * for everything that starts work under the policy or reports it (the
+ * coordinator, the tools).
+ */
 export function resolveConfig(pi: ExtensionAPI): WorkgraphConfig {
+  return {
+    ...resolveConfigWithoutPolicy(pi),
+    policy: policyValue(pi, "workgraph-policy", "WORKGRAPH_POLICY"),
+  };
+}
+
+/**
+ * The effective configuration minus `policy`, which is neither read nor
+ * validated. For readers that never consult the policy and must keep working
+ * under an invalid one: executor adapters, the expiry sweep, the compaction
+ * takeover, session wiring. The return type leaves `policy` out, so reading
+ * `.policy` off this result is a type error rather than a silent "defaults".
+ * (It is still assignable to `WorkgraphConfig`, where `policy` is optional:
+ * never wire it into something that judges work.)
+ */
+export function resolveConfigWithoutPolicy(
+  pi: ExtensionAPI,
+): Omit<WorkgraphConfig, "policy"> {
   const pollMs = timerValue(
     pi,
     "workgraph-poll-ms",
@@ -563,7 +622,6 @@ export function resolveConfig(pi: ExtensionAPI): WorkgraphConfig {
       "workgraph-worker-id",
       "WORKGRAPH_WORKER_ID",
     ),
-    policy: policyValue(pi, "workgraph-policy", "WORKGRAPH_POLICY"),
     compatLegacyIssues: boolValue(
       pi,
       "workgraph-compat-legacy-issues",

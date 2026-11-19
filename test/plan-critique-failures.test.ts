@@ -28,6 +28,7 @@ import { listComments } from "../src/store.ts";
 import { setResolvedTiers } from "../src/tiers.ts";
 import { registerWorkgraphTools } from "../src/tools.ts";
 import { WORKGRAPH_PLAN_CRITIQUE_KEY, type PlanCritiqueT, type PlanT } from "../src/types.ts";
+import { preProofConfig } from "./helpers/config.ts";
 import { installFakeExecutor, type FakeExecutorHandle, type RoleScript } from "./helpers/fake-executor.ts";
 import {
   asExtensionAPI,
@@ -40,17 +41,7 @@ import { makeScratchGraph, type ScratchGraph } from "./helpers/scratch.ts";
 
 const WORKER = "plan-critique-failures-worker";
 
-const CONFIG: WorkgraphConfig = {
-  leaseTtlMs: 300_000,
-  heartbeatMs: 600_000,
-  pollMs: 600_000,
-  sweepIntervalMs: 600_000,
-  discoveryTimeoutMs: 40,
-  acceptTimeoutMs: 150,
-  compatInSessionExecutor: false,
-  workerIdOverride: WORKER,
-  planCritique: "high-risk",
-};
+const CONFIG = preProofConfig({ workerIdOverride: WORKER, planCritique: "high-risk" });
 
 const PLAN_PROV = { harness: "fake", model: "plan-model", provider: "prov-plan" };
 const CRITIC_PROV = { harness: "fake", model: "critic-model", provider: "prov-critic" };
@@ -85,7 +76,7 @@ interface Harness {
 
 function makeHarness(overrides: Partial<WorkgraphConfig> = {}, planCritiqueWaitMs?: number): Harness {
   const mock = makeMockPi();
-  const config: WorkgraphConfig = { ...CONFIG, ...overrides };
+  const config = preProofConfig({ ...CONFIG, ...overrides });
   setWorkerIdOverride(WORKER);
   registerWorkgraphTools(asExtensionAPI(mock));
   const coordinator = registerCoordinator(asExtensionAPI(mock), {

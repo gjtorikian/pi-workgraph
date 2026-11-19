@@ -17,7 +17,6 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getOpLog, resetOpLog } from "../src/store.ts";
-import type { WorkgraphConfig } from "../src/config.ts";
 import {
   DISPATCH_MESSAGE_TYPE,
   registerDispatch,
@@ -34,21 +33,16 @@ import {
   type MockEventContext,
   type MockPi,
 } from "./helpers/mock-pi.ts";
+import { preProofConfig } from "./helpers/config.ts";
 import { makeScratchGraph, type ScratchGraph } from "./helpers/scratch.ts";
 
 const WORKER = "drain-worker";
 const POOL_SIZE = 5;
 
-const TEST_CONFIG: WorkgraphConfig = {
-  leaseTtlMs: 300_000,
-  heartbeatMs: 600_000, // beats never fire — the drain is tick-driven
-  pollMs: 600_000, // ticks come from agent_settled, not the interval
-  sweepIntervalMs: 600_000, // the sweep never fires mid-test either
-  discoveryTimeoutMs: 40, // unused by deprecated dispatch — config-shape only
-  acceptTimeoutMs: 150,
-  compatInSessionExecutor: false,
-  workerIdOverride: WORKER,
-};
+// The shared timers: beats and the sweep never fire mid-test (the drain is
+// tick-driven) and ticks come from agent_settled, not the interval. The
+// protocol timeouts are unused by deprecated dispatch — config shape only.
+const TEST_CONFIG = preProofConfig({ workerIdOverride: WORKER });
 
 let mock: MockPi;
 let controller: DispatchController;

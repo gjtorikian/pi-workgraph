@@ -36,6 +36,7 @@ import {
   transition,
 } from "../src/lifecycle.ts";
 import { registerWorkgraphTools } from "../src/tools.ts";
+import { preProofConfig } from "./helpers/config.ts";
 import { installFakeExecutor } from "./helpers/fake-executor.ts";
 import {
   asExtensionAPI,
@@ -48,18 +49,10 @@ import { makeScratchGraph, type ScratchGraph } from "./helpers/scratch.ts";
 
 const WORKER = "migration-test-worker";
 
-/** Huge scheduling timers (event-driven ticks only), tiny REAL protocol
- *  timeouts (bounded discovery/accept waits resolve fast). */
-const CONFIG: WorkgraphConfig = {
-  leaseTtlMs: 300_000,
-  heartbeatMs: 600_000,
-  pollMs: 600_000,
-  sweepIntervalMs: 600_000,
-  discoveryTimeoutMs: 40,
-  acceptTimeoutMs: 150,
-  compatInSessionExecutor: false,
-  workerIdOverride: WORKER,
-};
+/** The shared timers — huge scheduling timers (event-driven ticks only),
+ *  tiny REAL protocol timeouts (bounded discovery/accept waits resolve
+ *  fast). */
+const CONFIG = preProofConfig({ workerIdOverride: WORKER });
 
 const COMPAT_WARNING_MARKER = "workgraph-compat-legacy-issues is enabled";
 
@@ -73,7 +66,7 @@ interface Harness {
 
 function makeHarness(overrides: Partial<WorkgraphConfig> = {}): Harness {
   const mock = makeMockPi();
-  const config: WorkgraphConfig = { ...CONFIG, ...overrides };
+  const config = preProofConfig({ ...CONFIG, ...overrides });
   setWorkerIdOverride(WORKER);
   const warnings: string[] = [];
   const coordinator = registerCoordinator(asExtensionAPI(mock), {

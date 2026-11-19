@@ -55,6 +55,7 @@ import {
   WORKGRAPH_PHASE_KEY,
   WORKGRAPH_WORKFLOW_RUN_ID_KEY,
 } from "../src/types.ts";
+import { preProofConfig } from "./helpers/config.ts";
 import { installFakeExecutor } from "./helpers/fake-executor.ts";
 import {
   asExtensionAPI,
@@ -66,22 +67,16 @@ import { makeScratchGraph, type ScratchGraph } from "./helpers/scratch.ts";
 
 const WORKER = "coord-test-worker";
 
-/** Huge scheduling timers (event-driven ticks only), tiny REAL protocol
- *  timeouts (bounded waits resolve fast). */
-const CONFIG: WorkgraphConfig = {
-  leaseTtlMs: 300_000,
-  heartbeatMs: 600_000,
-  pollMs: 600_000,
-  sweepIntervalMs: 600_000,
-  discoveryTimeoutMs: 40,
-  acceptTimeoutMs: 150,
+/** The shared timers — huge scheduling timers (event-driven ticks only),
+ *  tiny REAL protocol timeouts (bounded waits resolve fast). */
+const CONFIG = preProofConfig({
   compatInSessionExecutor: false, // integration tests override per-harness
   // This suite exercises protocol coordination over legacy scratch issues;
   // the phase-3 approved-only rule (and its default legacy skip) has its
   // own coverage in test/judgment.test.ts.
   compatLegacyIssues: true,
   workerIdOverride: WORKER,
-};
+});
 
 function makeOffer(overrides: Partial<ExecutorOfferT> = {}): ExecutorOfferT {
   return {
@@ -106,7 +101,7 @@ interface Harness {
 
 function makeHarness(overrides: Partial<WorkgraphConfig> = {}): Harness {
   const mock = makeMockPi();
-  const config: WorkgraphConfig = { ...CONFIG, ...overrides };
+  const config = preProofConfig({ ...CONFIG, ...overrides });
   setWorkerIdOverride(WORKER);
   const coordinator = registerCoordinator(asExtensionAPI(mock), {
     getConfig: () => config,
@@ -775,7 +770,7 @@ describe("in-session adapter (standalone)", () => {
     config: WorkgraphConfig;
   } {
     const mock = makeMockPi();
-    const config: WorkgraphConfig = { ...CONFIG, compatInSessionExecutor: compat };
+    const config = preProofConfig({ ...CONFIG, compatInSessionExecutor: compat });
     const adapter = registerInSessionExecutor(asExtensionAPI(mock), {
       getConfig: () => config,
     });
@@ -955,7 +950,7 @@ describe("in-session integration", () => {
     const graph = makeScratchGraph({ prefix: "coordis", seed: 2 });
     const mock = makeMockPi();
     setWorkerIdOverride(WORKER);
-    const config: WorkgraphConfig = { ...CONFIG, compatInSessionExecutor: true };
+    const config = preProofConfig({ ...CONFIG, compatInSessionExecutor: true });
     // Registration order matters and mirrors index.ts: the ADAPTER first,
     // so within one settled dispatch it observes the run state from the
     // previous tick and never completes a run the same instant it accepted.
@@ -1012,7 +1007,7 @@ describe("in-session integration", () => {
     const graph = makeScratchGraph({ prefix: "coordtd", seed: 1 });
     const mock = makeMockPi();
     setWorkerIdOverride(WORKER);
-    const config: WorkgraphConfig = { ...CONFIG, compatInSessionExecutor: true };
+    const config = preProofConfig({ ...CONFIG, compatInSessionExecutor: true });
     registerInSessionExecutor(asExtensionAPI(mock), { getConfig: () => config });
     const coordinator = registerCoordinator(asExtensionAPI(mock), {
       getConfig: () => config,

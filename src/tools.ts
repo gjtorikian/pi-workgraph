@@ -70,7 +70,19 @@ import {
 } from "./lifecycle.ts";
 import { latestPlanCritique } from "./critique.ts";
 import { latestPlan, renderPlanForReview } from "./plan.ts";
-import { DEFAULT_RISK_TIER } from "./policy.ts";
+import {
+  DEFAULT_RISK_TIER,
+  GATES,
+  resolvePolicy,
+  type GateName,
+} from "./policy.ts";
+import {
+  latestGateRecords,
+  listGateRecords,
+  summarizeGates,
+  type GateRecord,
+  type GateSummary,
+} from "./proof.ts";
 import { resolveConfig as resolveFlags } from "./config.ts";
 import { effectiveTiers } from "./settings.ts";
 import {
@@ -89,6 +101,7 @@ import {
   ClaimParams,
   CloseParams,
   CreateParams,
+  GatesParams,
   HeartbeatParams,
   InitParams,
   OverrideParams,
@@ -135,6 +148,27 @@ function planCritiqueLine(summary: string, detailsReadable: boolean): string | u
   return detailsReadable
     ? `Critique (advisory): ${summary}, marked "?" under the steps they concern.`
     : `Critique (advisory): ${summary}, but its details could not be read.`;
+}
+
+/**
+ * One line of `workgraph_status`: what a gate last found on the issue. The
+ * mode shown is the one the gate ran under, which a later policy change may
+ * have moved on from (the `Gates:` line above it shows the current modes).
+ */
+function gateResultLine(record: GateRecord): string {
+  const effect = record.blocked ? ", blocked" : record.wouldBlock ? ", would block" : "";
+  const reason = record.reason !== undefined ? `: ${record.reason}` : "";
+  return `Gate ${record.gate}: ${record.result}${effect} (${record.mode}, attempt ${record.attempt})${reason}`;
+}
+
+/** One line of `workgraph_gates`: the issues a gate blocked and would have blocked. */
+function gateReportLine(gate: GateName, summary: GateSummary): string {
+  if (summary.records === 0) return `${gate}: no records`;
+  const list = (ids: string[]): string => (ids.length > 0 ? ` (${ids.join(", ")})` : "");
+  return (
+    `${gate}: ${summary.blocked.length} blocked${list(summary.blocked)}, ` +
+    `${summary.wouldBlock.length} would block${list(summary.wouldBlock)}`
+  );
 }
 
 function textResult<TDetails>(
@@ -664,7 +698,8 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     label: "Work status",
     description:
       "Show one issue's full workgraph state: lifecycle phase, acceptance criteria, risk tier, " +
-      "workflow run, attempt, last verdict, executor, and the lease (holder, epoch, expiry).",
+      "workflow run, attempt, last verdict, the gate modes that apply and each gate's latest result, " +
+      "executor, and the lease (holder, epoch, expiry).",
     promptSnippet: "Show a work-graph issue's lifecycle and lease state",
     promptGuidelines: [
       "Use workgraph_status to inspect where an issue is in the lifecycle before acting on it.",
@@ -672,7 +707,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     parameters: StatusParams,
     executionMode: "sequential",
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      await prepare(ctx);
+      const config = await prepare(ctx);
       const issue = await show(ctx.cwd, params.id);
       const phase = phaseOf(issue);
       const metadata = issue.metadata ?? {};
@@ -726,6 +761,14 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
       }
       const verdict = lastVerdictOf(issue);
       if (verdict) lines.push(`Last verdict: ${verdict}`);
+      // The gate modes in force for this issue's tier (a missing or unknown
+      // tier resolves to medium, as it does for the gate itself), then what
+      // each gate last found. Kept below the plan block: readers of a parked
+      // plan find its lines relative to the review header.
+      const policy = resolvePolicy(riskTier, config.policy);
+      lines.push(`Gates: ${GATES.map((gate) => `${gate}=${policy.gates[gate]}`).join(" ")}`);
+      const gateResults = latestGateRecords(await listGateRecords(ctx.cwd, params.id));
+      for (const record of gateResults) lines.push(gateResultLine(record));
       const question = metadata[WORKGRAPH_DECISION_QUESTION_KEY];
       if (
         metadata.workgraph_decision_pending === true ||
@@ -753,6 +796,33 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
         workflowRunId: runId ?? null,
         attempt: attemptOf(issue) ?? null,
         lastVerdict: verdict ?? null,
+        gates: policy.gates,
+        gateResults,
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "workgraph_gates",
+    label: "Gate report",
+    description:
+      "Report what the proof gates did: for each gate, the issues it blocked (mode enforce) and the issues it would have blocked (mode observe). " +
+      "A gate that is off records nothing. Pass an id to narrow the report to one issue.",
+    promptSnippet: "Report which gates blocked work, or would have",
+    promptGuidelines: [
+      "Use workgraph_gates to see what each gate blocked or would have blocked before changing a gate's mode in the policy.",
+    ],
+    parameters: GatesParams,
+    executionMode: "sequential",
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      await prepare(ctx);
+      // An unknown id is an error, not an empty report.
+      if (params.id !== undefined) await show(ctx.cwd, params.id);
+      const summary = summarizeGates(await listGateRecords(ctx.cwd, params.id));
+      const lines = GATES.map((gate) => gateReportLine(gate, summary[gate]));
+      return textResult(lines.join("\n"), {
+        id: params.id ?? null,
+        gates: summary,
       });
     },
   });

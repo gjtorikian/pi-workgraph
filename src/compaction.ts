@@ -20,7 +20,7 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { compact } from "@earendil-works/pi-coding-agent";
-import { resolveConfig } from "./config.ts";
+import { resolveConfigWithoutPolicy } from "./config.ts";
 import { heldLeases } from "./lease.ts";
 
 /** The in-flight work the summary must retain. */
@@ -118,9 +118,11 @@ export function registerCompactionTakeover(
       );
       // Resolved per compaction, never at registration: flags are not
       // readable at extension load, so a value captured there would
-      // silently drop `--workgraph-compaction-reasoning-level`.
+      // silently drop `--workgraph-compaction-reasoning-level`. Read without
+      // the policy: an invalid one must not cost the session this summary.
       const thinkingLevel =
-        resolveConfig(pi).compactionReasoningLevel ?? ctx.thinkingLevel;
+        resolveConfigWithoutPolicy(pi).compactionReasoningLevel ??
+        ctx.thinkingLevel;
       const result = await compactFn(
         event.preparation,
         model,
