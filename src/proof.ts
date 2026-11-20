@@ -46,6 +46,15 @@
  * write fails. {@link receiptFor} reads one back by run, tree and command,
  * which is what makes a tree checked once per run: a restart finds the
  * receipt on the trail instead of running the command again.
+ *
+ * THE BASE RECEIPT is the fourth: `workgraph-proof base-receipt {json}`, the
+ * check's result on the BASE tree, run in a throwaway worktree
+ * (`src/guards.ts`). It has a marker of its own, so it is never counted
+ * among the receipts a close rests on, and it is looked up by tree, command
+ * and setup command across runs ({@link baseReceiptFor}): the base of an
+ * issue does not change between claims. Nothing blocks on it. It only tells
+ * a guard whether the base was green, and a guard that cannot tell reports
+ * `unknown`, so {@link recordBaseReceipt} never rejects.
  */
 import {
   addComment,
@@ -70,6 +79,9 @@ const STAMP_AMENDED_MARKER = `${PROOF_PREFIX} stamp-amended `;
 
 /** Marker opening a check receipt. */
 const RECEIPT_MARKER = `${PROOF_PREFIX} receipt `;
+
+/** Marker opening the check's result on a base tree. */
+const BASE_RECEIPT_MARKER = `${PROOF_PREFIX} base-receipt `;
 
 /** What opens the reason of a `check` gate record for waived work. */
 export const WAIVED_REASON_PREFIX = "waived: ";
@@ -248,6 +260,10 @@ export interface GateSummary {
   /** Issues a human waived the gate for (recorded `not-applicable`), each
    *  once, with the latest waiver reason. */
   waived: Array<{ issueId: string; reason: string }>;
+  /** Issues the gate could not decide at least once (recorded `unknown`),
+   *  in first-seen order. For a diff guard this is where a blind guard
+   *  shows: its `unknown` never blocks, so no other column counts it. */
+  unknown: string[];
 }
 
 /**
@@ -262,7 +278,13 @@ export function summarizeGates(
 ): Record<GateName, GateSummary> {
   const summary = {} as Record<GateName, GateSummary>;
   for (const gate of GATES) {
-    summary[gate] = { records: 0, blocked: [], wouldBlock: [], waived: [] };
+    summary[gate] = {
+      records: 0,
+      blocked: [],
+      wouldBlock: [],
+      waived: [],
+      unknown: [],
+    };
   }
   for (const record of records) {
     const entry = summary[record.gate];
@@ -272,6 +294,9 @@ export function summarizeGates(
     }
     if (record.wouldBlock && !entry.wouldBlock.includes(record.issueId)) {
       entry.wouldBlock.push(record.issueId);
+    }
+    if (record.result === "unknown" && !entry.unknown.includes(record.issueId)) {
+      entry.unknown.push(record.issueId);
     }
     if (
       record.result === "not-applicable" &&
@@ -682,6 +707,97 @@ export async function receiptFor(
       receipt.workflowRunId === workflowRunId
     ) {
       return receipt;
+    }
+  }
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Base receipts
+// ---------------------------------------------------------------------------
+
+/** The check's result on a base tree, as recorded. */
+export interface BaseReceipt extends RecordedReceipt {
+  /** sha256 of the setup command that prepared the worktree; unset when none ran. */
+  setupDigest?: string;
+}
+
+/**
+ * Persist the check's result on a base tree as
+ * `workgraph-proof base-receipt {json}`. Resolves (never rejects) even when
+ * the write fails: nothing closes on this record, and the caller keeps the
+ * result in memory either way.
+ */
+export async function recordBaseReceipt(
+  cwd: string,
+  issueId: string,
+  receipt: BaseReceipt,
+  actor?: string,
+): Promise<void> {
+  const payload: BaseReceipt = {
+    tree: receipt.tree,
+    commandDigest: receipt.commandDigest,
+    ...(receipt.setupDigest !== undefined
+      ? { setupDigest: receipt.setupDigest }
+      : {}),
+    exitCode: receipt.exitCode,
+    ...(receipt.signal !== undefined ? { signal: receipt.signal } : {}),
+    timedOut: receipt.timedOut,
+    passed: receipt.passed,
+    ...(receipt.reason !== undefined
+      ? { reason: capReason(receipt.reason) }
+      : {}),
+    startedAt: receipt.startedAt,
+    endedAt: receipt.endedAt,
+    log: {
+      path: receipt.log.path,
+      bytes: receipt.log.bytes,
+      sha256: receipt.log.sha256,
+      tail: receipt.log.tail,
+    },
+    workflowRunId: receipt.workflowRunId,
+    attempt: receipt.attempt,
+  };
+  const text = `${BASE_RECEIPT_MARKER}${JSON.stringify(payload)}`;
+  try {
+    await addComment(cwd, issueId, text, actor);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // Loud, but non-blocking: the next run checks the base again.
+    console.error(
+      `[pi-workgraph] PROOF WRITE FAILED (base receipt on ${issueId}): ${msg}`,
+    );
+  }
+}
+
+/**
+ * The newest recorded result of one command on one base tree, prepared by
+ * one setup command (`undefined`: none), whichever run recorded it. Unlike
+ * {@link receiptFor} this is not scoped to a run: a base tree is the same
+ * content for every claim of the issue, so one result serves them all.
+ */
+export async function baseReceiptFor(
+  cwd: string,
+  issueId: string,
+  tree: string,
+  commandDigest: string,
+  setupDigest: string | undefined,
+): Promise<BaseReceipt | undefined> {
+  const comments = await listComments(cwd, issueId);
+  for (let i = comments.length - 1; i >= 0; i--) {
+    const text = comments[i]!.text;
+    if (!text.startsWith(BASE_RECEIPT_MARKER)) continue;
+    const receipt = parseReceipt(text.slice(BASE_RECEIPT_MARKER.length));
+    if (!receipt) continue;
+    const recordedSetup = jsonObject(text.slice(BASE_RECEIPT_MARKER.length))
+      ?.setupDigest;
+    const setup = typeof recordedSetup === "string" ? recordedSetup : undefined;
+    if (
+      receipt.tree === tree &&
+      receipt.commandDigest === commandDigest &&
+      setup === setupDigest
+    ) {
+      return { ...receipt, ...(setup !== undefined ? { setupDigest: setup } : {}) };
     }
   }
   return undefined;

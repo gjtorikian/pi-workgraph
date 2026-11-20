@@ -82,8 +82,26 @@
  *    downgrade what is left. Both steps can only take a blocker away, and a
  *    recheck that cannot be obtained leaves every blocker standing. Neither
  *    step has a gate mode, and neither touches a finding the core wrote.
+ *  - THE DIFF GUARDS (`src/guards.ts`): after the check and before any
+ *    reviewer is selected, the core reads the diff between the base tree
+ *    and the result tree for three ways an implementer can move its own
+ *    bar: `weakened-tests`, `scope` (against the file paths of the plan a
+ *    human approved, frozen on the bar) and `unproven-tests` (the check, run
+ *    in a throwaway worktree of the base with only the test files applied).
+ *    One result tree is evaluated once. A violation under `enforce` is a
+ *    blocking finding the core wrote and gets ONE revision round per guard
+ *    and per issue, outside `maxRevisions`; a guard that violates again
+ *    parks the issue with a question for a human, whose answer `allow` is
+ *    the only thing that lets that guard pass. A guard that cannot tell
+ *    records `unknown` and never blocks. One-shot work is not guarded.
+ *  - A RED BASE IS NOT THE IMPLEMENTER'S: when the check fails on the
+ *    result under `enforce`, the core runs it on the base tree too (once
+ *    per tree, setup command first). If the base fails as well the run
+ *    escalates, naming the base, instead of asking for a revision that
+ *    could not fix it.
  */
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -100,6 +118,17 @@ import {
   type CheckRun,
   type CheckSpec,
 } from "./check.ts";
+import {
+  DEFAULT_TEST_GLOBS,
+  guardQuestion,
+  listFiles,
+  scopeGuard,
+  testChanges,
+  touchedPaths,
+  weakenedTests,
+  type GuardFinding,
+  type TestChanges,
+} from "./guards.ts";
 import {
   StoreError,
   close,
@@ -165,6 +194,9 @@ import {
   escalate,
   executorIdOf,
   failureFingerprintOf,
+  guardAllowedByOf,
+  guardAllowedOf,
+  guardRoundsOf,
   isLifecycleV1,
   planApprovedOf,
   planFeedbackOf,
@@ -180,26 +212,32 @@ import {
   latestPlan,
   parsePlan,
   PlanError,
+  planPathTargets,
   planSummary,
   recordPlan,
   renderPlan,
 } from "./plan.ts";
 import {
   checkIndependence,
+  GUARD_GATES,
   type GateModeT,
   type GateName,
+  type GuardGate,
 } from "./policy.ts";
 import {
+  baseReceiptFor,
   decideGate,
   listReceipts,
   ReceiptWriteError,
   receiptFor,
+  recordBaseReceipt,
   recordGate,
   recordReceipt,
   recordStamp,
   recordStampAmendment,
   StampWriteError,
   WAIVED_REASON_PREFIX,
+  type BaseReceipt,
   type GateResult,
   type RecordedReceipt,
   type StampCheck,
@@ -232,6 +270,8 @@ import {
 } from "./recovery.ts";
 import {
   anchorTree,
+  changedFiles,
+  checkoutPaths,
   fileAt,
   isGitWorkspace,
   pathInTree,
@@ -240,6 +280,8 @@ import {
   snapshotWorkspace,
   treeOf,
   treeOfCommit,
+  withWorktree,
+  type ChangedFile,
 } from "./snapshot.ts";
 import { clearLeaseStatus, showLeaseStatus } from "./status.ts";
 import { reclaimAndLeaveReady } from "./sweep.ts";
@@ -267,9 +309,12 @@ import {
   WORKGRAPH_BAR_DIGEST_KEY,
   WORKGRAPH_BASE_COMMIT_KEY,
   WORKGRAPH_BASE_TREE_KEY,
+  WORKGRAPH_DECISION_GATE_KEY,
+  WORKGRAPH_DECISION_QUESTION_KEY,
   WORKGRAPH_EXECUTOR_ID_KEY,
   WORKGRAPH_FAILURE_FINGERPRINT_KEY,
   WORKGRAPH_FINALIZED_TREE_KEY,
+  WORKGRAPH_GUARD_ROUNDS_KEY,
   WORKGRAPH_LAST_VERDICT_KEY,
   WORKGRAPH_PHASE_KEY,
   WORKGRAPH_PLAN_APPROVED_KEY,
@@ -394,6 +439,26 @@ function effectiveWorkflowClass(issue: WorkIssue): WorkflowClassT {
     : workflowClass;
 }
 
+/**
+ * The file paths an approved plan names, as paths from the repository root:
+ * what the claim freezes on the bar for the `scope` guard. A path a planner
+ * wrote as absolute is made relative to the checkout it planned in; one that
+ * points outside it names nothing in the repository and is dropped.
+ */
+function approvedPlanTargets(cwd: string, plan: PlanT): string[] {
+  const targets: string[] = [];
+  for (const raw of planPathTargets(plan)) {
+    const target = pathInTree(cwd, raw);
+    if (target !== undefined && !targets.includes(target)) targets.push(target);
+  }
+  return targets;
+}
+
+/** A guard, or the base check, that could not determine an answer, and why. */
+interface Undetermined {
+  unknown: string;
+}
+
 /** One workflow run the coordinator supervises. */
 export interface CoordinatorRun {
   cwd: string;
@@ -481,6 +546,14 @@ export interface CoordinatorRun {
    * the gate is `off` or has not been evaluated.
    */
   checkOutcome?: { status: StampCheck; tree?: string; logSha256?: string };
+  /**
+   * Revision rounds of THIS claim that a diff guard started. They are left
+   * out when the rounds are compared with `maxRevisions`. Counted here and
+   * not read from `workgraph_guard_rounds`: that key lists gates and
+   * outlives the claim, while the attempt it is subtracted from starts over
+   * at every claim.
+   */
+  guardRounds?: number;
   /**
    * A recorded plan that has not parked yet: set by acceptPlan when a
    * critique will run, cleared by parkForPlanReview. While set, the
@@ -1184,7 +1257,10 @@ export function registerCoordinator(
     issue: WorkIssue,
     config: WorkgraphConfig,
   ): Promise<void> {
-    const current = buildBar(issue, config);
+    // The plan's paths are compared with themselves: they came from the plan
+    // the claim loaded, and a plan comment appended since must not read as a
+    // change to the bar, let alone become one.
+    const current = buildBar(issue, config, run.bar.planTargets);
     const digest = barDigest(current);
     if (digest === run.barDigest || run.barChanges?.includes(digest)) return;
     run.barChanges = [...(run.barChanges ?? []), digest];
@@ -1479,6 +1555,490 @@ export function registerCoordinator(
     }
     await escalateRun(run, phase, `check: ${reason}`);
     return { kind: "stop" };
+  }
+
+  // -------------------------------------------------------------------------
+  // The base tree and the diff guards. The pure parts live in src/guards.ts
+  // (what a diff shows) and src/snapshot.ts (the worktree); everything here
+  // runs commands, which needs what only the coordinator has: the store's
+  // log directory, the abort handle of a held run, and `stillHeld`.
+  // -------------------------------------------------------------------------
+
+  /** Results of the check on a base tree this session: by tree, command and setup command. */
+  const baseReceipts = new Map<string, BaseReceipt>();
+
+  /** The digest of the bar's setup command; undefined when there is none. */
+  function setupDigestOf(run: CoordinatorRun): string | undefined {
+    return run.bar.setup !== undefined ? commandDigest(run.bar.setup) : undefined;
+  }
+
+  function baseReceiptKey(
+    tree: string,
+    spec: CheckSpec,
+    setupDigest: string | undefined,
+  ): string {
+    return `${tree}\u0000${commandDigest(spec.command)}\u0000${setupDigest ?? ""}`;
+  }
+
+  /**
+   * A log name for one command a guard runs. Never a number: the numbered
+   * logs belong to the receipts of the result (`runCheckOnce` names the
+   * next one from their count), and a guard's run must not take one or
+   * overwrite one.
+   */
+  function guardLogName(
+    kind: "setup" | "base" | "tests",
+    run: CoordinatorRun,
+    tree: string,
+  ): string {
+    return `${kind}-${runKey(run.workflowRunId).slice(0, 8)}-${run.attempt}-${tree.slice(0, 12)}`;
+  }
+
+  /**
+   * Run one command for a guard in `cwd` (a worktree of the base). Records
+   * nothing. Registered like a check, so teardown, a lost lease and a halt
+   * stop it; `released` means the run is no longer held and nothing may be
+   * written for it.
+   */
+  async function runGuardCommand(
+    run: CoordinatorRun,
+    spec: CheckSpec,
+    cwd: string,
+    logName: string,
+  ): Promise<CheckRun | "released"> {
+    let logPath: string;
+    try {
+      logPath = proofLogPath(run.cwd, run.lease.issueId, logName);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return unstartedRun(spec, `could not write log: ${msg}`);
+    }
+    const controller = new AbortController();
+    checksInFlight.set(run, controller);
+    let ran: CheckRun;
+    try {
+      ran = await runCheck(spec, cwd, logPath, { signal: controller.signal });
+    } finally {
+      checksInFlight.delete(run);
+    }
+    return !stillHeld(run) || ran.reason === "aborted" ? "released" : ran;
+  }
+
+  /** A run that says nothing about the tree: its log or its process never started. */
+  function neverRan(ran: CheckRun): boolean {
+    return (
+      ran.reason?.startsWith("could not write log") === true ||
+      ran.reason?.startsWith("could not start") === true
+    );
+  }
+
+  /** The base result already known for the run's base tree: this session's, else the trail's. */
+  async function knownBaseReceipt(
+    run: CoordinatorRun,
+    spec: CheckSpec,
+  ): Promise<BaseReceipt | undefined> {
+    const tree = run.baseTree;
+    if (tree === undefined) return undefined;
+    const setupDigest = setupDigestOf(run);
+    const key = baseReceiptKey(tree, spec, setupDigest);
+    const cached = baseReceipts.get(key);
+    if (cached) return cached;
+    let recorded: BaseReceipt | undefined;
+    try {
+      recorded = await baseReceiptFor(
+        run.cwd,
+        run.lease.issueId,
+        tree,
+        commandDigest(spec.command),
+        setupDigest,
+      );
+    } catch {
+      return undefined; // an unreadable trail is "not known", not a failure
+    }
+    if (recorded) baseReceipts.set(key, recorded);
+    return recorded;
+  }
+
+  /**
+   * Run `work` in a throwaway worktree of the run's base commit, after the
+   * bar's setup command when there is one (a fresh worktree has no installed
+   * dependencies). The worktree is removed afterwards whatever happened. A
+   * worktree that cannot be created, a base that was never recorded and a
+   * setup command that fails are each `unknown`, with the reason.
+   */
+  async function inBaseWorktree<T>(
+    run: CoordinatorRun,
+    spec: CheckSpec,
+    work: (path: string) => Promise<T>,
+  ): Promise<T | Undetermined | "released"> {
+    const commit = run.baseCommit;
+    const tree = run.baseTree;
+    const repo = run.basePath ?? run.workspacePath ?? run.cwd;
+    if (commit === undefined || tree === undefined) {
+      return { unknown: "no base commit was recorded for the work" };
+    }
+    try {
+      return await withWorktree<T | Undetermined | "released">(
+        repo,
+        commit,
+        async (path) => {
+          const setup = run.bar.setup;
+          if (setup !== undefined) {
+            // The check's timeout bounds the setup too: it is the one bound
+            // the settings give.
+            const prepared = await runGuardCommand(
+              run,
+              { command: setup, timeoutMs: spec.timeoutMs },
+              path,
+              guardLogName("setup", run, tree),
+            );
+            if (prepared === "released") return "released";
+            if (!prepared.passed) {
+              return {
+                unknown: `setup failed: ${prepared.reason ?? "the setup command did not pass"}`,
+              };
+            }
+          }
+          return work(path);
+        },
+      );
+    } catch (e) {
+      return {
+        unknown: `no worktree of the base tree: ${gitFailure(repo, e)}`,
+      };
+    }
+  }
+
+  /**
+   * Run the check in `path`, a prepared worktree of the base, and keep the
+   * result: in this session's cache and as a base receipt on the trail. A
+   * run that never started is `unknown` and is not kept, so the next look
+   * tries again.
+   */
+  async function checkBaseIn(
+    run: CoordinatorRun,
+    spec: CheckSpec,
+    tree: string,
+    path: string,
+  ): Promise<BaseReceipt | Undetermined | "released"> {
+    const ran = await runGuardCommand(
+      run,
+      spec,
+      path,
+      guardLogName("base", run, tree),
+    );
+    if (ran === "released") return "released";
+    if (neverRan(ran)) {
+      return { unknown: `the check could not run on the base tree: ${ran.reason}` };
+    }
+    const setupDigest = setupDigestOf(run);
+    const receipt: BaseReceipt = {
+      ...ran,
+      tree,
+      workflowRunId: run.workflowRunId,
+      attempt: run.attempt,
+      ...(setupDigest !== undefined ? { setupDigest } : {}),
+    };
+    baseReceipts.set(baseReceiptKey(tree, spec, setupDigest), receipt);
+    // Never rejects: nothing closes on this record.
+    await recordBaseReceipt(
+      run.cwd,
+      run.lease.issueId,
+      receipt,
+      run.actor.bdActor,
+    );
+    return receipt;
+  }
+
+  /**
+   * The check's result on the run's BASE tree, computed once per tree,
+   * command and setup command: this session's cache, then the trail, then
+   * the command itself in a throwaway worktree. `unknown` when the bar has
+   * no check or the result could not be determined; `released` when the run
+   * is no longer held.
+   */
+  async function baseReceipt(
+    run: CoordinatorRun,
+  ): Promise<BaseReceipt | Undetermined | "released"> {
+    const spec = run.bar.check;
+    const tree = run.baseTree;
+    if (spec === undefined) return { unknown: "the bar has no check" };
+    if (tree === undefined) return { unknown: "no base tree was recorded" };
+    const known = await knownBaseReceipt(run, spec);
+    if (known) return known;
+    return inBaseWorktree(run, spec, (path) =>
+      checkBaseIn(run, spec, tree, path),
+    );
+  }
+
+  /** What a red base is told about setup: the likeliest cause when none is configured. */
+  function setupHint(run: CoordinatorRun): string {
+    return run.bar.setup === undefined
+      ? "; the base is checked in a fresh worktree with no installed dependencies, so set check.setup in the workgraph settings if the check needs them"
+      : "";
+  }
+
+  /**
+   * The `unproven-tests` guard: do the change's new and changed tests fail
+   * without the change? In one worktree of the base (setup, then the base
+   * check unless its result is already known), only `tests` are taken from
+   * the result tree and the check runs again.
+   *
+   *   the check passes there      → `violation`: the tests prove nothing
+   *   the check exits non-zero    → `pass`: they depend on the change
+   *   a red base, a failed setup, a timeout, a signal, git failing
+   *                               → `unknown`, which never blocks
+   *
+   * The caller has already established that the change's own check passed
+   * on `tree`; without that, a failure here would mean nothing.
+   */
+  async function unprovenTests(
+    run: CoordinatorRun,
+    spec: CheckSpec,
+    tree: string,
+    tests: TestChanges,
+  ): Promise<GuardFinding | "released"> {
+    const baseTree = run.baseTree;
+    if (baseTree === undefined) {
+      return { result: "unknown", files: [], reason: "no base tree was recorded" };
+    }
+    const red = (receipt: BaseReceipt): GuardFinding => ({
+      result: "unknown",
+      files: [],
+      reason: `the check fails on the base tree (${receipt.reason ?? "check failed"}), so running the tests there shows nothing${setupHint(run)}`,
+    });
+    const known = await knownBaseReceipt(run, spec);
+    if (known !== undefined && !known.passed) return red(known);
+    const outcome = await inBaseWorktree<
+      { ran: CheckRun } | { red: BaseReceipt } | Undetermined | "released"
+    >(run, spec, async (path) => {
+      const base = known ?? (await checkBaseIn(run, spec, baseTree, path));
+      if (base === "released" || "unknown" in base) return base;
+      if (!base.passed) return { red: base };
+      try {
+        checkoutPaths(path, tree, tests.apply);
+        // A renamed test: without this it would exist under both names.
+        for (const old of tests.remove) rmSync(join(path, old), { force: true });
+      } catch (e) {
+        return {
+          unknown: `the test files could not be applied to the base tree: ${gitFailure(path, e)}`,
+        };
+      }
+      const ran = await runGuardCommand(
+        run,
+        spec,
+        path,
+        guardLogName("tests", run, tree),
+      );
+      return ran === "released" ? "released" : { ran };
+    });
+    if (outcome === "released") return "released";
+    if ("unknown" in outcome) {
+      return { result: "unknown", files: [], reason: outcome.unknown };
+    }
+    if ("red" in outcome) return red(outcome.red);
+    const ran = outcome.ran;
+    if (ran.passed) {
+      return {
+        result: "violation",
+        files: tests.apply,
+        reason: `new or changed tests pass without the change: ${listFiles(tests.apply)}`,
+      };
+    }
+    // Only a command that ran to its own non-zero exit says the tests fail.
+    if (ran.exitCode !== null && !ran.timedOut && ran.signal === undefined && !neverRan(ran)) {
+      return { result: "pass", files: [] };
+    }
+    return {
+      result: "unknown",
+      files: [],
+      reason: `the tests could not be run on the base tree: ${ran.reason ?? "the check did not finish"}`,
+    };
+  }
+
+  /**
+   * Evaluate and record the three diff guards for the run's current result:
+   * `weakened-tests`, `scope`, then `unproven-tests`. A gate whose mode is
+   * `off` is skipped. A gate a human allowed for this issue
+   * (`workgraph_guard_allowed`, read from the issue as claimed: an
+   * allowance is only ever written between claims) is recorded as `pass`
+   * with who allowed it and the files it covers, and the expensive one is
+   * not run for it.
+   *
+   * `continue`: nothing blocks. `stop`: the run is no longer held.
+   * `revise`: at least one guard blocks and none of them has had its
+   * revision round: `verdict` carries one code-authored blocking finding per
+   * guard, and `spent` is the list to write with the round. `decide`: a
+   * guard that already had its round blocks again, so a human is asked.
+   */
+  async function evaluateGuards(
+    run: CoordinatorRun,
+    issue: WorkIssue,
+    attempt: number,
+    tree: string | undefined,
+  ): Promise<
+    | { kind: "continue" }
+    | { kind: "stop" }
+    | { kind: "revise"; spent: GuardGate[]; verdict: VerdictT }
+    | { kind: "decide"; gates: GuardGate[]; question: string; verdict: VerdictT }
+  > {
+    const modes = run.bar.policy.gates;
+    const active = GUARD_GATES.filter((gate) => modes[gate] !== "off");
+    if (active.length === 0) return { kind: "continue" };
+    const baseTree = run.baseTree;
+    const repo = run.workspacePath ?? run.cwd;
+    const globs = run.bar.testGlobs ?? DEFAULT_TEST_GLOBS;
+    const allowed = guardAllowedOf(run.issue);
+    const allowedBy = guardAllowedByOf(run.issue) ?? "a human";
+    const undetermined = (reason: string): GuardFinding => ({
+      result: "unknown",
+      files: [],
+      reason,
+    });
+
+    // One diff for all three. With no tree, or a diff git cannot produce,
+    // every guard is blind and says so.
+    let changed: ChangedFile[] | undefined;
+    let blind = "";
+    if (tree === undefined || baseTree === undefined) {
+      const why =
+        bindingModeOf(run) === "off"
+          ? "the tree-binding gate is off"
+          : (run.bindingReason ?? "no result tree was recorded");
+      blind = `there is no result tree to compare with a base (${why})`;
+    } else {
+      try {
+        changed = changedFiles(repo, baseTree, tree);
+      } catch (e) {
+        blind = `the diff could not be read: ${gitFailure(repo, e)}`;
+      }
+    }
+
+    const found = new Map<GuardGate, GuardFinding>();
+    for (const gate of active) {
+      if (changed === undefined || tree === undefined || baseTree === undefined) {
+        found.set(gate, undetermined(blind));
+        continue;
+      }
+      if (gate === "weakened-tests") {
+        found.set(gate, weakenedTests(repo, baseTree, tree, globs, changed));
+        continue;
+      }
+      if (gate === "scope") {
+        // A target with no directory reads as a path only by its extension,
+        // and so does a symbol such as `Policy.backoff`. One that names no
+        // file in either tree is treated as the symbol it probably is.
+        const targets = run.bar.planTargets?.filter(
+          (target) =>
+            /[/*?]/.test(target) ||
+            fileAt(repo, baseTree, target) !== undefined ||
+            fileAt(repo, tree, target) !== undefined,
+        );
+        found.set(gate, scopeGuard(touchedPaths(changed), targets, globs));
+        continue;
+      }
+      const spec = run.bar.check;
+      if (spec === undefined) {
+        found.set(gate, {
+          result: "not-applicable",
+          files: [],
+          reason: "the bar has no check",
+        });
+        continue;
+      }
+      let tests: TestChanges;
+      try {
+        tests = testChanges(repo, baseTree, tree, changed, globs);
+      } catch (e) {
+        found.set(gate, undetermined(`the diff could not be read: ${gitFailure(repo, e)}`));
+        continue;
+      }
+      if (tests.apply.length === 0) {
+        found.set(gate, {
+          result: "not-applicable",
+          files: [],
+          reason: "no test file was added or modified",
+        });
+      } else if (allowed.includes(gate)) {
+        found.set(gate, { result: "pass", files: tests.apply });
+      } else if (
+        run.checkOutcome?.status !== "passed" ||
+        run.checkOutcome.tree !== tree
+      ) {
+        // The inference needs a green check on the change itself.
+        found.set(
+          gate,
+          undetermined(
+            "the change's own check did not pass on this tree, so a failure on the base would not show that the tests depend on the change",
+          ),
+        );
+      } else {
+        const finding = await unprovenTests(run, spec, tree, tests);
+        if (finding === "released") return { kind: "stop" };
+        found.set(gate, finding);
+      }
+    }
+
+    const blocked: Array<{ gate: GuardGate; finding: GuardFinding }> = [];
+    for (const gate of active) {
+      const finding = found.get(gate)!;
+      const mode = modes[gate];
+      const isAllowed = allowed.includes(gate);
+      const result: GateResult = isAllowed ? "pass" : finding.result;
+      const reason = isAllowed
+        ? `allowed by ${allowedBy}${
+            finding.files.length > 0 ? `: ${listFiles(finding.files)}` : ""
+          }`
+        : finding.reason;
+      const decision = decideGate(gate, mode, result);
+      noteGate(run, gate, result);
+      await recordGate(
+        run.cwd,
+        run.lease.issueId,
+        {
+          gate,
+          mode,
+          result,
+          ...decision,
+          ...(reason !== undefined ? { reason } : {}),
+          ...(tree !== undefined ? { tree } : {}),
+          workflowRunId: run.workflowRunId,
+          attempt,
+        },
+        run.actor.bdActor,
+      );
+      if (decision.blocked) blocked.push({ gate, finding });
+    }
+    if (blocked.length === 0) return { kind: "continue" };
+
+    const gates = blocked.map(({ gate }) => gate);
+    const verdict: VerdictT = {
+      findings: blocked.map(({ gate, finding }) => ({
+        criterion: gate,
+        severity: "blocking",
+        author: "code",
+        note: finding.reason ?? `${gate} violation`,
+        ...(finding.files.length > 0
+          ? { evidence: listFiles(finding.files) }
+          : {}),
+      })),
+    };
+    // The live issue: a round started earlier in this claim is on it.
+    const spent = guardRoundsOf(issue);
+    if (gates.some((gate) => spent.includes(gate))) {
+      return {
+        kind: "decide",
+        gates,
+        verdict,
+        question: guardQuestion(
+          blocked.map(({ gate, finding }) => ({
+            gate,
+            reason: finding.reason ?? "violation",
+          })),
+        ),
+      };
+    }
+    return { kind: "revise", spent: [...spent, ...gates], verdict };
   }
 
   /**
@@ -3188,6 +3748,9 @@ export function registerCoordinator(
         workgraph_decision_requested_at: new Date(nowFn()).toISOString(),
         workgraph_workspace_run_id: run.workflowRunId,
         workgraph_halt_unconfirmed: !stopped,
+        // An executor's question is never a guard question, whatever it
+        // says: only the core names a gate here (requestGuardDecision).
+        [WORKGRAPH_DECISION_GATE_KEY]: "",
       },
     );
     if (!saved) return;
@@ -3200,6 +3763,55 @@ export function registerCoordinator(
         decisionId: completion.executionId,
         question: completion.decisionQuestion,
         workerStopped: stopped,
+      },
+      run.actor.bdActor,
+    );
+  }
+
+  /**
+   * Park a question the CORE asks: a diff guard still finds a violation
+   * after its one revision round, and only a human can say whether the
+   * change is meant. Same decision metadata, audit and release as
+   * {@link requestDecision}, without the parts that concern a worker: no
+   * execution is running during judgment, so there is nothing to cancel and
+   * no completion to fence. `workgraph_decision_gate` names the gates, and
+   * is what lets `workgraph_answer_decision` turn the answer `allow` into
+   * an allowance for exactly those gates.
+   */
+  async function requestGuardDecision(
+    run: CoordinatorRun,
+    gates: readonly GuardGate[],
+    question: string,
+    summary: string,
+  ): Promise<void> {
+    // No execution asked, so the id is the core's own: the run, the attempt.
+    const decisionId = `guard-${runKey(run.workflowRunId)}-${run.attempt}`;
+    const saved = await escalateRun(
+      run,
+      "judging",
+      `Needs your decision: ${question}`,
+      {
+        workgraph_decision_pending: true,
+        workgraph_decision_id: decisionId,
+        [WORKGRAPH_DECISION_QUESTION_KEY]: question,
+        workgraph_decision_requested_at: new Date(nowFn()).toISOString(),
+        workgraph_workspace_run_id: run.workflowRunId,
+        workgraph_halt_unconfirmed: false,
+        [WORKGRAPH_DECISION_GATE_KEY]: gates.join(","),
+        [WORKGRAPH_LAST_VERDICT_KEY]: summary,
+      },
+    );
+    if (!saved) return;
+    await recordLeaseEvent(
+      run.cwd,
+      "decision-needed",
+      run.lease.issueId,
+      {
+        workflowRunId: run.workflowRunId,
+        decisionId,
+        question,
+        gates: [...gates],
+        workerStopped: true,
       },
       run.actor.bdActor,
     );
@@ -3330,8 +3942,9 @@ export function registerCoordinator(
   /**
    * The blocking path: what happens once a gate that enforces found
    * blocking findings on the result under judgment. Shared by the `review`
-   * gate (a reviewer's verdict) and the `check` gate (a verdict the core
-   * built around one finding of its own), so both are bounded the same way:
+   * gate (a reviewer's verdict), the `check` gate and the diff guards (a
+   * verdict the core built around findings of its own), so all are bounded
+   * the same way:
    *
    *  - the same findings on the same content (`digest`: the result tree, or
    *    the artifact list when nothing is bound) is a repeat, and a repeat
@@ -3339,6 +3952,12 @@ export function registerCoordinator(
    *    planned work escalates;
    *  - `maxRevisions` (from the frozen bar) bounds the rounds the same way;
    *  - otherwise judging → revising, and one revision run.
+   *
+   * A GUARD ROUND (`guard` set) is outside `maxRevisions` on both sides: it
+   * starts whatever the count is, and the rounds a guard started are taken
+   * off the count every other caller is held to. What bounds it instead is
+   * `guard.spent`: the guards that have now had their one round, written
+   * with the transition so a transition that loses its race spends nothing.
    *
    * Returns the revision's completion with the run back in `judging`, or
    * undefined when the run stopped (promoted, escalated, parked, aborted).
@@ -3351,6 +3970,7 @@ export function registerCoordinator(
     verdict: VerdictT,
     summary: string,
     digest: string,
+    guard?: { spent: readonly GuardGate[] },
   ): Promise<RunCompletedT | undefined> {
     const maxRevisions = run.bar.policy.maxRevisions;
     const fingerprint = failureFingerprint(blockingFindings(verdict), digest);
@@ -3371,7 +3991,9 @@ export function registerCoordinator(
       );
       return undefined;
     }
-    if (attempt - 1 >= maxRevisions) {
+    // Never below zero: `workgraph_attempt` starts over at every claim.
+    const charged = Math.max(0, attempt - 1 - (run.guardRounds ?? 0));
+    if (guard === undefined && charged >= maxRevisions) {
       if (effectiveWorkflowClass(issue) === "reviewed") {
         await promoteReviewedToPlanned(
           run,
@@ -3397,6 +4019,9 @@ export function registerCoordinator(
           [WORKGRAPH_ATTEMPT_KEY]: String(attempt + 1),
           [WORKGRAPH_FAILURE_FINGERPRINT_KEY]: fingerprint,
           [WORKGRAPH_LAST_VERDICT_KEY]: summary,
+          ...(guard !== undefined
+            ? { [WORKGRAPH_GUARD_ROUNDS_KEY]: guard.spent.join(",") }
+            : {}),
         },
         actor: run.actor.bdActor,
       });
@@ -3419,6 +4044,7 @@ export function registerCoordinator(
     });
     run.phase = "revising";
     run.attempt = attempt + 1;
+    if (guard !== undefined) run.guardRounds = (run.guardRounds ?? 0) + 1;
     const revision = await runRevision(run, box, verdict, attempt + 1);
     if (revision === "aborted" || revision === "parked") return undefined;
     run.phase = "judging";
@@ -4184,6 +4810,10 @@ export function registerCoordinator(
     // revision that changed nothing leaves the same tree, and it must be
     // found failing again, not waved through to review.
     let checkRecordedFor: string | undefined;
+    // The same for the three diff guards, and cleared the same way: a guard
+    // whose round changed nothing must find the violation again, which is
+    // what parks the issue for a human.
+    let guardsRecordedFor: string | undefined;
     /** What a gate was recorded for: the bound tree, or why there is none. */
     const resultKey = (): string =>
       boundTreeOf(run) ?? `unknown: ${run.bindingReason ?? ""}`;
@@ -4258,6 +4888,22 @@ export function registerCoordinator(
           // wrote takes the path a reviewer's blocking finding takes. No
           // verdict record exists for this round, and none is requested.
           const failed: VerdictT = { findings: [checked.finding] };
+          // A RED BASE: before asking for a revision, run the same check on
+          // the tree the work started from (once per tree). If it fails
+          // there too, no revision of this work can make it pass, so a
+          // human is told instead. A base that cannot be checked changes
+          // nothing: the revision goes ahead as before.
+          const base = await baseReceipt(run);
+          if (base === "released" || box.closed) return;
+          if (!("unknown" in base) && !base.passed) {
+            await escalateRun(
+              run,
+              "judging",
+              `the check already fails on the base tree: ${base.reason ?? "check failed"}${setupHint(run)}`,
+              { [WORKGRAPH_LAST_VERDICT_KEY]: verdictSummary(failed) },
+            );
+            return;
+          }
           const revision = await reviseAfterBlock(
             run,
             box,
@@ -4271,6 +4917,7 @@ export function registerCoordinator(
           if (revision === undefined) return;
           author = revision;
           checkRecordedFor = undefined;
+          guardsRecordedFor = undefined;
           continue; // check the revised tree
         }
         if (boundTreeOf(run) !== before) {
@@ -4282,6 +4929,45 @@ export function registerCoordinator(
       }
       // The tree every record of this round names; undefined = unbound.
       const tree = bindingMode !== "off" ? boundTreeOf(run) : undefined;
+
+      // ---- the diff guards. After the check, because `unproven-tests`
+      // reads its result; before the review-off branch and before reviewer
+      // selection, for the reasons the check sits there. Once per result
+      // tree: they read two git trees, which do not move. ----
+      if (guardsRecordedFor !== resultKey()) {
+        const guarded = await evaluateGuards(run, issue, attempt, tree);
+        if (guarded.kind === "stop") return; // no longer held
+        if (box.closed) return;
+        guardsRecordedFor = resultKey();
+        if (guarded.kind === "decide") {
+          // The guard had its round and the violation is still there: a
+          // deliberate change needs a human yes, not more implementer runs.
+          await requestGuardDecision(
+            run,
+            guarded.gates,
+            guarded.question,
+            verdictSummary(guarded.verdict),
+          );
+          return;
+        }
+        if (guarded.kind === "revise") {
+          const revision = await reviseAfterBlock(
+            run,
+            box,
+            issue,
+            attempt,
+            guarded.verdict,
+            verdictSummary(guarded.verdict),
+            tree ?? artifactDigest(author.artifacts),
+            { spent: guarded.spent },
+          );
+          if (revision === undefined) return;
+          author = revision;
+          checkRecordedFor = undefined;
+          guardsRecordedFor = undefined;
+          continue; // check and guard the revised tree
+        }
+      }
 
       /**
        * The last look before the close: has the workspace moved since the
@@ -4361,8 +5047,9 @@ export function registerCoordinator(
       };
 
       // ---- review gate off: not evaluated, so no reviewer is selected, no
-      // verdict exists, and no gate result is recorded (`criteria-evidence`
-      // included: it reads a verdict's answers, and there is no verdict).
+      // verdict exists, and no result is recorded for it (or for
+      // `criteria-evidence`: it reads a verdict's answers, and there is no
+      // verdict). The check and the diff guards above have already run.
       // The work is accepted on the implementation alone — which also means
       // an off tier never parks for want of a reviewer-capable executor. ----
       if (mode === "off") {
@@ -4867,7 +5554,8 @@ export function registerCoordinator(
         if (revision === undefined) return;
         author = revision;
         checkRecordedFor = undefined;
-        continue; // check and re-review the revised implementation
+        guardsRecordedFor = undefined;
+        continue; // check, guard and re-review the revised implementation
       }
       if (unanswered.length > 0) {
         // No blocker, and criteria nobody answered: not a pass. Ask the
@@ -5181,7 +5869,15 @@ export function registerCoordinator(
     // FREEZE THE BAR: what this claim is judged against, from the issue as
     // claimed and the config this tick validated. Nothing the implementer
     // does to the issue or to a settings file after this point changes it.
-    const bar = buildBar(outcome.issue, config);
+    // The approved plan's file paths are part of it: the `scope` guard reads
+    // them from the bar, never from the plan trail, which is in the checkout.
+    const bar = buildBar(
+      outcome.issue,
+      config,
+      approvedPlan !== undefined
+        ? approvedPlanTargets(ctx.cwd, approvedPlan)
+        : undefined,
+    );
     const frozenDigest = barDigest(bar);
 
     const run: CoordinatorRun = {
@@ -5746,7 +6442,17 @@ export function registerCoordinator(
           if (frozen !== undefined) {
             return { bar: frozen, digest: barDigest(frozen) };
           }
-          const bar = buildBar(cur, config);
+          const approved =
+            effectiveWorkflowClass(cur) === "planned" && planApprovedOf(cur)
+              ? await latestPlan(ctx.cwd, cur.id)
+              : undefined;
+          const bar = buildBar(
+            cur,
+            config,
+            approved !== undefined
+              ? approvedPlanTargets(ctx.cwd, approved)
+              : undefined,
+          );
           const digest = barDigest(bar);
           const claimed = barDigestOf(cur);
           await recordLeaseEvent(
@@ -5799,6 +6505,12 @@ export function registerCoordinator(
           supportsCancellation: offer?.supportsCancellation ?? false,
           bar: frozen.bar,
           barDigest: frozen.digest,
+          // Not persisted as a count. No more guard rounds can have run in
+          // this claim than gates spent one, or than revisions happened.
+          guardRounds: Math.min(
+            guardRoundsOf(cur).length,
+            Math.max(0, (attemptOf(cur) ?? 1) - 1),
+          ),
         });
 
         if (phase === "planning") {

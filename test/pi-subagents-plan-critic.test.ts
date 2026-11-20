@@ -412,8 +412,12 @@ describe("buildSubagentTask for a plan critic", () => {
   // these byte-identical. Update a literal here only when that role's prompt
   // is changed on purpose.
   const ROLE_SENTENCE: Record<string, string> = {
-    planner:
+    // Two lines: the second asks for the file paths the `scope` guard holds
+    // an approved plan to.
+    planner: [
       "Produce a concrete implementation plan as structured output matching the provided schema. Do not modify product code.",
+      "In each step's targets, list the repository-relative file paths the step expects to change (a directory covers everything under it). Once the plan is approved, a change to a file outside those paths is flagged as out of scope; test files, and a lockfile beside a changed manifest, are exempt.",
+    ].join("\n"),
     implementer:
       "Implement and validate the changes. Leave the result in this workspace for independent review and subsequent workflow stages.",
     reviewer:

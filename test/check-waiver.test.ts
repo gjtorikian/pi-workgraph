@@ -581,12 +581,18 @@ describe("the workgraph.check setting", () => {
       expect(resolveConfig(api).check).toBeUndefined();
 
       writeProjectSettings(graph.dir, {
-        check: { command: " npm test ", timeoutMs: 120_000, setup: "npm ci" },
+        check: {
+          command: " npm test ",
+          timeoutMs: 120_000,
+          setup: "npm ci",
+          testGlobs: [" spec/** ", "**/*_spec.rb"],
+        },
       });
       expect(resolveConfig(api).check).toEqual({
         command: "npm test",
         timeoutMs: 120_000,
         setup: "npm ci",
+        testGlobs: ["spec/**", "**/*_spec.rb"],
       });
 
       const invalid: ReadonlyArray<[unknown, RegExp]> = [
@@ -595,7 +601,10 @@ describe("the workgraph.check setting", () => {
         [{ command: 5 }, /check\.command/],
         [{ timeoutMs: 0 }, /check\.timeoutMs must be a positive number/],
         [{ timeoutMs: "60s" }, /check\.timeoutMs/],
-        [{ comand: "npm test" }, /check\.comand is not a check setting \(expected command, timeoutMs, setup\)/],
+        [{ testGlobs: [] }, /check\.testGlobs must be a non-empty array of glob strings, got an empty array/],
+        [{ testGlobs: "**/*.test.ts" }, /check\.testGlobs must be a non-empty array/],
+        [{ testGlobs: ["**/*.test.ts", ""] }, /check\.testGlobs/],
+        [{ comand: "npm test" }, /check\.comand is not a check setting \(expected command, timeoutMs, setup, testGlobs\)/],
       ];
       for (const [block, message] of invalid) {
         writeProjectSettings(graph.dir, { check: block });
@@ -777,6 +786,9 @@ describe("waived and unapproved work at the gate", () => {
       expect(stamp!.gates).toEqual({
         "tree-binding": "pass",
         check: "not-applicable",
+        "weakened-tests": "pass",
+        scope: "not-applicable",
+        "unproven-tests": "not-applicable",
         "criteria-evidence": "not-applicable",
         review: "pass",
       });
@@ -918,7 +930,6 @@ describe("the frozen bar", () => {
         reviewer: { provenance: REV_PROV, verdict: CLEAN_VERDICT },
       },
     });
-    captureErrors(); // "no revision-capable executor"
     const ectx = makeEventContext(repo.dir);
     try {
       await drive(mock, ectx.ctx);
@@ -942,9 +953,11 @@ describe("the frozen bar", () => {
       fake.complete();
       await mock.flushEvents();
 
-      // The frozen command ran, and failed: the issue did not close.
+      // The frozen command ran, and failed: the issue did not close. It
+      // fails on the base tree as well, so no revision could fix it and the
+      // run escalates (test/diff-guards.test.ts covers that rule).
       expect(repo.showIssue(id).status).not.toBe("closed");
-      expect(metadataOf(repo, id)[WORKGRAPH_PHASE_KEY]).toBe("revising");
+      expect(metadataOf(repo, id)[WORKGRAPH_PHASE_KEY]).toBe("escalated");
       const receipts = await listReceipts(repo.dir, id);
       expect(receipts).toHaveLength(1);
       expect(receipts[0]).toMatchObject({
@@ -1046,11 +1059,11 @@ describe("the frozen bar", () => {
         reviewer: { provenance: REV_PROV, verdict: CLEAN_VERDICT },
       },
     });
-    captureErrors();
     const ectx = makeEventContext(repo.dir);
     try {
       await drive(mock, ectx.ctx);
-      expect(metadataOf(repo, id)[WORKGRAPH_PHASE_KEY]).toBe("revising");
+      // A check that fails on the base tree too: escalated, not revised.
+      expect(metadataOf(repo, id)[WORKGRAPH_PHASE_KEY]).toBe("escalated");
 
       // A human fixes the command: release, then approve with the new one.
       await run(mock, "workgraph_override", { id, action: "release", reason: "wrong check" }, repo.dir);

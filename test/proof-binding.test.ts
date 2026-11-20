@@ -564,6 +564,10 @@ describe("the tree-binding gate", () => {
         gates: {
           "tree-binding": "pass",
           check: "pass",
+          // The diff guards: no test file changed, and no plan was approved.
+          "weakened-tests": "pass",
+          scope: "not-applicable",
+          "unproven-tests": "not-applicable",
           "criteria-evidence": "not-applicable",
           review: "pass",
         },
@@ -578,6 +582,9 @@ describe("the tree-binding gate", () => {
       expect(records.map((r) => [r.gate, r.result, r.blocked, r.tree])).toEqual([
         ["tree-binding", "pass", false, tree],
         ["check", "pass", false, tree],
+        ["weakened-tests", "pass", false, tree],
+        ["scope", "not-applicable", false, tree],
+        ["unproven-tests", "not-applicable", false, tree],
         ["criteria-evidence", "not-applicable", false, tree],
         ["review", "pass", false, tree],
       ]);
@@ -712,9 +719,14 @@ describe("the tree-binding gate", () => {
       expect(stamp).not.toHaveProperty("tree");
       expect(stamp).not.toHaveProperty("baseTree");
       expect(stamp).not.toHaveProperty("commit");
+      // The diff guards have no trees to compare: unknown, which for a
+      // guard never blocks, whatever its mode.
       expect(stamp!.gates).toEqual({
         "tree-binding": "unknown",
         check: "not-applicable",
+        "weakened-tests": "unknown",
+        scope: "unknown",
+        "unproven-tests": "unknown",
         "criteria-evidence": "not-applicable",
         review: "pass",
       });
@@ -858,9 +870,13 @@ describe("the tree-binding gate", () => {
         expect(metadata[key]).toBeUndefined();
       }
       expect(await latestStamp(repo.dir, id)).toBeUndefined();
-      expect((await listGateRecords(repo.dir, id)).map((r) => r.gate)).toEqual([
-        "criteria-evidence",
-        "review",
+      // The diff guards are still on, and with no tree each says so.
+      expect((await listGateRecords(repo.dir, id)).map((r) => [r.gate, r.result])).toEqual([
+        ["weakened-tests", "unknown"],
+        ["scope", "unknown"],
+        ["unproven-tests", "unknown"],
+        ["criteria-evidence", "not-applicable"],
+        ["review", "pass"],
       ]);
       expect(repo.git("for-each-ref", "refs/workgraph")).toBe("");
       const verdicts = await payloads(repo.dir, id, VERDICT_MARKER);
@@ -1102,7 +1118,14 @@ describe("a workspace that changes under judgment", () => {
       expect(fileAt(repo.dir, stamp!.tree!, "late.txt")).toBe("late\n");
       // No review ran, so the stamp rests on no verdict.
       expect(stamp).not.toHaveProperty("verdict");
-      expect(stamp!.gates).toEqual({ "tree-binding": "pass", check: "pass" });
+      expect(stamp!.gates).toEqual({
+        "tree-binding": "pass",
+        check: "pass",
+        // The diff guards run with the review gate off, as the check does.
+        "weakened-tests": "pass",
+        scope: "not-applicable",
+        "unproven-tests": "not-applicable",
+      });
       expect(stamp!.tree).toBe(treeOf(repo.dir));
       // The edit sent the issue back through the check as well: one receipt
       // for the tree first checked, one for the tree that was stamped.

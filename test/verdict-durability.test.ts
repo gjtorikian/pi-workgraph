@@ -241,13 +241,16 @@ describe("a failed verdict write never closes", () => {
         expect(await commentsStarting(graph.dir, id, "workgraph-lease judgment-closed ")).toEqual([]);
         // The review gate was never applied: its result is recorded only
         // once the verdict it rests on is durable. (The tree-binding and
-        // check gates are evaluated before the review and have their own
-        // records.)
+        // check gates and the diff guards are evaluated before the review
+        // and have their own records.)
         const records = await listGateRecords(graph.dir, id);
         expect(records.filter((r) => r.gate === "review")).toEqual([]);
         expect(records.map((r) => [r.gate, r.result])).toEqual([
           ["tree-binding", "pass"],
           ["check", "pass"],
+          ["weakened-tests", "pass"],
+          ["scope", "not-applicable"],
+          ["unproven-tests", "not-applicable"],
         ]);
         expect(heldLeases(graph.dir)).toHaveLength(0);
       } finally {

@@ -25,6 +25,7 @@
  * override tool bypasses phases entirely, always audited).
  */
 import { setMetadata, show, type MetadataValue } from "./store.ts";
+import { GUARD_GATES, type GuardGate } from "./policy.ts";
 import type { WorkIssue, WorkflowClassT, WorkgraphPhase } from "./types.ts";
 import {
   DEFAULT_WORKFLOW_CLASS,
@@ -36,9 +37,13 @@ import {
   WORKGRAPH_BASE_TREE_KEY,
   WORKGRAPH_CHECK_KEY,
   WORKGRAPH_CHECK_WAIVER_KEY,
+  WORKGRAPH_DECISION_GATE_KEY,
   WORKGRAPH_EXECUTOR_ID_KEY,
   WORKGRAPH_FAILURE_FINGERPRINT_KEY,
   WORKGRAPH_FINALIZED_TREE_KEY,
+  WORKGRAPH_GUARD_ALLOWED_BY_KEY,
+  WORKGRAPH_GUARD_ALLOWED_KEY,
+  WORKGRAPH_GUARD_ROUNDS_KEY,
   WORKGRAPH_LAST_VERDICT_KEY,
   WORKGRAPH_LIFECYCLE_VERSION_KEY,
   WORKGRAPH_PHASE_KEY,
@@ -303,6 +308,42 @@ export function checkWaiverOf(issue: WorkIssue): string | undefined {
 /** The digest of the bar frozen at the latest claim, if recorded. */
 export function barDigestOf(issue: WorkIssue): string | undefined {
   return bindingValue(issue, WORKGRAPH_BAR_DIGEST_KEY);
+}
+
+/**
+ * A guard key's value as a list of guard gates, each once, in the order
+ * written. "" (cleared), a non-string and any name that is not a guard gate
+ * read as nothing: a hand-written `review` in the list allows no gate.
+ */
+function guardList(issue: WorkIssue, key: string): GuardGate[] {
+  const raw = issue.metadata?.[key];
+  if (typeof raw !== "string") return [];
+  const gates: GuardGate[] = [];
+  for (const part of raw.split(",")) {
+    const gate = GUARD_GATES.find((candidate) => candidate === part.trim());
+    if (gate !== undefined && !gates.includes(gate)) gates.push(gate);
+  }
+  return gates;
+}
+
+/** The guards whose one revision round this issue has already spent. */
+export function guardRoundsOf(issue: WorkIssue): GuardGate[] {
+  return guardList(issue, WORKGRAPH_GUARD_ROUNDS_KEY);
+}
+
+/** The guards a human allowed for this issue. */
+export function guardAllowedOf(issue: WorkIssue): GuardGate[] {
+  return guardList(issue, WORKGRAPH_GUARD_ALLOWED_KEY);
+}
+
+/** Who gave the latest guard allowance, if recorded. */
+export function guardAllowedByOf(issue: WorkIssue): string | undefined {
+  return bindingValue(issue, WORKGRAPH_GUARD_ALLOWED_BY_KEY);
+}
+
+/** The guards the pending decision is about; empty for an executor's own question. */
+export function decisionGatesOf(issue: WorkIssue): GuardGate[] {
+  return guardList(issue, WORKGRAPH_DECISION_GATE_KEY);
 }
 
 // ---------------------------------------------------------------------------

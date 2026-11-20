@@ -161,6 +161,35 @@ export const WORKGRAPH_CHECK_WAIVER_KEY = "workgraph_check_waiver";
 export const WORKGRAPH_BAR_DIGEST_KEY = "workgraph_bar_digest";
 
 /**
+ * Diff-guard keys (`src/guards.ts`). The first two hold a comma-joined list
+ * of guard gate names; a cleared key holds "". They outlive a claim on
+ * purpose: a guard gets one revision round per issue, and a human's
+ * allowance covers the gate for the rest of the issue. Only an override
+ * release clears them.
+ */
+/** The guards whose one revision round was already spent on this issue. */
+export const WORKGRAPH_GUARD_ROUNDS_KEY = "workgraph_guard_rounds";
+/** The guards a human allowed for this issue (the answer `allow` to a guard question). */
+export const WORKGRAPH_GUARD_ALLOWED_KEY = "workgraph_guard_allowed";
+/** Who gave the latest allowance: the actor of that `workgraph_answer_decision` call. */
+export const WORKGRAPH_GUARD_ALLOWED_BY_KEY = "workgraph_guard_allowed_by";
+/**
+ * The guards a pending decision is about, written by the core with the
+ * question. It is what makes a question a guard question: an executor's own
+ * question clears it, so text that merely reads like a guard question can
+ * never turn the answer `allow` into an allowance.
+ */
+export const WORKGRAPH_DECISION_GATE_KEY = "workgraph_decision_gate";
+
+/** Every diff-guard key, for the one writer that clears them all (override release). */
+export const WORKGRAPH_GUARD_KEYS: readonly string[] = [
+  WORKGRAPH_GUARD_ROUNDS_KEY,
+  WORKGRAPH_GUARD_ALLOWED_KEY,
+  WORKGRAPH_GUARD_ALLOWED_BY_KEY,
+  WORKGRAPH_DECISION_GATE_KEY,
+];
+
+/**
  * The lifecycle phase union (README "Durable lifecycle metadata"). the store'
  * four native statuses stay untouched; this is workgraph semantics stored in
  * `workgraph_phase`. Legal edges live in `src/lifecycle.ts`'s LEGAL table.
@@ -389,16 +418,25 @@ export type BlockerRecheckT = Static<typeof BlockerRecheck>;
 // completion carries a `plan` field on the non-strict RunCompleted schema, and
 // `src/plan.ts` validates it before the plan is persisted or handed to the
 // implementer. Deliberately thin — the plan is EVIDENCE the implementer reads,
-// never something the core interprets. The core's only structural interest is
-// the acceptance criteria the planner refined, because the judgment gate
-// reviews against them.
+// and the core does not interpret its steps. The core reads two things: the
+// acceptance criteria the planner refined, because the judgment gate reviews
+// against them, and the file paths among a step's `targets`, which the
+// `scope` guard compares the change with once a human approved the plan
+// (`src/guards.ts`).
 // ---------------------------------------------------------------------------
 
 export const PlanStep = Type.Object({
   /** One bounded unit of implementation work, in order. */
   description: Type.String(),
-  /** Files/symbols the step is expected to touch (advisory, never enforced). */
-  targets: Type.Optional(Type.Array(Type.String())),
+  /** What the step is expected to change. Entries that read as file paths
+   *  are what the `scope` guard holds an approved plan to; symbol names are
+   *  ignored. */
+  targets: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Repository-relative file paths this step expects to change (a directory covers everything under it).",
+    }),
+  ),
   /** Why this step exists — the rationale the implementer would otherwise
    *  have to re-derive. */
   rationale: Type.Optional(Type.String()),

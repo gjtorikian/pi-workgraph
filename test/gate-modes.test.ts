@@ -1114,9 +1114,11 @@ describe("gate report", () => {
         "check: 0 blocked, 0 would block",
         // Evaluated for both, and it applies to neither: no criteria.
         "criteria-evidence: 0 blocked, 0 would block",
-        "weakened-tests: no records",
-        "unproven-tests: no records",
-        "scope: no records",
+        // The diff guards, evaluated for both: nothing here weakens a test,
+        // adds one, or has an approved plan to leave.
+        "weakened-tests: 0 blocked, 0 would block",
+        "unproven-tests: 0 blocked, 0 would block",
+        "scope: 0 blocked, 0 would block",
       ]);
 
       // Narrowed to one issue.

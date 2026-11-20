@@ -137,7 +137,9 @@ export interface WorkgraphConfig {
    * The repository's check settings, from the `workgraph.check` key of Pi
    * settings (there is no flag): `command` is the check run for every issue
    * that names none of its own, `timeoutMs` bounds any check (default 10
-   * minutes), `setup` is accepted for a later release. Validated by
+   * minutes), `setup` prepares a throwaway worktree of a base tree before a
+   * check runs there, and `testGlobs` replaces the default globs that say
+   * which files are tests (`src/guards.ts`). Validated by
    * `validateCheckSettings`, which throws on an unknown key or a bad value.
    */
   check?: CheckSettings;

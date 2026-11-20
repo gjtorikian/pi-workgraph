@@ -58,10 +58,15 @@ import {
   renewLease,
   untrackLease,
 } from "./lease.ts";
+import { GUARD_ALLOW_ANSWER } from "./guards.ts";
 import {
   attemptOf,
   checkOf,
   checkWaiverOf,
+  decisionGatesOf,
+  guardAllowedByOf,
+  guardAllowedOf,
+  guardRoundsOf,
   isLifecycleV1,
   lastVerdictOf,
   phaseOf,
@@ -77,6 +82,7 @@ import { latestPlan, renderPlanForReview } from "./plan.ts";
 import {
   DEFAULT_RISK_TIER,
   GATES,
+  GUARD_GATES,
   resolvePolicy,
   type GateName,
 } from "./policy.ts";
@@ -119,8 +125,12 @@ import {
   WORKGRAPH_CHECK_KEY,
   WORKGRAPH_CHECK_WAIVER_KEY,
   WORKGRAPH_DECISION_ANSWER_KEY,
+  WORKGRAPH_DECISION_GATE_KEY,
   WORKGRAPH_DECISION_QUESTION_KEY,
   WORKGRAPH_EXECUTOR_ID_KEY,
+  WORKGRAPH_GUARD_ALLOWED_BY_KEY,
+  WORKGRAPH_GUARD_ALLOWED_KEY,
+  WORKGRAPH_GUARD_KEYS,
   WORKGRAPH_PHASE_KEY,
   WORKGRAPH_TREE_BINDING_KEYS,
   WORKGRAPH_PLAN_APPROVED_KEY,
@@ -172,11 +182,20 @@ function gateResultLine(record: GateRecord): string {
 /**
  * One line of `workgraph_gates`: the issues a gate blocked and would have
  * blocked, then (only when there are any) the issues a human waived it for,
- * each with its reason. A gate with no waiver keeps the two-column line.
+ * each with its reason, and the issues a diff guard could not decide. A
+ * gate with neither keeps the two-column line.
+ *
+ * `unknown` is listed for the diff guards only. For every other gate an
+ * `unknown` blocks, so the first two columns already count it; for a guard
+ * it never does, and this is the one place a blind guard shows.
  */
 function gateReportLine(gate: GateName, summary: GateSummary): string {
   if (summary.records === 0) return `${gate}: no records`;
   const list = (ids: string[]): string => (ids.length > 0 ? ` (${ids.join(", ")})` : "");
+  const unknown =
+    summary.unknown.length > 0 && GUARD_GATES.some((guard) => guard === gate)
+      ? `, ${summary.unknown.length} unknown${list(summary.unknown)}`
+      : "";
   const waived =
     summary.waived.length > 0
       ? `, ${summary.waived.length} not applicable, waived (${summary.waived
@@ -185,7 +204,7 @@ function gateReportLine(gate: GateName, summary: GateSummary): string {
       : "";
   return (
     `${gate}: ${summary.blocked.length} blocked${list(summary.blocked)}, ` +
-    `${summary.wouldBlock.length} would block${list(summary.wouldBlock)}${waived}`
+    `${summary.wouldBlock.length} would block${list(summary.wouldBlock)}${waived}${unknown}`
   );
 }
 
@@ -698,11 +717,13 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
       // A released issue starts over: its next run must not inherit the
       // previous one's workspace, base or result tree. This is the one
       // place those keys are cleared — a re-claim, a promotion and a
-      // re-approval all keep the base on purpose (`src/snapshot.ts`).
+      // re-approval all keep the base on purpose (`src/snapshot.ts`). The
+      // diff-guard keys go with them: a spent revision round and a human's
+      // allowance both belong to the work that was just given up.
       await unsetMetadata(
         ctx.cwd,
         params.id,
-        [...WORKGRAPH_TREE_BINDING_KEYS],
+        [...WORKGRAPH_TREE_BINDING_KEYS, ...WORKGRAPH_GUARD_KEYS],
         actor.bdActor,
       );
       if (resetsPhase) {
@@ -731,10 +752,13 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     description:
       "Answer the question a run of this issue parked for a human (phase escalated, decision pending). " +
       "Records the answer, audits it, and clears the block; then workgraph_approve resumes the issue and " +
-      "every later run receives the question and the answer.",
+      "every later run receives the question and the answer. " +
+      "When the question comes from a diff guard (weakened-tests, unproven-tests, scope), the exact answer allow " +
+      "accepts the change: that guard passes for the rest of the issue. Any other answer is carried as instructions and the guard still applies.",
     promptSnippet: "Answer a parked decision request on a work-graph issue",
     promptGuidelines: [
       "When workgraph_approve refuses an escalated issue because it needs a human decision, read the question with workgraph_status, get the human's answer, call workgraph_answer_decision with it, then approve again.",
+      "Answer allow to a diff-guard question only when the human said to accept the change it names; never choose allow yourself to get work through.",
     ],
     parameters: AnswerDecisionParams,
     executionMode: "sequential",
@@ -750,6 +774,17 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
         throw new Error(`${params.id} has no pending decision request.`);
       }
       const question = metadata[WORKGRAPH_DECISION_QUESTION_KEY];
+      // A guard question is one the CORE marked with the gates it is about.
+      // The text of the question decides nothing: an executor can write a
+      // question that reads like a guard's, and its answer must never
+      // switch a guard off.
+      const guards = decisionGatesOf(cur);
+      const allows =
+        guards.length > 0 &&
+        params.answer.trim().toLowerCase() === GUARD_ALLOW_ANSWER;
+      const allowed = allows
+        ? [...new Set([...guardAllowedOf(cur), ...guards])]
+        : [];
       // Audit FIRST, as override does: a half-applied answer must still be visible.
       await recordLeaseEvent(
         ctx.cwd,
@@ -759,6 +794,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
           decisionId: metadata.workgraph_decision_id,
           question,
           answer: params.answer,
+          ...(guards.length > 0 ? { gates: guards, allowed: allows } : {}),
           actor: identitySnapshot(actor),
         },
         actor.bdActor,
@@ -770,12 +806,33 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
           workgraph_decision_pending: false,
           [WORKGRAPH_DECISION_ANSWER_KEY]: params.answer,
           workgraph_decision_answered_at: new Date().toISOString(),
+          // Answered: the next question starts unmarked.
+          [WORKGRAPH_DECISION_GATE_KEY]: "",
+          // The allowance and who gave it, in the same write as the answer.
+          ...(allows
+            ? {
+                [WORKGRAPH_GUARD_ALLOWED_KEY]: allowed.join(","),
+                [WORKGRAPH_GUARD_ALLOWED_BY_KEY]: actor.bdActor,
+              }
+            : {}),
         },
         actor.bdActor,
       );
+      // Say which of the two happened: `"allow"` in quotes or `Allow.` is
+      // not the answer, and a human who meant it should learn that now.
+      const outcome = allows
+        ? ` Allowed ${guards.join(", ")}: from the next run on, that guard records these changes as accepted for this issue.`
+        : guards.length > 0
+          ? ` The answer was not exactly "${GUARD_ALLOW_ANSWER}", so ${guards.join(", ")} still applies: the next run receives the answer as instructions, and another violation parks the issue again.`
+          : "";
       return textResult(
-        `Answered the decision on ${params.id}. Re-approve it with workgraph_approve; every later run receives the question and this answer.`,
-        { id: params.id, question: question ?? null },
+        `Answered the decision on ${params.id}.${outcome} Re-approve it with workgraph_approve; every later run receives the question and this answer.`,
+        {
+          id: params.id,
+          question: question ?? null,
+          guards,
+          allowed: allows,
+        },
       );
     },
   });
@@ -885,6 +942,17 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
       } else if (typeof metadata[WORKGRAPH_DECISION_ANSWER_KEY] === "string") {
         lines.push(`Decision answered: ${question} → ${metadata[WORKGRAPH_DECISION_ANSWER_KEY]}`);
       }
+      // The diff guards a human allowed for this issue, and the ones whose
+      // one revision round is spent (the next violation asks a human).
+      const guardsAllowed = guardAllowedOf(issue);
+      if (guardsAllowed.length > 0) {
+        const by = guardAllowedByOf(issue);
+        lines.push(`Guards allowed: ${guardsAllowed.join(", ")}${by !== undefined ? ` (by ${by})` : ""}`);
+      }
+      const guardsSpent = guardRoundsOf(issue).filter((gate) => !guardsAllowed.includes(gate));
+      if (guardsSpent.length > 0) {
+        lines.push(`Guard revision round spent: ${guardsSpent.join(", ")}`);
+      }
       const holder = leaseHolderOf(issue);
       if (holder) {
         lines.push(
@@ -918,6 +986,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     description:
       "Report what the proof gates did: for each gate, the issues it blocked (mode enforce) and the issues it would have blocked (mode observe). " +
       "A gate that is off records nothing. Work whose check was waived is listed under check as not applicable, with the waiver reason. " +
+      "A diff guard (weakened-tests, unproven-tests, scope) also lists the issues it could not decide as unknown: a guard that is blind in this repository shows there. " +
       "Pass an id to narrow the report to one issue.",
     promptSnippet: "Report which gates blocked work, or would have",
     promptGuidelines: [

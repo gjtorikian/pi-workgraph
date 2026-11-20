@@ -27,8 +27,16 @@
  *
  * FAILURE. Every function throws when git fails ({@link isGitWorkspace} and
  * {@link fileAt} report failure as `false` / `undefined` instead); callers
- * turn a throw into `tree-binding: unknown`. Each call is synchronous and
- * bounded at 20 seconds, so callers keep these out of retry loops.
+ * turn a throw into `tree-binding: unknown`, or into a diff guard's
+ * `unknown`. Each call is synchronous and bounded at 20 seconds, so callers
+ * keep these out of retry loops.
+ *
+ * THE DIFF GUARDS (`src/guards.ts`) read two more things from here: the
+ * lines a change added to a set of files ({@link addedLines}), and a
+ * throwaway checkout of a commit to run a command in
+ * ({@link withWorktree}). A worktree is created under the OS temp directory
+ * and removed when the work is done, whatever happened in it; a process
+ * killed in between leaves an entry that `git worktree prune` clears.
  */
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -38,6 +46,8 @@ import {
   mkdtempSync,
   realpathSync,
   rmSync,
+  statSync,
+  utimesSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
@@ -55,6 +65,14 @@ export interface ChangedFile {
   path: string;
   /** The path before a rename (`status: "R"` only). */
   oldPath?: string;
+}
+
+/** One line a change added to a file. */
+export interface AddedLine {
+  /** The file's path in the result tree. */
+  file: string;
+  /** The line as added, without the diff's leading `+`. */
+  text: string;
 }
 
 /** Namespace of every ref this module creates. */
@@ -158,7 +176,16 @@ export function treeOf(path: string): string {
   try {
     // A repository with no commits and nothing staged has no index file;
     // git then creates the temporary one from nothing.
-    if (existsSync(realIndex)) copyFileSync(realIndex, tempIndex);
+    if (existsSync(realIndex)) {
+      copyFileSync(realIndex, tempIndex);
+      // The copy keeps the original's modification time. Git trusts a
+      // file's cached stat only when the file was last changed BEFORE the
+      // index was written; a copy stamped "now" would make every entry look
+      // settled, and a same-size edit made in the second the index was
+      // written would be read as no change at all.
+      const { atime, mtime } = statSync(realIndex);
+      utimesSync(tempIndex, atime, mtime);
+    }
     const env = { GIT_INDEX_FILE: tempIndex };
     git(path, ["add", "-A"], env);
     return git(path, ["write-tree"], env);
@@ -296,6 +323,154 @@ export function fileAt(
   } catch {
     return undefined;
   }
+}
+
+/** The path on a diff's `+++ ` line, or undefined for `/dev/null`. */
+function diffHeaderPath(raw: string): string | undefined {
+  // git ends the line with a tab when the name holds a space.
+  let name = raw.endsWith("\t") ? raw.slice(0, -1) : raw;
+  if (name.startsWith('"')) {
+    // A name with a quote, a backslash or a control character is C-quoted.
+    try {
+      name = JSON.parse(name) as string;
+    } catch {
+      /* keep it as printed */
+    }
+  }
+  if (name === "/dev/null") return undefined;
+  return name.startsWith("b/") ? name.slice(2) : name;
+}
+
+/**
+ * The lines `tree` added to `files`, compared with `baseTree`. `files` are
+ * paths from the tree's root, taken literally (a `[` in a path is not a
+ * glob); pass both paths of a rename so its diff is the edit and not the
+ * whole file. A file that is new in `tree` has every line added; a binary
+ * file has none. Empty when `files` is.
+ *
+ * Throws when git fails, the argument list is too long for the OS, or the
+ * diff is larger than 16 MiB.
+ */
+export function addedLines(
+  path: string,
+  baseTree: string,
+  tree: string,
+  files: readonly string[],
+): AddedLine[] {
+  assertWorkspacePath(path);
+  if (files.length === 0) return [];
+  // The flags pin the output against user configuration: no color, no
+  // external diff or textconv filter, fixed `a/` and `b/` prefixes, names
+  // unquoted. Not trimmed: an added line may end in whitespace.
+  const out = execFileSync(
+    "git",
+    [
+      "-c",
+      "core.quotePath=false",
+      "--literal-pathspecs",
+      "diff",
+      "-U0",
+      "-M",
+      "--no-color",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--src-prefix=a/",
+      "--dst-prefix=b/",
+      baseTree,
+      tree,
+      "--",
+      ...files,
+    ],
+    {
+      cwd: path,
+      encoding: "utf8",
+      timeout: GIT_TIMEOUT_MS,
+      env: gitEnv(),
+      stdio: ["ignore", "pipe", "pipe"],
+      maxBuffer: MAX_FILE_BYTES,
+    },
+  );
+  // Read by hunk, not by prefix. With no context lines every line of a hunk
+  // starts with `+`, `-` or a backslash, so `diff --git` can only open the
+  // next file, and the `+++ ` header appears only before a file's first
+  // `@@`. An added line whose own text starts with `++` is therefore kept.
+  const added: AddedLine[] = [];
+  let file: string | undefined;
+  let inHeader = true;
+  for (const line of out.split("\n")) {
+    if (line.startsWith("diff --git ")) {
+      file = undefined;
+      inHeader = true;
+    } else if (inHeader) {
+      if (line.startsWith("+++ ")) file = diffHeaderPath(line.slice(4));
+      else if (line.startsWith("@@")) inHeader = false;
+    } else if (line.startsWith("+") && file !== undefined) {
+      added.push({ file, text: line.slice(1) });
+    }
+  }
+  return added;
+}
+
+/** Stops `git worktree add` and `git checkout` from running the repository's hooks. */
+const NO_HOOKS = ["-c", "core.hooksPath=/dev/null"];
+
+/**
+ * Run `fn` in a detached worktree of `commit`, and always remove the
+ * worktree afterwards. The worktree is a fresh checkout under the OS temp
+ * directory: tracked files only, nothing ignored, nothing installed.
+ * Rejects when the worktree cannot be created, or with whatever `fn`
+ * rejects with. A removal that fails is logged and never rejects.
+ */
+export async function withWorktree<T>(
+  repo: string,
+  commit: string,
+  fn: (path: string) => Promise<T>,
+): Promise<T> {
+  assertWorkspacePath(repo);
+  const parent = mkdtempSync(join(tmpdir(), "pi-workgraph-worktree-"));
+  const worktree = join(parent, "tree");
+  let created = false;
+  try {
+    git(repo, [...NO_HOOKS, "worktree", "add", "--detach", worktree, commit]);
+    created = true;
+    return await fn(worktree);
+  } finally {
+    if (created) {
+      try {
+        git(repo, ["worktree", "remove", "--force", worktree]);
+      } catch (e) {
+        // Logged, not pruned: `git worktree prune` would also drop the
+        // user's own stale entries, which are not this module's to touch.
+        const msg = e instanceof Error ? e.message.split("\n")[0] : String(e);
+        console.error(
+          `[pi-workgraph] could not remove the worktree ${worktree}: ${msg}; \`git worktree prune\` clears its entry`,
+        );
+      }
+    }
+    // The directory goes either way; it is under the OS temp directory.
+    rmSync(parent, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Bring `files` in `worktree` to what they are in `treeish` (a commit or a
+ * tree), leaving every other file as it is. Paths are taken literally.
+ * Throws when git fails.
+ */
+export function checkoutPaths(
+  worktree: string,
+  treeish: string,
+  files: readonly string[],
+): void {
+  if (files.length === 0) return;
+  git(worktree, [
+    ...NO_HOOKS,
+    "--literal-pathspecs",
+    "checkout",
+    treeish,
+    "--",
+    ...files,
+  ]);
 }
 
 function realOr(path: string): string {

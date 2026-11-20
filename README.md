@@ -430,11 +430,11 @@ assignee writes are how leases get corrupted.
 | `workgraph_heartbeat`       | Renew the leases this worker holds (verifies the fencing epoch, pushes `lease_expires_at` forward)            |
 | `workgraph_approve`         | Approve a draft/legacy/escalated issue: acceptance criteria, check command or waiver, workflow class, risk tier, phase `ready` |
 | `workgraph_approve_plan`    | Approve a recorded plan (implement it next) or reject it with feedback (plan again)                           |
-| `workgraph_answer_decision` | Answer the question a run parked for a human; re-approve, and every later run of the issue carries the answer |
+| `workgraph_answer_decision` | Answer the question a run or a diff guard parked for a human (`allow` accepts a guard's violation); re-approve, and every later run carries the answer |
 | `workgraph_tiers`           | Set or show per-role model tiers for this repository (a role → model table, or clear)                         |
 | `workgraph_override`        | Explicit human override: force-close or force-release, bypassing guards — always audited                      |
 | `workgraph_status`          | One issue's full control-plane state: phase, plan, lease, attempt, verdict and its review context, gate modes and results, criteria, check |
-| `workgraph_gates`           | Per gate, the issues it blocked, would have blocked, and was waived for; `id` narrows the report to one issue |
+| `workgraph_gates`           | Per gate, the issues it blocked, would have blocked, was waived for, and (diff guards) could not decide; `id` narrows the report |
 
 The in-session executor adds `workgraph_submit_plan`, valid only during a
 planning turn. `/workgraph init [prefix]` and `/workgraph tiers` are the
@@ -479,14 +479,14 @@ of seven gates a mode, per risk tier.
 | `tree-binding`      | The work has a base tree and a result tree, and the verdict and the close name the result |
 | `check`             | The check command, run by the coordinator itself, exited 0 on the result tree         |
 | `criteria-evidence` | The verdict answers every numbered acceptance criterion as met, with evidence         |
-| `weakened-tests`    | The change deletes no tests and skips none                                            |
-| `unproven-tests`    | Every new test fails without the change                                               |
-| `scope`             | The change stays inside the approved plan's path targets                              |
+| `weakened-tests`    | The change deletes no test file and adds no skip marker                               |
+| `unproven-tests`    | The new and changed tests fail on the base without the change                         |
+| `scope`             | The change stays inside the approved plan's file paths                                |
 
-`review`, `tree-binding`, `check` and `criteria-evidence` are evaluated in
-this release. The other three are already part of the policy, so a policy
-written today keeps working as each gate gains its evaluation. Until then
-they record nothing, whatever their mode.
+All seven are evaluated. The last three are the
+[diff guards](#diff-guards): they read the difference between the base
+tree and the result tree, and they are the only gates whose `unknown`
+result never blocks.
 
 Each gate has one of three modes:
 
@@ -522,7 +522,8 @@ medium and high).
 With `review` set to `off`, no reviewer is asked and reviewed work closes
 on the implementer's reported success alone; a reported failure escalates.
 `criteria-evidence` is not evaluated either, whatever its mode: it reads a
-verdict's answers, and there is no verdict.
+verdict's answers, and there is no verdict. The check and the diff guards
+still run: they come before the review and need none.
 `workgraph_status` shows `review=off` on every issue the mode applies to.
 
 **An invalid policy stops dispatch.** An unknown tier, key, gate, or mode
@@ -548,14 +549,18 @@ graph, one line per gate:
 ```text
 review: 1 blocked (bdx-003), 2 would block (bdx-001, bdx-004)
 check: 1 blocked (bdx-005), 0 would block, 1 not applicable, waived (bdx-007: docs only, nothing to run)
+unproven-tests: 1 blocked (bdx-006), 0 would block, 2 unknown (bdx-002, bdx-008)
 scope: no records
 ```
 
 An issue counts as blocked if the gate ever blocked it, even when a later
 revision passed. Work whose check was waived is listed under `check` with
 the waiver's reason; a gate nobody waived shows only the first two
-columns. `workgraph_status` prints the modes that apply to one issue and
-each gate's latest result on it.
+columns. A diff guard also lists the issues it could not decide, as
+`unknown`: that never blocks, so this column is where a guard that is
+blind in your repository shows (most often `unproven-tests` with no
+`check.setup`). `workgraph_status` prints the modes that apply to one
+issue and each gate's latest result on it.
 
 **The verdict record has no mode.** If a reviewer's verdict cannot be
 written to the issue, the run escalates with the write failure as the
@@ -688,9 +693,10 @@ executes model work; a shell command with an exit code is not model work.
 - Per repository: `"workgraph": { "check": { "command": "npm test" } }` in
   `.pi/settings.json` (or `~/.pi/agent/settings.json`). It applies to every
   issue with no check of its own. `timeoutMs` in the same block bounds any
-  check (default 600000, ten minutes). There is no flag for it. `setup` is
-  accepted and reserved for a later release. An unknown key or a bad value
-  in the block is an error that stops dispatch, as an invalid policy does.
+  check (default 600000, ten minutes). There is no flag for it. `setup`
+  and `testGlobs` in the same block belong to the
+  [diff guards](#diff-guards). An unknown key or a bad value in the block
+  is an error that stops dispatch, as an invalid policy does.
 
 An issue's own check wins over the repository's. `workgraph_status` prints
 `Check: <command>`, with `(repository default)` when that is where it
@@ -936,6 +942,104 @@ context: fresh` under the last verdict. It is recorded, not enforced: no
 policy rejects a review for its context, and like the rest of provenance
 it is the executor's own report.
 
+### Diff guards
+
+A check and a review both judge the change against a bar. Three guards
+stop the implementer from moving the bar instead. Each reads the
+difference between the run's base tree and its result tree
+([Tree binding](#tree-binding)), after the check and before any reviewer
+is asked.
+
+| Guard            | Violation                                                                                   | Never a violation                                                                 |
+| ---------------- | ------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `weakened-tests` | A test file was deleted, or a line added to a test file holds a skip marker                 | A test file that was renamed and is still a test; a marker that was already there |
+| `unproven-tests` | The new and changed test files, applied to the base on their own, still pass the check      | A change that touches no test file; work with no check                            |
+| `scope`          | A changed file is not covered by the file paths of the plan a human approved                | Test files; a lockfile beside a changed manifest; anything under `.workgraph/`    |
+
+**Which files are tests.** A file whose path matches one of these globs:
+`**/*.test.*`, `**/*.spec.*`, `**/*_test.*`, `**/test_*.py`, `**/test/**`,
+`**/tests/**`, `**/__tests__/**`. Everything under a `test/` directory
+counts, helpers and fixtures included. A repository with other
+conventions sets `"workgraph": { "check": { "testGlobs": ["spec/**"] } }`,
+which **replaces** the list. `**` crosses directories, `*` and `?` do not,
+and a glob with no `/` matches a file name at any depth.
+
+**Skip markers.** The common forms across runners: a test, suite or bench
+switched off with `skip`, a `todo` placeholder, a suite narrowed with
+`only`, the `xit` and `xdescribe` aliases, `@pytest.mark.skip`,
+`@unittest.skip`, Go's `t.Skip`, Rust's `#[ignore]`, JUnit's `@Disabled`
+and `@Ignore`. Only lines the change **added** are read. An assertion
+loosened without a marker is not detected; the reviewer and
+`unproven-tests` are the other lines of defense.
+
+**Unproven tests.** The coordinator checks out the base in a throwaway git
+worktree, takes only the added and modified test files from the result,
+and runs the check there. If it passes, those tests pass without the
+change and prove nothing about it. If it exits non-zero, they depend on
+the change. This never parses the check command, so it works with any
+test runner. Two consequences:
+
+- Any edit to a test that does not make it fail on the base is a
+  violation, including a pure refactor or a comment. That is what `allow`
+  is for (below).
+- A fresh worktree has no installed dependencies. Set `"workgraph": {
+  "check": { "setup": "npm ci" } }` to a command that prepares one; it runs
+  before the first check in every such worktree, bounded by `timeoutMs`.
+  Without it the check usually fails on the base, the guard records
+  `unknown`, and it never fires.
+
+**Scope.** The guard reads the plan's `targets` that look like file paths:
+no whitespace, no parenthesis, and either a `/` or a file extension.
+Symbol names are ignored. A path names a file, a directory (everything
+under it), or with a `*` a glob. It applies only when a human approved the
+plan at the plan gate. Reviewed work, a plan accepted under `planApproval:
+"auto"`, and a plan that names no file path all record `not-applicable`.
+A recorded plan keeps at most 20 targets per step.
+
+**A red base.** When the check fails on the result, the coordinator runs
+it on the base tree as well, once per tree and command. If the base fails
+too, no revision could fix it: the issue escalates with `the check already
+fails on the base tree`, and no revision is requested. With no
+`check.setup`, a check that needs installed dependencies fails on every
+base this way; the escalation says so. Check results on a base tree are
+kept as `workgraph-proof base-receipt` comments, apart from the receipts a
+close rests on.
+
+**One revision round, then a human.** A violation under `enforce` is a
+blocking finding the coordinator wrote itself. The implementer gets one
+revision round to fix it. That round is outside `maxRevisions`, and each
+guard gets one per issue. If the same guard still finds a violation on the
+next tree, the issue parks with a question:
+
+```text
+The weakened-tests guard still finds a violation after one revision round (weakened-tests: test files deleted: test/legacy.test.ts). Reply "allow" to accept these changes, or describe what to change.
+```
+
+Answer it with `workgraph_answer_decision`, then approve again:
+
+- The exact answer `allow` accepts the change. That guard records `pass`,
+  `allowed by <who answered>` and the files, for the rest of the issue.
+  It covers the gate, not one file: a later, different violation of the
+  same guard on the same issue passes too.
+- Any other answer goes to the next run as instructions, and the guard
+  still applies. A planned issue plans again after re-approval, as it does
+  after any escalation.
+
+Only a question the coordinator asked can be answered this way. A question
+an executor parks is never a guard question, whatever its text says.
+`workgraph_override` with `release` clears the spent rounds and the
+allowances.
+
+**When a guard cannot tell.** No result tree, a diff git cannot produce, a
+red base, a failed setup command, a check that timed out on the base: each
+records `unknown` with the reason and blocks nothing. Under `observe` a
+violation is recorded as a would-block and the work goes on. `off` skips
+the guard. One-shot work is not guarded.
+
+A coordinator killed while a worktree exists leaves an entry behind;
+`git worktree prune` clears it. The worktree runs are POSIX only, like the
+check.
+
 ### The frozen bar
 
 Pi settings are read from a file inside the checkout on every lookup, and
@@ -947,7 +1051,9 @@ that copy until the claim ends:
 - the risk tier,
 - the gate modes, `maxRevisions` and `requireAuthorIndependence` for it,
 - the acceptance criteria,
-- the check command and its timeout, or the waiver.
+- the check command and its timeout, or the waiver,
+- the setup command and the test globs,
+- the file paths of the approved plan, when the claim implements one.
 
 The bar is recorded as a `bar-frozen` audit event, with its sha256 in
 `workgraph_bar_digest`. A restarted coordinator rebuilds the bar from that
@@ -1196,8 +1302,10 @@ the recorded result tree and was snapshotted again), `bar-frozen` (the bar
 a run is judged against, captured at claim), `bar-changed` (the issue or
 the settings no longer match it; the run keeps the frozen bar),
 `recheck-failed` (a second look at a reviewer's blocking findings could
-not be obtained, with the reason; the blockers stand),
-`escalated`, and `judgment-closed`. A `run-completed` event for an implementation or a
+not be obtained, with the reason; the blockers stand), `decision-needed`
+(a run, or a diff guard, parked a question for a human; a guard's names
+its `gates`), `decision-answered` (with `allowed` when the answer accepted
+a guard's violation), `escalated`, and `judgment-closed`. A `run-completed` event for an implementation or a
 revision carries `workspacePath` and, when a snapshot was taken, its
 `tree`; a restarted coordinator rebuilds the run from it.
 Audit writes never block lease operations: the protocol stays correct
@@ -1268,9 +1376,15 @@ issue metadata:
 | `workgraph_check`               | The issue's check command, a string (see [The check](#the-check))                                                           |
 | `workgraph_check_waiver`        | Why no check applies to the issue, in the approver's words; never set together with `workgraph_check`                       |
 | `workgraph_bar_digest`          | The sha256 of the bar frozen at the latest claim (see [The frozen bar](#the-frozen-bar))                                    |
+| `workgraph_guard_rounds`        | The [diff guards](#diff-guards) whose one revision round is spent on this issue, comma-joined                               |
+| `workgraph_guard_allowed`       | The diff guards a human allowed for this issue, comma-joined                                                                |
+| `workgraph_guard_allowed_by`    | Who gave the latest allowance                                                                                               |
+| `workgraph_decision_gate`       | The diff guards a pending decision is about; empty for a question an executor asked                                         |
 
-The seven tree keys and the three check keys are scalar strings (see
-[Tree binding](#tree-binding)). A cleared key holds an empty string.
+The seven tree keys, the three check keys and the four guard keys are
+scalar strings (see [Tree binding](#tree-binding)). A cleared key holds an
+empty string. The guard keys outlive a claim; only an override release
+clears them.
 
 ### 2. State transitions
 
@@ -1402,11 +1516,14 @@ Four rules the code enforces, each with a reason:
   Silently implementing without the plan would look identical to success
   while being the exact thing the operator wanted to prevent. Recover via
   re-approve, as with any escalation.
-- **A plan is evidence, not authority.** The core never interprets steps or
-  enforces `targets`, and a planner's refined `acceptanceCriteria` is
-  recorded in the plan trail rather than overwriting the approved criteria
-  on the issue — a planner that could rewrite its own bar would defeat the
-  judgment gate. The same holds for a
+- **A plan is evidence, not authority.** The core never interprets steps,
+  and a planner's refined `acceptanceCriteria` is recorded in the plan
+  trail rather than overwriting the approved criteria on the issue — a
+  planner that could rewrite its own bar would defeat the judgment gate.
+  The one thing the core reads is the file paths among a plan's `targets`,
+  and only once a human approved the plan: the `scope`
+  [diff guard](#diff-guards) holds the change to them. Planner prompts ask
+  for repository-relative paths for that reason. The same holds for a
   [plan critique](#plan-critique-optional): its gaps are recorded beside
   the plan for the human at the gate, the core never acts on them, and the
   implementer's request does not carry them.

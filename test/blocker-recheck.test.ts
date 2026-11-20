@@ -879,8 +879,9 @@ describe("the blocker recheck in the judgment loop", () => {
 
   it("a blocker the core wrote is never rechecked: a failed check goes straight to revision", async () => {
     const t = setUp("brcode", [{ verdict: CLEAN }], {
-      // Fails until the revision writes the file it tests for.
-      check: "test -f fixed.txt",
+      // Passes on the base tree, fails on the implementer's (which holds
+      // ten.txt) until the revision writes the file it tests for.
+      check: "test ! -f ten.txt || test -f fixed.txt",
       revision: {
         onRequest: (request) => writeFileSync(join(request.workspace.path!, "fixed.txt"), "fixed\n"),
       },

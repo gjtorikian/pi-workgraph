@@ -25,11 +25,13 @@
  * it is how one issue opts out of it.
  *
  * THE BAR ({@link Bar}) is everything a run is judged against: the risk
- * tier, the resolved gate policy, the acceptance criteria and the check or
- * its waiver. The coordinator captures it when it claims the issue and uses
- * only that copy until the claim ends, because settings are read from a file
- * inside the checkout on every lookup and an implementer could otherwise
- * edit what it is judged against (decision log).
+ * tier, the resolved gate policy, the acceptance criteria, the check or its
+ * waiver, and what the diff guards read (`src/guards.ts`): the setup
+ * command, the test-file globs and the approved plan's file paths. The
+ * coordinator captures it when it claims the issue and uses only that copy
+ * until the claim ends, because settings are read from a file inside the
+ * checkout on every lookup and an implementer could otherwise edit what it
+ * is judged against (decision log).
  *
  * POSIX only: the group kill and `shell: true` assume `sh`.
  */
@@ -371,9 +373,14 @@ export interface CheckSettings {
   command?: string;
   /** How long any check may run, in milliseconds (default {@link DEFAULT_CHECK_TIMEOUT_MS}). */
   timeoutMs?: number;
-  /** A command that prepares a fresh worktree for the check. Accepted and
-   *  validated here; nothing runs it yet. */
+  /** A command that prepares a fresh worktree for the check (install
+   *  dependencies, build). The core runs it before the first check in every
+   *  throwaway worktree of a base tree; the check in the implementer's own
+   *  workspace never needs it. */
   setup?: string;
+  /** Globs naming the repository's test files. Replaces the defaults
+   *  (`DEFAULT_TEST_GLOBS` in `src/guards.ts`); never extends them. */
+  testGlobs?: string[];
 }
 
 /** Thrown when the `check` settings block does not validate. The message names the key. */
@@ -384,7 +391,7 @@ export class CheckConfigError extends Error {
   }
 }
 
-const CHECK_SETTINGS_KEYS = ["command", "timeoutMs", "setup"] as const;
+const CHECK_SETTINGS_KEYS = ["command", "timeoutMs", "setup", "testGlobs"] as const;
 
 /** The largest delay a timer accepts. */
 const MAX_TIMEOUT_MS = 2_147_483_647;
@@ -431,6 +438,22 @@ export function validateCheckSettings(raw: unknown): CheckSettings {
           );
         }
         settings.timeoutMs = value;
+        break;
+      case "testGlobs":
+        // An empty list would make every file a non-test and switch two
+        // guards off without a word, so it is an error, not "no tests".
+        if (
+          !Array.isArray(value) ||
+          value.length === 0 ||
+          value.some((glob) => typeof glob !== "string" || glob.trim() === "")
+        ) {
+          throw new CheckConfigError(
+            `check.testGlobs must be a non-empty array of glob strings, got ${
+              Array.isArray(value) && value.length === 0 ? "an empty array" : described(value)
+            }`,
+          );
+        }
+        settings.testGlobs = (value as string[]).map((glob) => glob.trim());
         break;
       default:
         throw new CheckConfigError(
@@ -550,14 +573,37 @@ export interface Bar {
   criteria?: string;
   check?: CheckSpec;
   checkWaiver?: string;
+  /** `check.setup` as configured at claim. Unset when none is configured. */
+  setup?: string;
+  /** `check.testGlobs` as configured at claim. Unset means the defaults. */
+  testGlobs?: string[];
+  /**
+   * The file paths the plan approved at the plan gate names
+   * (`planPathTargets`), which the `scope` guard holds the change to. Unset
+   * when the claim implements no approved plan; empty when the approved
+   * plan names no file path.
+   */
+  planTargets?: string[];
 }
 
-/** The bar for an issue as it stands now, under a configuration. */
-export function buildBar(issue: WorkIssue, config: CheckConfig): Bar {
+/**
+ * The bar for an issue as it stands now, under a configuration.
+ * `planTargets` is the one part neither of them holds: the claim passes the
+ * paths of the approved plan it loaded, and a later comparison passes the
+ * frozen ones back, because a plan comment appended after the claim must
+ * not move the bar.
+ */
+export function buildBar(
+  issue: WorkIssue,
+  config: CheckConfig,
+  planTargets?: readonly string[],
+): Bar {
   const tier = riskTierOf(issue);
   const policy = resolvePolicy(tier, config.policy);
   const resolved = resolveCheck(issue, config);
   const criteria = issue.acceptance_criteria;
+  const setup = config.check?.setup;
+  const testGlobs = config.check?.testGlobs;
   return {
     riskTier: effectiveTier(tier),
     // A copy: the defaults are shared objects, and a bar must not change
@@ -571,6 +617,13 @@ export function buildBar(issue: WorkIssue, config: CheckConfig): Bar {
     ...(criteria !== undefined ? { criteria } : {}),
     ...(resolved.spec !== undefined ? { check: { ...resolved.spec } } : {}),
     ...(resolved.waiver !== undefined ? { checkWaiver: resolved.waiver } : {}),
+    // Left out when unset, so a bar frozen before these existed keeps its
+    // digest.
+    ...(setup !== undefined && setup.trim() !== "" ? { setup: setup.trim() } : {}),
+    ...(testGlobs !== undefined && testGlobs.length > 0
+      ? { testGlobs: [...testGlobs] }
+      : {}),
+    ...(planTargets !== undefined ? { planTargets: [...planTargets] } : {}),
   };
 }
 
@@ -597,8 +650,8 @@ export function barDigest(bar: Bar): string {
 
 /**
  * The names of what differs between two bars, in a fixed order: `riskTier`,
- * `criteria`, `check`, `checkWaiver`, `gates.<gate>`,
- * `requireAuthorIndependence`, `maxRevisions`.
+ * `criteria`, `check`, `checkWaiver`, `setup`, `testGlobs`, `planTargets`,
+ * `gates.<gate>`, `requireAuthorIndependence`, `maxRevisions`.
  */
 export function barDifferences(frozen: Bar, current: Bar): string[] {
   const fields: string[] = [];
@@ -609,6 +662,11 @@ export function barDifferences(frozen: Bar, current: Bar): string[] {
   if (differs(frozen.check, current.check)) fields.push("check");
   if (differs(frozen.checkWaiver, current.checkWaiver)) {
     fields.push("checkWaiver");
+  }
+  if (differs(frozen.setup, current.setup)) fields.push("setup");
+  if (differs(frozen.testGlobs, current.testGlobs)) fields.push("testGlobs");
+  if (differs(frozen.planTargets, current.planTargets)) {
+    fields.push("planTargets");
   }
   for (const gate of GATES) {
     if (frozen.policy.gates[gate] !== current.policy.gates[gate]) {
@@ -682,6 +740,18 @@ export function parseBar(raw: unknown): Bar | undefined {
     }
     spec = { command: check.command, timeoutMs: check.timeoutMs };
   }
+  const strings = (raw: unknown): string[] | undefined | null =>
+    raw === undefined
+      ? undefined
+      : Array.isArray(raw) && raw.every((item) => typeof item === "string")
+        ? (raw as string[])
+        : null;
+  const testGlobs = strings(value.testGlobs);
+  const planTargets = strings(value.planTargets);
+  if (testGlobs === null || planTargets === null) return undefined;
+  if (value.setup !== undefined && typeof value.setup !== "string") {
+    return undefined;
+  }
   return {
     riskTier,
     policy: {
@@ -702,5 +772,10 @@ export function parseBar(raw: unknown): Bar | undefined {
     ...(typeof value.checkWaiver === "string" && value.checkWaiver !== ""
       ? { checkWaiver: value.checkWaiver }
       : {}),
+    ...(typeof value.setup === "string" && value.setup !== ""
+      ? { setup: value.setup }
+      : {}),
+    ...(testGlobs !== undefined && testGlobs.length > 0 ? { testGlobs } : {}),
+    ...(planTargets !== undefined ? { planTargets } : {}),
   };
 }

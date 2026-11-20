@@ -8,16 +8,16 @@
  * GATES. A policy names seven gates and gives each a mode per risk tier:
  * `off` (not evaluated, nothing recorded), `observe` (evaluated and
  * recorded, never blocks) or `enforce` (evaluated, recorded, and blocks).
- * Four have an evaluation today: `review` (the reviewer's blocking findings
- * that survive the citation check and the recheck, `src/verdict.ts`),
+ * Each has an evaluation: `review` (the reviewer's blocking findings that
+ * survive the citation check and the recheck, `src/verdict.ts`),
  * `tree-binding` (the work is bound to a base tree and a result tree,
  * `src/snapshot.ts`), `check` (the core ran the check command against the
- * result tree, `src/check.ts`) and `criteria-evidence` (the verdict answers
+ * result tree, `src/check.ts`), `criteria-evidence` (the verdict answers
  * every numbered acceptance criterion as met, with evidence,
- * `src/criteria.ts`). The other three are declared, defaulted and validated
- * here so that a later release only adds an evaluation, never a config
- * surface. What a gate result means, and when it blocks, lives in
- * `src/proof.ts`.
+ * `src/criteria.ts`) and the three diff guards, {@link GUARD_GATES}
+ * (`weakened-tests`, `unproven-tests` and `scope`, which read the diff
+ * between the two trees, `src/guards.ts`). What a gate result means, and
+ * when it blocks, lives in `src/proof.ts`.
  *
  * The remaining knobs are deliberately trimmed to what a criterion exercises
  * (decision log): author independence, max revisions, and escalation
@@ -53,6 +53,15 @@ export const GATES = [
   "scope",
 ] as const;
 export type GateName = (typeof GATES)[number];
+
+/**
+ * The three diff guards, in the order they are evaluated and recorded. A
+ * guard that cannot determine an answer records `unknown` and never blocks
+ * (`src/proof.ts`); a violation gets one revision round, then a human
+ * decision (`src/guards.ts`).
+ */
+export const GUARD_GATES = ["weakened-tests", "scope", "unproven-tests"] as const;
+export type GuardGate = (typeof GUARD_GATES)[number];
 
 /** `off`: not evaluated. `observe`: recorded, never blocks. `enforce`: blocks. */
 export type GateModeT = "off" | "observe" | "enforce";

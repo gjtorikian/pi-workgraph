@@ -489,6 +489,10 @@ function lines(path: string): string[] {
 }
 
 describe("the check gate, default config", () => {
+  // Each command passes on the base tree and fails on the implementer's
+  // (which holds feature.txt): a check that also fails on the base is not
+  // the implementer's to fix, and escalates instead of starting a revision
+  // (test/diff-guards.test.ts).
   const FAILING: ReadonlyArray<{
     label: string;
     command: string;
@@ -498,20 +502,20 @@ describe("the check gate, default config", () => {
   }> = [
     {
       label: "exits non-zero",
-      command: "echo boom; exit 1",
+      command: "echo boom; test ! -f feature.txt",
       reason: "exited 1",
       receipt: { exitCode: 1, timedOut: false },
     },
     {
       label: "times out",
-      command: "sleep 30",
+      command: "test -f feature.txt && sleep 30; true",
       timeoutMs: 300,
       reason: "timed out after 0.3s",
       receipt: { timedOut: true },
     },
     {
       label: "is killed by a signal",
-      command: "kill -9 $$",
+      command: "test -f feature.txt && kill -9 $$; true",
       reason: "killed by SIGKILL",
       receipt: { exitCode: null, signal: "SIGKILL", timedOut: false },
     },
@@ -680,7 +684,10 @@ describe("the check gate, default config", () => {
   it("a revision that fixes a failing check: a second receipt for the new tree, then review, then close", async () => {
     const repo = makeScratchRepo({ prefix: "pcfix", seed: 1 });
     const id = repo.seededIds[0]!;
-    approve(repo, id, { check: "echo looking for fixed.txt; test -f fixed.txt" });
+    // Green on the base; red once feature.txt is there without fixed.txt.
+    approve(repo, id, {
+      check: "echo looking for fixed.txt; test ! -f feature.txt || test -f fixed.txt",
+    });
     const { mock, coordinator } = makeHarness();
     const fake = installFakeExecutor(mock.events, {
       roles: ["implementer", "reviewer", "revision"],
@@ -762,7 +769,11 @@ describe("the check gate, default config", () => {
     const repo = makeScratchRepo({ prefix: "pcsame", seed: 1 });
     const marks = outside();
     const id = repo.seededIds[0]!;
-    approve(repo, id, { check: `echo ran >> ${marks.file("runs")}; exit 1` });
+    // Counts its runs on the implementer's tree only, and fails there. (It
+    // also runs once on the base tree, where it passes and leaves no mark.)
+    approve(repo, id, {
+      check: `test -f feature.txt && echo ran >> ${marks.file("runs")}; test ! -f feature.txt`,
+    });
     const { mock, coordinator } = makeHarness();
     const fake = installFakeExecutor(mock.events, {
       roles: ["implementer", "reviewer", "revision"],
@@ -1057,6 +1068,9 @@ describe("the check gate, other modes and edges", () => {
       expect(stamp).not.toHaveProperty("check");
       expect(stamp!.gates).toEqual({
         "tree-binding": "pass",
+        "weakened-tests": "pass",
+        scope: "not-applicable",
+        "unproven-tests": "not-applicable",
         "criteria-evidence": "not-applicable",
         review: "pass",
       });
@@ -1071,14 +1085,20 @@ describe("the check gate, other modes and edges", () => {
   it("with the review gate off the work is still checked", async () => {
     const repo = makeScratchRepo({ prefix: "pcnorev", seed: 1 });
     const id = repo.seededIds[0]!;
-    approve(repo, id, { check: "exit 1" });
+    // Green on the base, red on the implementer's tree.
+    approve(repo, id, { check: "test ! -f feature.txt" });
     const { mock, coordinator } = makeHarness({
       policy: { medium: { gates: { review: "off" } } },
     });
     const fake = installFakeExecutor(mock.events, {
       roles: ["implementer"],
       workspace: isolatedIn(repo),
-      roleScripts: { implementer: { provenance: IMPL_PROV } },
+      roleScripts: {
+        implementer: {
+          provenance: IMPL_PROV,
+          onRequest: () => write(repo, "feature.txt", "v1\n"),
+        },
+      },
     });
     const ectx = makeEventContext(repo.dir);
     captureErrors();
@@ -1262,8 +1282,13 @@ describe("the check gate, other modes and edges", () => {
       const stamp = await latestStamp(repo.dir, waived);
       expect(stamp).toMatchObject({ check: "waived" });
       expect(stamp).not.toHaveProperty("tree");
+      // The diff guards have no tree to compare either: unknown, which
+      // never blocks.
       expect(stamp!.gates).toEqual({
         check: "not-applicable",
+        "weakened-tests": "unknown",
+        scope: "unknown",
+        "unproven-tests": "unknown",
         "criteria-evidence": "not-applicable",
         review: "pass",
       });

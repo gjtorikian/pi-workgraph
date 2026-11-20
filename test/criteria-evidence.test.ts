@@ -668,6 +668,9 @@ describe("the criteria-evidence gate, default config, medium risk", () => {
       expect(stamp!.gates).toEqual({
         "tree-binding": "pass",
         check: "pass",
+        "weakened-tests": "pass",
+        scope: "not-applicable",
+        "unproven-tests": "not-applicable",
         "criteria-evidence": "pass",
         review: "pass",
       });

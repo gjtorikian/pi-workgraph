@@ -503,6 +503,7 @@ export function buildSubagentTask(msg: ReviewRequest): string {
     lines.push(
       "",
       "Produce a concrete implementation plan as structured output matching the provided schema. Do not modify product code.",
+      "In each step's targets, list the repository-relative file paths the step expects to change (a directory covers everything under it). Once the plan is approved, a change to a file outside those paths is flagged as out of scope; test files, and a lockfile beside a changed manifest, are exempt.",
     );
   }
   if (msg.role === "plan_critic") {

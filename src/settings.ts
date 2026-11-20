@@ -16,7 +16,7 @@
  *       "planApproval": "required",                // or "auto"
  *       "planCritique": "off",                     // or "high-risk"
  *       "policy": { "low": { "gates": { "scope": "off" } } }, // gate modes per risk tier
- *       "check": { "command": "npm test" }           // the repository's default check
+ *       "check": { "command": "npm test", "setup": "npm ci" } // default check, and how to prepare a fresh worktree for it
  *     }
  *   }
  *
@@ -58,7 +58,7 @@ export interface WorkgraphSettings {
   store?: string;
   /** The gate policy as raw JSON, for config.ts to validate: the object `--workgraph-policy` takes. */
   policy?: string;
-  /** The `check` block as raw JSON, for config.ts to validate: `{ command?, timeoutMs?, setup? }`. */
+  /** The `check` block as raw JSON, for config.ts to validate: `{ command?, timeoutMs?, setup?, testGlobs? }`. */
   check?: string;
 }
 
