@@ -414,7 +414,7 @@ work, or judgment cannot pass.
 
 ## Tools
 
-Fifteen typed tools, all schema-validated and race-safe. Agents are
+Seventeen typed tools, all schema-validated and race-safe. Agents are
 instructed to use these instead of touching the store from bash — bare
 assignee writes are how leases get corrupted.
 
@@ -433,8 +433,10 @@ assignee writes are how leases get corrupted.
 | `workgraph_answer_decision` | Answer the question a run or a diff guard parked for a human (`allow` accepts a guard's violation); re-approve, and every later run carries the answer |
 | `workgraph_tiers`           | Set or show per-role model tiers for this repository (a role → model table, or clear)                         |
 | `workgraph_override`        | Explicit human override: force-close or force-release, bypassing guards — always audited                      |
-| `workgraph_status`          | One issue's full control-plane state: phase, plan, lease, attempt, verdict and its review context, gate modes and results, criteria, check |
+| `workgraph_status`          | One issue's full control-plane state: phase, plan, lease, attempt, verdict and its review context, gate modes and results, criteria, check, and the outcome recorded after the close |
 | `workgraph_gates`           | Per gate, the issues it blocked, would have blocked, was waived for, and (diff guards) could not decide; `id` narrows the report |
+| `workgraph_record_outcome`  | Record what happened to accepted work after it closed: `clean`, `needed_fixes` with a round count, or `abandoned` (see [Outcomes](#outcomes)) |
+| `workgraph_scorecard`       | Of the issues the gate closed in the last 7 days (`windowDays`), how many needed nothing, split by check, with the worst listed |
 
 The in-session executor adds `workgraph_submit_plan`, valid only during a
 planning turn. `/workgraph init [prefix]` and `/workgraph tiers` are the
@@ -465,6 +467,7 @@ Resolution order per value: CLI flag > environment variable > default.
 | `--workgraph-compaction-reasoning-level` | `WORKGRAPH_COMPACTION_REASONING_LEVEL` | the session's thinking level    | Opt-in: reasoning level for the compaction summary (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`)                          |
 | `--workgraph-subagents-executor`         | `WORKGRAPH_SUBAGENTS_EXECUTOR`         | settings `subagentsExecutor`    | Opt-in: the experimental pi-subagents bridge (`true` or its JSON block)                                                                 |
 | `--workgraph-finalization`               | `WORKGRAPH_FINALIZATION`               | —                               | Optional post-verification task (JSON with `instructions`, `timeoutMs`)                                                                 |
+| `--workgraph-outcome`                    | `WORKGRAPH_OUTCOME`                    | —                               | Optional step launched in the background after a close (JSON with `instructions`, `timeoutMs`; see [Outcomes](#outcomes))               |
 | `--workgraph-worker-id`                  | `WORKGRAPH_WORKER_ID`                  | `{user}@{host}/{short-session}` | Worker identity used for claims, audit records, and fencing checks                                                                      |
 | `--workgraph-dispatch`                   | —                                      | `true`                          | Kill switch: `false` keeps tools + context injection, no autonomy (the flag name predates the coordinator; it disables the coordinator) |
 
@@ -530,7 +533,7 @@ still run: they come before the review and need none.
 is an error that names it, as is JSON that does not parse. Until the
 policy is fixed the coordinator claims nothing and judges nothing, logs
 the message once, and the [tools](#tools) fail with the same message
-(all fifteen except `workgraph_init`). Leases the coordinator already
+(all seventeen except `workgraph_init`). Leases the coordinator already
 holds keep renewing, and a run already in flight proceeds as far as
 judgment and waits there. An invalid `check` settings block
 ([The check](#the-check)) does the same, for the same reason: dropping it
@@ -1074,6 +1077,134 @@ them too. Keeping the database out of the checkout
 ([Where the store lives](#where-the-store-lives)) puts it one step
 further away.
 
+### Outcomes
+
+A close says the work passed its gates. It does not say the work held up.
+An **outcome record** is that second answer, written after the close:
+
+| Outcome        | Meaning                                                              |
+| -------------- | -------------------------------------------------------------------- |
+| `clean`        | The accepted work needed nothing more                                |
+| `needed_fixes` | It needed follow-up fixes; `fixRounds` says how many rounds          |
+| `abandoned`    | It was dropped or reverted                                           |
+| `unknown`      | Nobody could say. Only the core writes this, never a caller          |
+
+`workgraph_record_outcome` is the one writer. It takes `id`, `outcome`,
+`fixRounds` and a one-line `summary`, and it needs no executor and no
+running coordinator. Each record is a comment,
+`workgraph-outcome outcome {json}`, with a compact copy in
+`workgraph_outcome` (for example `needed_fixes:2`). Recording again is
+allowed: the latest record counts and the earlier ones stay on the trail.
+`needed_fixes` with no `fixRounds` is stored as given, and the scorecard
+counts it as one round.
+
+**Only gate-closed work is graded.** The tool refuses an issue that is not
+closed, one that `workgraph_override` closed, and one whose close left no
+stamp, and its error names which. A stamp is written when `tree-binding`
+or `check` is evaluated ([Tree binding](#tree-binding)), so with both of
+those gates `off` there is nothing to record an outcome against. An
+outcome belongs to one close: a record names the run whose stamp it
+grades, an issue that is released and closed again starts with none, and
+an override release clears the outcome keys.
+
+**A record is not fenced.** It is an annotation on a closed issue. It
+changes no lifecycle state, and no lease exists there to check it against.
+Anything that can call the tool can write one, the session's own model
+included, so the record keeps the reporting actor.
+
+`workgraph_scorecard` counts the issues the gate closed in the last 7 days
+(`windowDays` changes the window):
+
+```
+Gate-closed issues in the last 7 days: 4
+2 of 4 needed nothing
+Needed fixes: 1, abandoned: 0, unknown: 0
+1 of 4 have no outcome recorded (never counted as clean)
+By check: check passed: 1 of 3 needed nothing; check waived: 1 of 1 needed nothing
+Worst: wg-12 retry the upload: needed_fixes (2 rounds)
+```
+
+- An issue with no record is counted as **none**, never as clean. When
+  most counted issues have none, that line is printed first.
+- Under ten counted issues it prints counts, never a percentage.
+- The split is by the close stamp's `check` field (`passed`, `waived`,
+  `failed` for a failing check the gate only observed, and no check), so
+  the report shows whether waived work fares worse.
+- The worst are listed in order: abandoned, then needed fixes by rounds,
+  then unknown.
+
+#### The outcome step
+
+Nothing above happens by itself. Set `WORKGRAPH_OUTCOME` and the
+coordinator starts a step of your own after every gate close:
+
+```bash
+export WORKGRAPH_OUTCOME='{
+  "instructions": "Watch the pull request named in the finalization result until it can be merged. Report how many fix rounds it needed.",
+  "timeoutMs": 7200000
+}'
+# Optional: give the step a skill of yours (the name is a placeholder).
+--workgraph-subagents-executor='{
+  "enabled": true,
+  "options": { "finalizer": { "skills": ["your-watch-skill"] } }
+}'
+```
+
+The core names no skill and no hosting service, and it never opens, merges
+or watches anything itself. It sends the step your `instructions`
+unchanged, followed by a separate block it supplies: the issue id, the
+close stamp, the finalization result when finalization ran, and one
+sentence telling the step to call `workgraph_record_outcome` when it is
+done. `timeoutMs` (default 7200000, two hours) is how long the step may
+stay silent.
+
+- **It runs after the close and holds nothing.** The issue is closed and
+  its lease is gone before the step starts. The step has no lease and no
+  heartbeat, the next ready issue is claimed while it runs, and nothing it
+  does can fail or delay a close.
+- **It runs in the background.** The step is sent to an executor that
+  offers a background launch, so a step that waits an hour does not hold
+  the foreground slot reviews use.
+- **It reports through the tool.** The core never reads the step's result.
+  It only learns that the step ended. If the step ended without calling
+  the tool, the outcome is `unknown`.
+- **Silence is `unknown`.** So is a step that cannot be launched: no
+  executor offers a background launch, the launch is rejected, or it is
+  not accepted in time. Each records `unknown` with the reason and is
+  never retried. A step still silent at its deadline is recorded as
+  `unknown` at the next tick, or at the next start. A later report through
+  the tool still replaces an `unknown`.
+- **A restart loses the step's end, not the step.** A step still inside
+  its deadline is left alone at startup: its child may be running and can
+  still report through the tool. pi-subagents announces a background run's
+  end only to the session that launched it, so after a restart a step that
+  does not report ends at its deadline.
+- **Only stamped closes get a step.** With `tree-binding` and `check` both
+  `off` no stamp is written and no step is launched.
+
+Three costs to know before you turn it on:
+
+- **The step shares the `finalizer` role.** It is sent as a `finalizer`
+  run with a background flag, not under a role of its own. The finalizer's
+  model tier, `options.finalizer.skills`, the `finalizer` route and an
+  executor pin for `finalizer` all apply to both finalization and the
+  outcome step. Only the instructions differ.
+- **It needs a pi-subagents line the bridge verified.** The bridge offers a
+  background launch on pi-subagents 0.41 and 0.89, the two lines whose
+  source was read for it. On any other line, 0.34 included, it offers
+  none and every close records `unknown` with
+  `no executor can run a background outcome step`. The in-session executor
+  never offers one.
+- **It can work in your checkout.** The step runs where the work was done.
+  For work implemented in the chat session that is your own checkout, and
+  after the close nothing reserves it: the next issue's base snapshot can
+  include whatever the step edited there. The step's end may also show as
+  a notice in your chat session.
+
+Fixes the step pushes are not judged again. The close stamp still names
+the tree that was accepted, and the outcome's `fixRounds` is the signal
+that what landed is not that tree.
+
 ## How it works
 
 - **The store** — `src/store.ts`: one SQLite file per repository (WAL
@@ -1207,6 +1338,9 @@ the epoch.
 A stale holder that wakes up after a reclaim finds a higher epoch and
 must abort — do not continue the issue, do not "release" it out from
 under the new holder.
+One write is not fenced, on purpose: an [outcome record](#outcomes). It is
+an annotation on an issue that is already closed, where no lease exists to
+check, and it changes no lifecycle state.
 <!-- Tested: src/lease.test.ts — "extends the expiry at the same epoch" -->
 5. **Heartbeat = fenced expiry push.** Renewal verifies the epoch, then
 rewrites `lease_expires_at` to `now + TTL` at the same epoch. Because
@@ -1305,14 +1439,17 @@ the settings no longer match it; the run keeps the frozen bar),
 not be obtained, with the reason; the blockers stand), `decision-needed`
 (a run, or a diff guard, parked a question for a human; a guard's names
 its `gates`), `decision-answered` (with `allowed` when the answer accepted
-a guard's violation), `escalated`, and `judgment-closed`. A `run-completed` event for an implementation or a
+a guard's violation), `escalated`, `judgment-closed`, `outcome-launched`
+(an outcome step was accepted for a closed issue, with its execution id
+and deadline), and `outcome-recorded` (an outcome was written, by the tool
+or by the core as `unknown`). A `run-completed` event for an implementation or a
 revision carries `workspacePath` and, when a snapshot was taken, its
 `tree`; a restarted coordinator rebuilds the run from it.
 Audit writes never block lease operations: the protocol stays correct
 without the trail, and a broken audit surface must not take claiming down
 with it.
 
-Two more trails ride the same comments under their own prefixes.
+Three more trails ride the same comments under their own prefixes.
 `workgraph-verdict` holds each reviewer verdict as it was reported, and
 after it a `recheck` record when the blocker checks changed or questioned
 it (see [Criteria and blockers](#criteria-and-blockers)). The verdict is a
@@ -1323,6 +1460,8 @@ the audit trail never blocks, and two records that do: the check receipt
 (see [The check](#the-check)) and the close stamp (see
 [Tree binding](#tree-binding)). A receipt or a stamp that cannot be
 recorded escalates the run.
+`workgraph-outcome` holds each [outcome record](#outcomes), written after
+the close; nothing waits on it.
 
 ## Experimental: Control-Plane Protocol v1
 
@@ -1380,11 +1519,16 @@ issue metadata:
 | `workgraph_guard_allowed`       | The diff guards a human allowed for this issue, comma-joined                                                                |
 | `workgraph_guard_allowed_by`    | Who gave the latest allowance                                                                                               |
 | `workgraph_decision_gate`       | The diff guards a pending decision is about; empty for a question an executor asked                                         |
+| `workgraph_outcome`             | The latest [outcome](#outcomes) recorded for the close, compact: `clean`, `needed_fixes:2`, `abandoned`, `unknown`          |
+| `workgraph_outcome_status`      | `pending` while an outcome step is expected to report, `recorded` once an outcome exists                                    |
+| `workgraph_outcome_execution_id` | The execution of the outcome step launched for the latest close                                                            |
+| `workgraph_outcome_deadline`    | ISO time after which a pending outcome is recorded as `unknown`                                                             |
 
-The seven tree keys, the three check keys and the four guard keys are
-scalar strings (see [Tree binding](#tree-binding)). A cleared key holds an
-empty string. The guard keys outlive a claim; only an override release
-clears them.
+The seven tree keys, the three check keys, the four guard keys and the
+four outcome keys are scalar strings (see [Tree binding](#tree-binding)). A
+cleared key holds an empty string. The guard keys outlive a claim; only an
+override release clears them. The outcome keys describe one close, and an
+override release clears them too.
 
 ### 2. State transitions
 
@@ -1616,7 +1760,9 @@ Bridge semantics:
 
 The adapter accepts up to four runs and queues their foreground calls, launching
 one at a time because pi-subagents permits only one foreground call per session.
-Queued executions remain cancellable. Executor launch failures are escalated
+Queued executions remain cancellable. An [outcome step](#the-outcome-step) is
+the one run that is not a foreground call: it is launched in the background at
+once, is never queued, and takes none of the four slots. Executor launch failures are escalated
 with their original error; a failed review or finalizer does not become a
 generic structured-output parsing error.
 
@@ -1654,6 +1800,9 @@ and role without hard-coding model IDs into the control plane:
 Configure the named profiles' model, thinking level, and fallbacks in Pi or
 pi-subagents settings. The bridge was contract-tested against pi-subagents
 0.34.8; other major.minor lines remain fail-closed until re-verified.
+Background launch, which only the [outcome step](#the-outcome-step) uses,
+was verified separately by reading the published source of 0.41.0 and
+0.89.1, and the bridge offers it on the 0.41 and 0.89 lines only.
 
 **Activity events**: the coordinator publishes `workgraph:v1:activity` on
 every canonical lifecycle change it commits (claim, phase transition,
@@ -1746,6 +1895,11 @@ accumulate, one per implementer run. List them with `git worktree list`;
 remove one with `git worktree remove <path>` and `git branch -D <branch>`.
 Accepted plans are included in every downstream task. Pi executor children retain
 workgraph tools but do not start additional coordinators or recovery sweeps.
+
+Finalization runs before the close and holds the lease until it is done. Work
+that should start after the close, such as waiting on a pull request, belongs in
+the [outcome step](#the-outcome-step), which shares the `finalizer` role and its
+options.
 
 Finalization is opt-in. Existing runs without it keep their previous behavior.
 Interrupted verification/finalization is parked for operator recovery; it is

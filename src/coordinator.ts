@@ -99,6 +99,16 @@
  *    per tree, setup command first). If the base fails as well the run
  *    escalates, naming the base, instead of asking for a revision that
  *    could not fix it.
+ *  - THE OUTCOME STEP HOLDS NOTHING (`src/outcome.ts`): when `outcome` is
+ *    configured, a caller-defined step is launched AFTER a gate close that
+ *    left a stamp, in an executor's background mode, with the caller's
+ *    instructions unchanged. The issue is already closed: the step has no
+ *    lease, no heartbeat and no place in `heldRuns` or `inFlightCounts`, and
+ *    the next ready issue is claimed while it runs. It reports through the
+ *    outcome tool, so the core never reads its result; it only learns that
+ *    the step ended. A step that cannot be launched, ends without
+ *    reporting, or stays silent past its deadline is recorded as `unknown`,
+ *    and nothing about it can fail or delay a close.
  */
 import { existsSync, realpathSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -158,6 +168,15 @@ import {
 } from "./critique.ts";
 import { DISPATCH_FLAG } from "./dispatch.ts";
 import {
+  compactOutcome,
+  DEFAULT_OUTCOME_TIMEOUT_MS,
+  latestOutcome,
+  markOutcomePending,
+  outcomeReportInstruction,
+  recordOutcome,
+  type OutcomeReport,
+} from "./outcome.ts";
+import {
   discoverExecutors,
   ExecutorSelectionError,
   requestRun,
@@ -201,6 +220,7 @@ import {
   planApprovedOf,
   planFeedbackOf,
   LifecycleError,
+  outcomeStatusOf,
   phaseOf,
   riskTierOf,
   transition,
@@ -227,6 +247,7 @@ import {
 import {
   baseReceiptFor,
   decideGate,
+  latestStamp,
   listReceipts,
   ReceiptWriteError,
   receiptFor,
@@ -261,6 +282,7 @@ import {
   emptyReport,
   listRunHeldInProgress,
   partitionByExpiry,
+  pendingOutcomes,
   reconstructAuthorCompletion,
   reconstructBar,
   reconstructBinding,
@@ -316,6 +338,8 @@ import {
   WORKGRAPH_FINALIZED_TREE_KEY,
   WORKGRAPH_GUARD_ROUNDS_KEY,
   WORKGRAPH_LAST_VERDICT_KEY,
+  WORKGRAPH_OUTCOME_KEY,
+  WORKGRAPH_OUTCOME_STATUS_KEY,
   WORKGRAPH_PHASE_KEY,
   WORKGRAPH_PLAN_APPROVED_KEY,
   WORKGRAPH_PLAN_CRITIQUE_KEY,
@@ -696,6 +720,25 @@ export function registerCoordinator(
     closed: boolean;
   }
 
+  /**
+   * One outcome step this coordinator is waiting on. It follows a CLOSED
+   * issue, so it carries no lease and nothing here protects it: tracking
+   * exists only so the step's `run:completed` can be told apart from an
+   * unknown run's and settled.
+   */
+  interface OutcomeLaunch {
+    cwd: string;
+    issueId: string;
+    /** The closed run the step follows; also the run its record grades. */
+    workflowRunId: string;
+    /** Who the core writes as (the closed run's initiator). */
+    actor: string;
+    /** Bound at the step's acceptance, or re-read from metadata on restart. */
+    executionId?: string;
+    /** Completions that arrived before the execution id was known. */
+    early: RunCompletedT[];
+  }
+
   interface CoordinatorState {
     /** The run being requested or executed — capacity is 1, like v0 dispatch. */
     active: CoordinatorRun | null;
@@ -717,6 +760,11 @@ export function registerCoordinator(
     reconciling: boolean;
     lastSkipLog: string | null;
     seen: SeenMessages;
+    /** Outcome steps launched (or re-tracked after a restart) and not yet
+     *  settled, keyed by the workflowRunId of the closed run they follow.
+     *  NOT held runs: no lease, no heartbeat, never in `heldRuns` or
+     *  `inFlightCounts`. */
+    outcomes: Map<string, OutcomeLaunch>;
   }
 
   const state: CoordinatorState = {
@@ -730,6 +778,7 @@ export function registerCoordinator(
     reconciling: false,
     lastSkipLog: null,
     seen: new SeenMessages(),
+    outcomes: new Map(),
   };
 
   pi.registerFlag(COORDINATOR_FLAG, {
@@ -2308,6 +2357,8 @@ export function registerCoordinator(
    * state, so a lost completion self-heals; spec-phase-5 failure-modes
    * row). Counted: the active implementation run and any live revision
    * execution, review, or finalization, including executor-owned queues.
+   * NOT counted: an outcome step. It runs in an executor's background mode
+   * after the close and takes none of the capacity this map guards.
    */
   /**
    * The executor pin for a role: the per-role table (`executorByRole`, from
@@ -2422,7 +2473,7 @@ export function registerCoordinator(
     run: CoordinatorRun,
     msg: RunCompletedT,
     bindingFields: Record<string, MetadataValue>,
-  ): Promise<void> {
+  ): Promise<boolean> {
     run.executionId = msg.executionId;
     run.evidence = [...msg.evidence];
     const checkMode = run.bar.policy.gates.check;
@@ -2454,7 +2505,7 @@ export function registerCoordinator(
           // Escalated from `implementing`, or no longer held.
           if (state.active === run) state.active = null;
           if (heldRuns().length === 0) stopHeartbeat();
-          return;
+          return false;
         }
         // The check may have re-bound the run to a tree the workspace moved
         // to while it ran; the fields about to be written must say so.
@@ -2518,7 +2569,7 @@ export function registerCoordinator(
       } catch (e) {
         if (!(e instanceof FencingError)) throw e;
       }
-      return;
+      return false;
     }
 
     await transition(run.cwd, run.lease.issueId, "implementing", "verifying", {
@@ -2559,7 +2610,7 @@ export function registerCoordinator(
       if (stopped) {
         if (state.active === run) state.active = null;
         if (heldRuns().length === 0) stopHeartbeat();
-        return;
+        return false;
       }
     }
     if (heldConfig().finalization) {
@@ -2570,14 +2621,14 @@ export function registerCoordinator(
         waiters: [],
         closed: false,
       });
-      if (!(await finalize(run, msg))) return;
+      if (!(await finalize(run, msg))) return false;
       if (bindingMode !== "off") {
         const finalized = await amendAfterFinalization(run);
         if (
           finalized !== undefined &&
           !(await recheckFinalized(run, finalized, run.attempt))
         ) {
-          return; // escalated from verifying; nothing closes
+          return false; // escalated from verifying; nothing closes
         }
       }
     }
@@ -2622,6 +2673,8 @@ export function registerCoordinator(
       },
       run.actor.bdActor,
     );
+    // Closed. The caller starts the outcome step, outside its latch.
+    return true;
   }
 
   async function onCompleted(raw: unknown): Promise<void> {
@@ -2645,6 +2698,27 @@ export function registerCoordinator(
     if (box) {
       box.messages.push(msg);
       wakeInbox(box);
+      return;
+    }
+
+    // The end of an OUTCOME STEP: the run it follows is closed and judged,
+    // so nothing above or below knows its workflow run any more. Matched
+    // only against a launch this coordinator registered (or re-tracked),
+    // and by execution id, so a late completion of the closed run's own
+    // work is never mistaken for the step's.
+    const launch = state.outcomes.get(msg.workflowRunId);
+    if (launch) {
+      if (launch.executionId === undefined) {
+        // The step finished inside the request emit, before its acceptance
+        // told us which execution it is. `launchOutcome` settles it.
+        launch.early.push(msg);
+      } else if (launch.executionId === msg.executionId) {
+        await settleOutcome(launch, msg);
+      } else {
+        logSkipOnce(
+          `ignoring run:completed for ${msg.workflowRunId}: not the outcome step's execution`,
+        );
+      }
       return;
     }
 
@@ -2677,6 +2751,7 @@ export function registerCoordinator(
     let startJudgment = false;
     let startImplementation = false;
     let startCritique = false;
+    let startOutcome = false;
     try {
       // Fencing triple, part 1: the payload must match the run we supervise.
       const payloadMatches =
@@ -2810,7 +2885,7 @@ export function registerCoordinator(
           if (heldRuns().length === 0) stopHeartbeat();
         }
       } else if (effectiveWorkflowClass(run.issue) === "oneshot") {
-        await finishOneshot(run, msg, bindingFields);
+        startOutcome = await finishOneshot(run, msg, bindingFields);
       } else {
         try {
           await transition(
@@ -2877,6 +2952,10 @@ export function registerCoordinator(
     if (startImplementation) await dispatchImplementation(run);
     if (startCritique) await critiqueThenPark(run);
     if (startJudgment) await judge(run, msg);
+    // A one-shot close: the outcome step waits on discovery and on an
+    // acceptance, and inside the latch that wait would drop the completion
+    // of whatever the next tick claims.
+    if (startOutcome) await launchOutcome(run);
   }
 
   /**
@@ -4761,6 +4840,365 @@ export function registerCoordinator(
       run.actor.bdActor,
     );
     dropJudgedRun(run);
+    // AFTER the run is dropped: its inbox is gone, so the step's completion
+    // is routed to the outcome launch and not swallowed with the inbox.
+    // This chain already runs outside the `completing` latch.
+    await launchOutcome(run);
+  }
+
+  // -------------------------------------------------------------------------
+  // The outcome step (`src/outcome.ts`): caller-defined work AFTER the close
+  // -------------------------------------------------------------------------
+
+  /**
+   * Record `unknown` for a close whose outcome step could not run or never
+   * reported. NEVER rejects, and never writes over a report: when the trail
+   * already holds an outcome for this close the record is left alone (and a
+   * status its reporter's second write lost is repaired). An issue that is
+   * no longer closed, or was re-closed by another run, is left untouched:
+   * the outcome it would have graded is gone.
+   */
+  async function recordUnknownOutcome(
+    target: {
+      cwd: string;
+      issueId: string;
+      workflowRunId: string;
+      executionId?: string;
+      actor: string;
+    },
+    summary: string,
+    data?: Record<string, unknown>,
+  ): Promise<void> {
+    try {
+      const cur = await show(target.cwd, target.issueId);
+      if (
+        cur.status !== "closed" ||
+        workflowRunIdOf(cur) !== target.workflowRunId
+      ) {
+        return;
+      }
+      const reported = await latestOutcome(target.cwd, target.issueId);
+      if (reported !== undefined) {
+        if (outcomeStatusOf(cur) !== "recorded") {
+          await setMetadata(
+            target.cwd,
+            target.issueId,
+            {
+              [WORKGRAPH_OUTCOME_KEY]: compactOutcome(reported),
+              [WORKGRAPH_OUTCOME_STATUS_KEY]: "recorded",
+            },
+            target.actor,
+          );
+        }
+        return;
+      }
+      await recordOutcome(
+        target.cwd,
+        target.issueId,
+        {
+          outcome: "unknown",
+          summary,
+          ...(data !== undefined ? { data } : {}),
+        },
+        {
+          actor: target.actor,
+          ...(target.executionId !== undefined
+            ? { executionId: target.executionId }
+            : {}),
+          workflowRunId: target.workflowRunId,
+        },
+        target.actor,
+      );
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : String(e);
+      console.error(
+        `[pi-workgraph] OUTCOME WRITE FAILED (${target.issueId}): ${detail}`,
+      );
+    }
+  }
+
+  /**
+   * The outcome step's execution ended. If it reported through the outcome
+   * tool, the record stands, whatever the completion says about the run
+   * itself; if it did not, the outcome is `unknown`. Never rejects.
+   */
+  async function settleOutcome(
+    launch: OutcomeLaunch,
+    completion: RunCompletedT,
+  ): Promise<void> {
+    if (state.outcomes.get(launch.workflowRunId) === launch) {
+      state.outcomes.delete(launch.workflowRunId);
+    }
+    const executionError =
+      completion.executionError ??
+      (completion.outcome !== "success"
+        ? `the step ended with outcome ${completion.outcome}`
+        : undefined);
+    await recordUnknownOutcome(
+      launch,
+      "the outcome step ended without reporting",
+      executionError !== undefined ? { executionError } : undefined,
+    );
+  }
+
+  /**
+   * Launch the caller-defined outcome step for a run that just CLOSED. Only
+   * when `outcome` is configured and the close left a stamp to grade (with
+   * `tree-binding` and `check` both `off` there is none, and nothing is
+   * launched). The step is sent under the `finalizer` role with
+   * `background: true` to an executor that offers both, with the caller's
+   * instructions unchanged; what the core adds (the issue id, the stamp, the
+   * finalization result, how to report) rides in `outcomeReport`.
+   *
+   * The issue is closed and the lease is gone: nothing here is fenced, held
+   * or heartbeated, and the step is in neither `heldRuns` nor
+   * `inFlightCounts`. It reports through `workgraph_record_outcome`; this
+   * side only learns that it ended. Whatever goes wrong becomes an
+   * `unknown` outcome, never a retry and never an error into the close
+   * path: the close is already complete. Reads `heldConfig()`, so a broken
+   * policy does not stop it.
+   */
+  async function launchOutcome(run: CoordinatorRun): Promise<void> {
+    try {
+      await launchOutcomeInner(run);
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : String(e);
+      state.outcomes.delete(run.workflowRunId);
+      logSkipOnce(
+        `outcome step for ${run.lease.issueId} could not be launched: ${detail}`,
+      );
+    }
+  }
+
+  async function launchOutcomeInner(run: CoordinatorRun): Promise<void> {
+    const config = heldConfig();
+    const task = config.outcome;
+    if (!task) return;
+    const cwd = run.cwd;
+    const issueId = run.lease.issueId;
+    const target = {
+      cwd,
+      issueId,
+      workflowRunId: run.workflowRunId,
+      actor: run.actor.bdActor,
+    };
+    // The stamp this close wrote, with any finalized tree folded in. A
+    // close without one is not graded, so there is nothing to launch for.
+    const stamp = await latestStamp(cwd, issueId);
+    if (stamp === undefined || stamp.workflowRunId !== run.workflowRunId) {
+      return;
+    }
+    const closed = await show(cwd, issueId);
+    let finalization: unknown;
+    const recorded = closed.metadata?.workgraph_finalization_result;
+    if (typeof recorded === "string" && recorded !== "") {
+      try {
+        finalization = JSON.parse(recorded);
+      } catch {
+        // An unreadable result is left out; the stamp still goes.
+      }
+    }
+    const offers = await discoverExecutors(pi.events, {
+      timeoutMs: config.discoveryTimeoutMs,
+      now: nowFn,
+      onInvalid,
+    });
+    // A background run takes none of an executor's foreground capacity, so
+    // `available` and `maxConcurrency` say nothing about it: both are left
+    // out of the offers selection sees.
+    const capable = offers
+      .filter(
+        (offer) =>
+          offer.supportsBackground === true &&
+          offer.roles.includes("finalizer"),
+      )
+      .map(({ available: _a, maxConcurrency: _m, ...offer }) => offer);
+    let executor: ExecutorOfferT | undefined;
+    try {
+      // A pinned executor that cannot run a background step is not in
+      // `capable`, so the pin fails closed here instead of selecting it.
+      executor = selectExecutor(
+        capable,
+        { role: "finalizer", requiresIsolation: false },
+        pinFor("finalizer"),
+      );
+    } catch (error) {
+      if (!(error instanceof ExecutorSelectionError)) throw error;
+    }
+    if (!executor) {
+      await recordUnknownOutcome(
+        target,
+        "no executor can run a background outcome step",
+      );
+      return;
+    }
+    const launch: OutcomeLaunch = { ...target, early: [] };
+    const report: OutcomeReport = {
+      issueId,
+      stamp,
+      ...(finalization !== undefined ? { finalization } : {}),
+      instruction: outcomeReportInstruction(issueId),
+    };
+    const request: RunRequestT & { outcomeReport: OutcomeReport } = {
+      ...newEnvelope(nowFn),
+      executorId: executor.executorId,
+      workflowRunId: run.workflowRunId,
+      // The closed run's last epoch: correlation only, nothing is fenced.
+      leaseEpoch: run.lease.epoch,
+      issue: {
+        id: run.issue.id,
+        title: run.issue.title,
+        workflowClass: effectiveWorkflowClass(run.issue),
+        riskTier: run.bar.riskTier,
+        description: run.issue.description,
+        acceptanceCriteria: run.bar.criteria,
+      },
+      role: "finalizer",
+      attempt: run.attempt,
+      workspace: requestWorkspace(run),
+      // The caller's own words, unchanged.
+      instructions: task.instructions,
+      background: true,
+      outcomeReport: report,
+    };
+    // Tracked BEFORE the emit: an executor may accept, and even finish,
+    // inside it, and that completion must find the launch.
+    state.outcomes.set(run.workflowRunId, launch);
+    const result = await requestRun(pi.events, request, {
+      timeoutMs: config.acceptTimeoutMs,
+      onInvalid,
+    });
+    if (result.kind !== "accepted") {
+      state.outcomes.delete(run.workflowRunId);
+      // Never retried. A step that was launched after all can still report
+      // through the tool, and the latest record counts.
+      await recordUnknownOutcome(
+        target,
+        result.kind === "rejected"
+          ? `the outcome step was rejected: ${result.message.reason}`
+          : "the outcome step was not accepted in time",
+      );
+      return;
+    }
+    const executionId = result.message.executionId;
+    launch.executionId = executionId;
+    const deadline = new Date(
+      nowFn() + (task.timeoutMs ?? DEFAULT_OUTCOME_TIMEOUT_MS),
+    ).toISOString();
+    try {
+      // `pending` only where nothing was reported yet: a step that already
+      // called the tool must not be turned back into one that is awaited.
+      if ((await latestOutcome(cwd, issueId)) === undefined) {
+        await markOutcomePending(
+          cwd,
+          issueId,
+          { executionId, deadline },
+          target.actor,
+        );
+      }
+    } catch (e) {
+      // Untracked on disk: the completion below is the only settle left.
+      const detail = e instanceof Error ? e.message : String(e);
+      logSkipOnce(`could not mark the outcome of ${issueId} pending: ${detail}`);
+    }
+    await recordLeaseEvent(
+      cwd,
+      "outcome-launched",
+      issueId,
+      {
+        workflowRunId: run.workflowRunId,
+        executionId,
+        executorId: executor.executorId,
+        deadline,
+      },
+      target.actor,
+    );
+    const ended = launch.early.find((msg) => msg.executionId === executionId);
+    launch.early = [];
+    if (ended) await settleOutcome(launch, ended);
+  }
+
+  /**
+   * Settle every pending outcome whose deadline has passed as `unknown`, and
+   * (re-)track the ones still inside it so their completion is recognized.
+   * Runs before each tick and once at reconciliation. NEVER throws. The
+   * deadline is compared on the injected clock, the one it was written on.
+   * A cancel is published for a step that ran out of time, as a courtesy:
+   * the outcome is `unknown` whatever the executor answers.
+   */
+  async function sweepOutcomes(cwd: string): Promise<void> {
+    try {
+      try {
+        await ensureWorkspace(cwd);
+      } catch {
+        return; // no workspace here: nothing recorded to settle
+      }
+      const { due, waiting } = await pendingOutcomes(cwd, nowFn());
+      const writer = ids.initiator().id;
+      for (const pending of waiting) {
+        if (
+          pending.workflowRunId === undefined ||
+          state.outcomes.has(pending.workflowRunId)
+        ) {
+          continue;
+        }
+        state.outcomes.set(pending.workflowRunId, {
+          cwd,
+          issueId: pending.issueId,
+          workflowRunId: pending.workflowRunId,
+          actor: writer,
+          ...(pending.executionId !== undefined
+            ? { executionId: pending.executionId }
+            : {}),
+          early: [],
+        });
+      }
+      for (const pending of due) {
+        const tracked =
+          pending.workflowRunId !== undefined
+            ? state.outcomes.get(pending.workflowRunId)
+            : undefined;
+        if (pending.workflowRunId !== undefined) {
+          state.outcomes.delete(pending.workflowRunId);
+          if (pending.executionId !== undefined) {
+            const cancel: RunCancelT = {
+              ...newEnvelope(nowFn),
+              workflowRunId: pending.workflowRunId,
+              issueId: pending.issueId,
+              executionId: pending.executionId,
+              reason: "the outcome step did not report before its deadline",
+            };
+            pi.events.emit(CH.runCancel, cancel);
+          }
+        }
+        if (pending.workflowRunId === undefined) {
+          // Hand-written metadata naming no run: there is no close to grade.
+          // Stop waiting on it.
+          await setMetadata(
+            cwd,
+            pending.issueId,
+            { [WORKGRAPH_OUTCOME_STATUS_KEY]: "" },
+            writer,
+          );
+          continue;
+        }
+        await recordUnknownOutcome(
+          {
+            cwd,
+            issueId: pending.issueId,
+            workflowRunId: pending.workflowRunId,
+            actor: tracked?.actor ?? writer,
+            ...(pending.executionId !== undefined
+              ? { executionId: pending.executionId }
+              : {}),
+          },
+          "the outcome step did not report before its deadline",
+        );
+      }
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : String(e);
+      logSkipOnce(`could not settle pending outcomes: ${detail}`);
+    }
   }
 
   /** Error-isolated wrapper: a judgment failure never unwinds the bus. */
@@ -5614,6 +6052,10 @@ export function registerCoordinator(
     if (state.reconciling) return; // recovery first — ticks resume after
     state.ticking = true;
     try {
+      // Before the tick proper: that one stops on an invalid policy, on a
+      // run in flight and on a busy session, and none of those is a reason
+      // to leave a silent outcome step waiting. Never throws.
+      await sweepOutcomes(ctx.cwd);
       await tickInner(ctx);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -6150,6 +6592,12 @@ export function registerCoordinator(
     for (const workflowRunId of [...state.inboxes.keys()]) {
       closeInbox(workflowRunId);
     }
+    // Outcome steps are left running on purpose: the issue is closed, no
+    // lease is involved, and a step can still report through the outcome
+    // tool after this session is gone. Only the in-memory tracking goes;
+    // the next start re-tracks from metadata, and the deadline settles
+    // whatever never reports.
+    state.outcomes.clear();
     // Never throws: every held lease below must still be released.
     const config = heldConfig();
     const active = state.active;
@@ -6320,6 +6768,13 @@ export function registerCoordinator(
       } catch {
         return report; // no workspace here — nothing persisted to recover
       }
+      // Outcome steps first, and before the config is read: they follow
+      // CLOSED issues, hold no lease, and an invalid policy is no reason to
+      // forget them. A step still inside its deadline is re-tracked and
+      // left alone (its child may be running and can still report); one
+      // past it is recorded as `unknown`. Not part of the report: nothing
+      // here is a lease.
+      await sweepOutcomes(ctx.cwd);
       const config = currentConfig();
       const nowMs = nowFn();
       const issues = await listRunHeldInProgress(

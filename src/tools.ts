@@ -69,6 +69,10 @@ import {
   guardRoundsOf,
   isLifecycleV1,
   lastVerdictOf,
+  outcomeDeadlineOf,
+  outcomeExecutionIdOf,
+  outcomeOf,
+  outcomeStatusOf,
   phaseOf,
   planApprovedOf,
   reapprove,
@@ -78,6 +82,18 @@ import {
   workflowRunIdOf,
 } from "./lifecycle.ts";
 import { latestPlanCritique } from "./critique.ts";
+import {
+  compactOutcome,
+  DEFAULT_SCORECARD_WINDOW_DAYS,
+  gradableClose,
+  latestOutcome,
+  OVERRIDE_CLOSE_PREFIX,
+  recordOutcome,
+  renderScorecard,
+  scorecard,
+  scorecardRows,
+  type OutcomeT,
+} from "./outcome.ts";
 import { latestPlan, renderPlanForReview } from "./plan.ts";
 import {
   DEFAULT_RISK_TIER,
@@ -117,7 +133,9 @@ import {
   InitParams,
   OverrideParams,
   ReadyParams,
+  RecordOutcomeParams,
   ReleaseParams,
+  ScorecardParams,
   SplitParams,
   StatusParams,
   TiersParams,
@@ -131,6 +149,7 @@ import {
   WORKGRAPH_GUARD_ALLOWED_BY_KEY,
   WORKGRAPH_GUARD_ALLOWED_KEY,
   WORKGRAPH_GUARD_KEYS,
+  WORKGRAPH_OUTCOME_KEYS,
   WORKGRAPH_PHASE_KEY,
   WORKGRAPH_TREE_BINDING_KEYS,
   WORKGRAPH_PLAN_APPROVED_KEY,
@@ -140,6 +159,9 @@ import {
   WORKGRAPH_RISK_TIER_KEY,
   WORKGRAPH_WORKFLOW_CLASS_KEY,
 } from "./types.ts";
+
+/** The outcomes a caller may report (`workgraph_record_outcome`). */
+const REPORTABLE_OUTCOMES = ["clean", "needed_fixes", "abandoned"] as const;
 
 const CRITIQUE_UNAVAILABLE_PREFIX = "unavailable:";
 
@@ -704,7 +726,12 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
         actor.bdActor,
       );
       if (params.action === "close") {
-        await close(ctx.cwd, params.id, `override: ${params.reason}`, actor.bdActor);
+        await close(
+          ctx.cwd,
+          params.id,
+          `${OVERRIDE_CLOSE_PREFIX}${params.reason}`,
+          actor.bdActor,
+        );
         untrackLease(ctx.cwd, params.id);
         return textResult(
           `Override-closed ${params.id} (reason: ${params.reason}) — audited as ${actor.bdActor}.`,
@@ -719,11 +746,17 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
       // place those keys are cleared — a re-claim, a promotion and a
       // re-approval all keep the base on purpose (`src/snapshot.ts`). The
       // diff-guard keys go with them: a spent revision round and a human's
-      // allowance both belong to the work that was just given up.
+      // allowance both belong to the work that was just given up. So do the
+      // outcome keys: an outcome grades one close, and the next close of
+      // this issue starts with none (and with no stale deadline to sweep).
       await unsetMetadata(
         ctx.cwd,
         params.id,
-        [...WORKGRAPH_TREE_BINDING_KEYS, ...WORKGRAPH_GUARD_KEYS],
+        [
+          ...WORKGRAPH_TREE_BINDING_KEYS,
+          ...WORKGRAPH_GUARD_KEYS,
+          ...WORKGRAPH_OUTCOME_KEYS,
+        ],
         actor.bdActor,
       );
       if (resetsPhase) {
@@ -843,6 +876,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     description:
       "Show one issue's full workgraph state: lifecycle phase, acceptance criteria, the check command or its waiver, risk tier, " +
       "workflow run, attempt, last verdict and the context its review ran in, the gate modes that apply and each gate's latest result, " +
+      "the outcome recorded after the close (or that an outcome step is still expected to report), " +
       "executor, and the lease (holder, epoch, expiry).",
     promptSnippet: "Show a work-graph issue's lifecycle and lease state",
     promptGuidelines: [
@@ -933,6 +967,30 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
       lines.push(`Gates: ${GATES.map((gate) => `${gate}=${policy.gates[gate]}`).join(" ")}`);
       const gateResults = latestGateRecords(await listGateRecords(ctx.cwd, params.id));
       for (const record of gateResults) lines.push(gateResultLine(record));
+      // What happened after the close, printed only when there is something
+      // to print: a record for the latest close, or a step still expected
+      // to report. Below the gate results, like them clear of the plan
+      // block.
+      const outcomeStatus = outcomeStatusOf(issue);
+      const outcome =
+        outcomeOf(issue) !== undefined || outcomeStatus !== undefined
+          ? await latestOutcome(ctx.cwd, params.id)
+          : undefined;
+      if (outcome !== undefined) {
+        lines.push(
+          `Outcome: ${compactOutcome(outcome)}: ${outcome.summary}${
+            outcome.actor !== undefined ? ` (recorded by ${outcome.actor})` : ""
+          }`,
+        );
+      } else if (outcomeStatus === "pending") {
+        const step = outcomeExecutionIdOf(issue);
+        const deadline = outcomeDeadlineOf(issue);
+        lines.push(
+          `Outcome: pending${step !== undefined ? `, outcome step ${step}` : ""}${
+            deadline !== undefined ? `, recorded as unknown after ${deadline}` : ""
+          }`,
+        );
+      }
       const question = metadata[WORKGRAPH_DECISION_QUESTION_KEY];
       if (
         metadata.workgraph_decision_pending === true ||
@@ -976,7 +1034,99 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
         checkWaiver: effectiveCheck.waiver ?? null,
         gates: policy.gates,
         gateResults,
+        outcome: outcome ?? null,
+        outcomeStatus: outcome !== undefined ? "recorded" : outcomeStatus ?? null,
       });
+    },
+  });
+
+  pi.registerTool({
+    name: "workgraph_record_outcome",
+    label: "Record outcome",
+    description:
+      "Record what happened to accepted work after it closed. " +
+      "The issue must be closed by the gate and carry its close stamp; an open issue or one closed by workgraph_override is refused. " +
+      "Recording again is allowed: the latest record counts and the earlier ones stay on the trail.",
+    promptSnippet: "Record what happened to accepted work after it closed",
+    promptGuidelines: [
+      "Use workgraph_record_outcome only for what actually happened after the close: clean when nothing more was needed, needed_fixes with the number of fix rounds, abandoned when the work was dropped or reverted. Do not record clean for work nobody followed up on.",
+    ],
+    parameters: RecordOutcomeParams,
+    executionMode: "sequential",
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      await prepare(ctx);
+      const actor = defaultLeaseActor();
+      // An unknown id throws here, before any guard is read.
+      const issue = await show(ctx.cwd, params.id);
+      const gradable = await gradableClose(ctx.cwd, issue);
+      if (!gradable.ok) throw new Error(gradable.refusal);
+      const summary = params.summary.trim();
+      if (summary === "") {
+        throw new Error("workgraph_record_outcome needs a one-line summary.");
+      }
+      // Pi checks parameters against the schema before `execute`; a direct
+      // caller gets the same answer here. `unknown` is the core's own word
+      // for a step that never reported, and is not a caller's to write.
+      const reported = REPORTABLE_OUTCOMES.find((value) => value === params.outcome);
+      if (reported === undefined) {
+        throw new Error(
+          `workgraph_record_outcome takes outcome ${REPORTABLE_OUTCOMES.join(", ")}; got "${params.outcome}".`,
+        );
+      }
+      const outcome: OutcomeT = {
+        outcome: reported,
+        ...(params.fixRounds !== undefined ? { fixRounds: params.fixRounds } : {}),
+        summary,
+      };
+      // The reporter does not know which execution it is: while a step is
+      // still expected to report, the record takes the launched step's id.
+      const executionId =
+        outcomeStatusOf(issue) === "pending"
+          ? outcomeExecutionIdOf(issue)
+          : undefined;
+      await recordOutcome(
+        ctx.cwd,
+        params.id,
+        outcome,
+        {
+          actor: actor.bdActor,
+          ...(executionId !== undefined ? { executionId } : {}),
+          workflowRunId: gradable.stamp.workflowRunId,
+        },
+        actor.bdActor,
+      );
+      return textResult(
+        `Recorded outcome ${compactOutcome(outcome)} for ${params.id}.`,
+        {
+          id: params.id,
+          outcome: params.outcome,
+          fixRounds: params.fixRounds ?? null,
+          executionId: executionId ?? null,
+        },
+      );
+    },
+  });
+
+  pi.registerTool({
+    name: "workgraph_scorecard",
+    label: "Scorecard",
+    description:
+      "Report how accepted work held up: of the issues the gate closed in the window (default 7 days), how many needed nothing, needed fixes, " +
+      "were abandoned, ended unknown, or have no outcome recorded (never counted as clean), split by whether their check passed or was waived, " +
+      "with the issues that fared worst. Under ten counted issues it prints counts, not a percentage.",
+    promptSnippet: "Report how accepted work held up after it closed",
+    promptGuidelines: [
+      "Use workgraph_scorecard to see whether accepted work needed fixes after it closed; an issue with no outcome recorded is not a clean one.",
+    ],
+    parameters: ScorecardParams,
+    executionMode: "sequential",
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      await prepare(ctx);
+      const card = scorecard(await scorecardRows(ctx.cwd), {
+        now: new Date(),
+        windowDays: params.windowDays ?? DEFAULT_SCORECARD_WINDOW_DAYS,
+      });
+      return textResult(renderScorecard(card), { scorecard: card });
     },
   });
 

@@ -128,6 +128,18 @@ export interface FakeExecutorOptions {
   /** Offer flags (phase 4; both default false, matching protocol history). */
   supportsCancellation?: boolean;
   supportsReconciliation?: boolean;
+  /** Advertise `supportsBackground` on the offer (omitted unless true). */
+  supportsBackground?: boolean;
+  /**
+   * Script for BACKGROUND requests (`background: true`: the outcome step
+   * that follows a close). Kept apart from `roleScripts.finalizer`, whose
+   * role such a request shares, so a suite can script finalization and the
+   * outcome step without interleaving one array. Consumed like a role
+   * script; when unset, a background request falls back to the finalizer
+   * script. A background run is never "the most recently accepted run":
+   * `complete()` does not see it, `completeBackground()` does.
+   */
+  background?: RoleScript | RoleScript[];
   /** `run:cancel` handling: `"ack"` (default) emits a correlated
    *  `run:cancelled` — including for unknown/finished runs (the no-op-ack
    *  contract); `"ignore"` drives the unacked-cancel abandon path. */
@@ -164,6 +176,15 @@ export interface FakeExecutorHandle {
   /** Complete the most recently accepted run (accept-stall flows). Returns
    *  the emitted message so tests can re-emit it verbatim. */
   complete(overrides?: CompleteOverrides): RunCompletedT;
+  /**
+   * Complete an accepted background run that has not completed yet
+   * (`background: { behavior: "accept-stall" }` flows): the one for
+   * `issueId`, or the most recently accepted one. Throws when there is none.
+   */
+  completeBackground(
+    issueId?: string,
+    overrides?: CompleteOverrides,
+  ): RunCompletedT;
   /** Re-emit a previously emitted completion verbatim (duplicate delivery). */
   reemit(message: RunCompletedT): void;
   /** Unsubscribe from the bus. */
@@ -184,6 +205,13 @@ export function installFakeExecutor(
     executionId: string;
     script: RoleScript;
   } | null = null;
+  /** Accepted background runs still waiting for their completion, oldest first. */
+  const backgroundPending: {
+    request: RunRequestT;
+    executionId: string;
+    script: RoleScript;
+  }[] = [];
+  let backgroundCursor = 0;
   let executionCounter = 0;
   const scriptCursor = new Map<ExecutorRoleT, number>();
   const unsubs: (() => void)[] = [];
@@ -196,6 +224,17 @@ export function installFakeExecutor(
     if (entry.length === 0) return {};
     const cursor = scriptCursor.get(role) ?? 0;
     scriptCursor.set(role, cursor + 1);
+    return entry[Math.min(cursor, entry.length - 1)]!;
+  }
+
+  /** Next scripted response for a background request (same array rules). */
+  function backgroundScript(): RoleScript {
+    const entry = opts.background;
+    if (entry === undefined) return scriptFor("finalizer");
+    if (!Array.isArray(entry)) return entry;
+    if (entry.length === 0) return {};
+    const cursor = backgroundCursor;
+    backgroundCursor += 1;
     return entry[Math.min(cursor, entry.length - 1)]!;
   }
 
@@ -282,6 +321,7 @@ export function installFakeExecutor(
         ...(opts.maxConcurrency !== undefined
           ? { maxConcurrency: opts.maxConcurrency }
           : {}),
+        ...(opts.supportsBackground ? { supportsBackground: true } : {}),
       };
       if (opts.offerDelayMs !== undefined) {
         setTimeout(() => events.emit(CH.offer, offer), opts.offerDelayMs);
@@ -302,7 +342,8 @@ export function installFakeExecutor(
       if (msg.executorId !== executorId) return; // addressed elsewhere
       requests.push(msg);
 
-      const script = scriptFor(msg.role);
+      const background = msg.background === true;
+      const script = background ? backgroundScript() : scriptFor(msg.role);
       const behavior = script.behavior ?? opts.behavior ?? "accept-complete";
       if (behavior === "silent") return;
       if (behavior === "reject") {
@@ -323,7 +364,13 @@ export function installFakeExecutor(
       // (e.g. a pre- and post-restart pair) must never collide on the
       // independence check's executionId floor.
       const executionId = `${executorId}-exec-${executionCounter}`;
-      lastAccepted = { request: msg, executionId, script };
+      if (background) {
+        if (behavior !== "accept-complete") {
+          backgroundPending.push({ request: msg, executionId, script });
+        }
+      } else {
+        lastAccepted = { request: msg, executionId, script };
+      }
       events.emit(CH.runAccepted, {
         ...newEnvelope(),
         inReplyTo: msg.messageId,
@@ -418,6 +465,28 @@ export function installFakeExecutor(
         lastAccepted.executionId,
         overrides,
         lastAccepted.script,
+      );
+      emitCompletion(message);
+      return message;
+    },
+    completeBackground(issueId, overrides = {}) {
+      const index =
+        issueId === undefined
+          ? backgroundPending.length - 1
+          : backgroundPending.findIndex(
+              (entry) => entry.request.issue.id === issueId,
+            );
+      const entry = backgroundPending[index];
+      if (!entry) {
+        throw new Error("fake executor: no background run to complete");
+      }
+      backgroundPending.splice(index, 1);
+      runHook(entry.script, entry.request);
+      const message = buildCompletion(
+        entry.request,
+        entry.executionId,
+        overrides,
+        entry.script,
       );
       emitCompletion(message);
       return message;

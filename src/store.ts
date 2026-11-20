@@ -94,7 +94,8 @@ export type StoreOp =
   | "listCommentsByPrefix"
   | "createIssue"
   | "addDependency"
-  | "listIssues";
+  | "listIssues"
+  | "listClosedByMetadata";
 
 export interface OpLogEntry {
   op: StoreOp;
@@ -1017,6 +1018,27 @@ function listIssuesSync(cwd: string, opts: ListIssuesOptions = {}): WorkIssue[] 
   return rows.map((r) => rowToIssue(db, r));
 }
 
+/**
+ * Closed issues whose metadata holds `value` under `key`, oldest first. The
+ * comparison is on the stored scalar as text, so a number or boolean is
+ * matched by its JSON spelling (`true`, `2`). One statement over the
+ * existing `status` and `metadata` columns: no index serves it, so it reads
+ * every closed row once.
+ */
+function listClosedByMetadataSync(cwd: string, key: string, value: string): WorkIssue[] {
+  recordOp("listClosedByMetadata");
+  const db = openDb(cwd, "listClosedByMetadata");
+  const path = `$."${key.replace(/["\\]/g, "")}"`;
+  const rows = db
+    .prepare(
+      `SELECT * FROM issues
+        WHERE status = 'closed' AND CAST(json_extract(metadata, ?) AS TEXT) = ?
+        ORDER BY rowid ASC`,
+    )
+    .all(path, value) as unknown as IssueRow[];
+  return rows.map((r) => rowToIssue(db, r));
+}
+
 /** Synchronous surface for synchronous callers (fixtures, hooks, tooling). */
 export const sync: {
   ready: typeof readySync;
@@ -1036,6 +1058,7 @@ export const sync: {
   createIssue: typeof createIssueSync;
   addDependency: typeof addDependencySync;
   listIssues: typeof listIssuesSync;
+  listClosedByMetadata: typeof listClosedByMetadataSync;
   initWorkspace: typeof initWorkspaceSync;
   getSetting: (cwd: string, key: string) => string | undefined;
   setSetting: (cwd: string, key: string, value: string | null) => void;
@@ -1057,6 +1080,7 @@ export const sync: {
   createIssue: createIssueSync,
   addDependency: addDependencySync,
   listIssues: listIssuesSync,
+  listClosedByMetadata: listClosedByMetadataSync,
   initWorkspace: initWorkspaceSync,
   // Assigned below their definitions (settings live at the end of the file).
   getSetting: undefined as never,
@@ -1189,6 +1213,15 @@ export async function addDependency(cwd: string, id: string, dependsOnId: string
 /** List issues, oldest first, optionally filtered by status. */
 export async function listIssues(cwd: string, opts: ListIssuesOptions = {}): Promise<WorkIssue[]> {
   return listIssuesSync(cwd, opts);
+}
+
+/**
+ * List closed issues by one metadata key and value, oldest first: the
+ * pending-outcome sweep (`workgraph_outcome_status` = `pending`) and the
+ * scorecard (`workgraph_phase` = `accepted`) both read through it.
+ */
+export async function listClosedByMetadata(cwd: string, key: string, value: string): Promise<WorkIssue[]> {
+  return listClosedByMetadataSync(cwd, key, value);
 }
 
 // ---------------------------------------------------------------------------

@@ -190,6 +190,29 @@ export const WORKGRAPH_GUARD_KEYS: readonly string[] = [
 ];
 
 /**
+ * Outcome keys (`src/outcome.ts`): what happened to accepted work after it
+ * closed. All scalar strings; a cleared key holds "". They describe ONE
+ * close, so an override release clears them with the keys above: an issue
+ * that is closed again starts with no outcome.
+ */
+/** The latest recorded outcome, compact: `clean`, `needed_fixes:2`, `abandoned`, `unknown`. */
+export const WORKGRAPH_OUTCOME_KEY = "workgraph_outcome";
+/** `pending` while an outcome step is expected to report, `recorded` once an outcome exists. */
+export const WORKGRAPH_OUTCOME_STATUS_KEY = "workgraph_outcome_status";
+/** The execution of the outcome step launched for the latest close. */
+export const WORKGRAPH_OUTCOME_EXECUTION_ID_KEY = "workgraph_outcome_execution_id";
+/** ISO time after which a pending outcome is recorded as `unknown`. */
+export const WORKGRAPH_OUTCOME_DEADLINE_KEY = "workgraph_outcome_deadline";
+
+/** Every outcome key, for the one writer that clears them all (override release). */
+export const WORKGRAPH_OUTCOME_KEYS: readonly string[] = [
+  WORKGRAPH_OUTCOME_KEY,
+  WORKGRAPH_OUTCOME_STATUS_KEY,
+  WORKGRAPH_OUTCOME_EXECUTION_ID_KEY,
+  WORKGRAPH_OUTCOME_DEADLINE_KEY,
+];
+
+/**
  * The lifecycle phase union (README "Durable lifecycle metadata"). the store'
  * four native statuses stay untouched; this is workgraph semantics stored in
  * `workgraph_phase`. Legal edges live in `src/lifecycle.ts`'s LEGAL table.
@@ -334,7 +357,15 @@ export type LeaseEvent =
   /** Judgment: the second look at a reviewer's blocking findings could not
    *  be obtained (rejected, not accepted or not finished in time, a failed
    *  or non-independent completion, an invalid answer). The blockers stand. */
-  | "recheck-failed";
+  | "recheck-failed"
+  /** The caller-defined outcome step was accepted by an executor for a
+   *  closed issue. Carries its execution id and the deadline after which a
+   *  silent step is recorded as `unknown`. No lease is held for it. */
+  | "outcome-launched"
+  /** An outcome record was written for a closed issue: by the outcome tool,
+   *  or by the core as `unknown` when the step could not run or never
+   *  reported. Carries the outcome and who recorded it. */
+  | "outcome-recorded";
 
 // ---------------------------------------------------------------------------
 // Verdict shapes. A reviewer completion carries a `verdict` field
@@ -618,6 +649,35 @@ export const AnswerDecisionParams = Type.Object({
   }),
 });
 export type AnswerDecisionParamsT = Static<typeof AnswerDecisionParams>;
+
+export const RecordOutcomeParams = Type.Object({
+  id: Type.String({ description: "Closed, accepted issue the outcome is about" }),
+  outcome: StringEnum(["clean", "needed_fixes", "abandoned"], {
+    description:
+      "clean: the accepted work needed nothing more; needed_fixes: it needed follow-up fixes; abandoned: it was dropped or reverted",
+  }),
+  fixRounds: Type.Optional(
+    Type.Integer({
+      minimum: 0,
+      description: "How many rounds of fixes the work needed after it closed (with needed_fixes)",
+    }),
+  ),
+  summary: Type.String({
+    minLength: 1,
+    description: "One line on what happened after the close",
+  }),
+});
+export type RecordOutcomeParamsT = Static<typeof RecordOutcomeParams>;
+
+export const ScorecardParams = Type.Object({
+  windowDays: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      description: "Count issues closed within this many days (default 7)",
+    }),
+  ),
+});
+export type ScorecardParamsT = Static<typeof ScorecardParams>;
 
 export const StatusParams = Type.Object({
   id: Type.String({ description: "Issue id to inspect" }),

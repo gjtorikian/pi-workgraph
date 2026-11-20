@@ -25,15 +25,26 @@
  * which composes these. Everything here is fenced + idempotent: a
  * reconciliation that crashes midway is safe to re-run — unprocessed issues
  * simply wait for the next start or the sweep.
+ *
+ * OUTCOME STEPS are the one thing recovered here that holds no lease. A step
+ * launched after a close (`src/outcome.ts`) is recorded on the CLOSED issue
+ * as `workgraph_outcome_status: "pending"` with its execution id and a
+ * deadline. {@link pendingOutcomes} reads those back and splits them on the
+ * deadline: one still inside it is re-tracked and left alone, since its
+ * child may be running and can still report through the outcome tool; one
+ * past it is the coordinator's to record as `unknown`.
  */
 import type { EventBus } from "@earendil-works/pi-coding-agent";
 import { AUDIT_PREFIX } from "./audit.ts";
 import { parseBar, type Bar } from "./check.ts";
 import { listComments, listInProgressUpdatedBefore } from "./store.ts";
+import { listPendingOutcomes, outcomeDeadlinePassed } from "./outcome.ts";
 import { leaseExpiresAtOf, leaseHolderOf, rfc3339 } from "./lease.ts";
 import {
   baseCommitOf,
   baseTreeOf,
+  outcomeDeadlineOf,
+  outcomeExecutionIdOf,
   resultCommitOf,
   resultTreeOf,
   workflowRunIdOf,
@@ -93,6 +104,42 @@ export function isRunHeld(issue: WorkIssue): boolean {
     holder.startsWith(WORKFLOW_RUN_PREFIX) &&
     workflowRunIdOf(issue) !== undefined
   );
+}
+
+/** An outcome step a closed issue is still waiting on, as its metadata recorded it. */
+export interface PendingOutcome {
+  issueId: string;
+  /** The closed run the step follows (absent only on hand-written metadata). */
+  workflowRunId?: string;
+  executionId?: string;
+  deadline?: string;
+}
+
+/**
+ * Every closed issue whose outcome is still `pending`, split on its
+ * deadline against `nowMs`: `due` (the deadline passed, or cannot be read)
+ * and `waiting`. Reads metadata only; what to do with either list is the
+ * coordinator's.
+ */
+export async function pendingOutcomes(
+  cwd: string,
+  nowMs: number,
+): Promise<{ due: PendingOutcome[]; waiting: PendingOutcome[] }> {
+  const due: PendingOutcome[] = [];
+  const waiting: PendingOutcome[] = [];
+  for (const issue of await listPendingOutcomes(cwd)) {
+    const workflowRunId = workflowRunIdOf(issue);
+    const executionId = outcomeExecutionIdOf(issue);
+    const deadline = outcomeDeadlineOf(issue);
+    const pending: PendingOutcome = {
+      issueId: issue.id,
+      ...(workflowRunId !== undefined ? { workflowRunId } : {}),
+      ...(executionId !== undefined ? { executionId } : {}),
+      ...(deadline !== undefined ? { deadline } : {}),
+    };
+    (outcomeDeadlinePassed(issue, nowMs) ? due : waiting).push(pending);
+  }
+  return { due, waiting };
 }
 
 /**

@@ -138,6 +138,15 @@ export const ExecutorOffer = Type.Object({
   maxConcurrency: Type.Optional(Type.Number()),
   available: Type.Optional(Type.Boolean()),
   priority: Type.Optional(Type.Number()),
+  /**
+   * True when the executor can launch a run in the BACKGROUND: the run is
+   * accepted on a launch receipt, takes none of the executor's foreground
+   * capacity, and its end is still reported as `run:completed`. Absent or
+   * false means every run is a foreground run. Only the outcome step
+   * (`src/outcome.ts`) asks for one, and it asks only an executor that
+   * offers this.
+   */
+  supportsBackground: Type.Optional(Type.Boolean()),
 });
 export type ExecutorOfferT = Static<typeof ExecutorOffer>;
 
@@ -219,6 +228,17 @@ export const RunRequest = Type.Object({
   decision: Type.Optional(
     Type.Object({ question: Type.String(), answer: Type.String() }),
   ),
+  /**
+   * Launch the run in the executor's background mode (see
+   * `ExecutorOffer.supportsBackground`). Sent only with role `finalizer`,
+   * for the outcome step that follows a close: the issue is closed and no
+   * lease is held, so `leaseEpoch` is the closed run's last epoch and
+   * serves correlation only. `instructions` are the caller's own and must
+   * reach the run unchanged; what the core adds travels in a tolerated
+   * extra field, `outcomeReport`. Optional and v1-safe, but validated once
+   * present: a value that is not a boolean fails the whole request.
+   */
+  background: Type.Optional(Type.Boolean()),
 });
 export type RunRequestT = Static<typeof RunRequest>;
 
@@ -441,6 +461,29 @@ export type ActivityT = Static<typeof Activity>;
  */
 export const SUBAGENTS_PACKAGE_NAME = "pi-subagents";
 export const SUBAGENTS_SUPPORTED_VERSION_RANGE = "0.34";
+
+/**
+ * The upstream `major.minor` lines whose BACKGROUND launch the bridge has
+ * verified by reading the published source (never by running it): an async
+ * request answers with a launch receipt carrying the run's id, the end of
+ * that run is announced as `subagent:async-complete` with the same id, and
+ * an async launch does not take the foreground lock. The bridge offers
+ * `supportsBackground` only on one of these lines. 0.34 is absent on
+ * purpose: there an async launch goes through the same single-dispatch
+ * guard as a foreground call, so one sent while a foreground run is in
+ * flight is refused as a duplicate.
+ */
+export const SUBAGENTS_BACKGROUND_VERSION_LINES: readonly string[] = [
+  "0.41",
+  "0.89",
+];
+
+/** True when `version` is on a line whose background launch was verified. */
+export function subagentsSupportsBackground(version: string): boolean {
+  return SUBAGENTS_BACKGROUND_VERSION_LINES.some((line) =>
+    subagentsVersionInRange(version, line),
+  );
+}
 
 /** True when `version` (e.g. "0.34.8") falls inside a `major.minor` prefix range. */
 export function subagentsVersionInRange(

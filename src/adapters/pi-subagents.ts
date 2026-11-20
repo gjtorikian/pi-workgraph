@@ -54,6 +54,7 @@ import {
   RunCancel,
   RunRequest,
   SUBAGENTS_PACKAGE_NAME,
+  subagentsSupportsBackground,
   subagentsVersionInRange,
   type ExecutorOfferT,
   type ExecutorRoleT,
@@ -79,6 +80,29 @@ export function isPiSubagentProcess(env = process.env): boolean {
  * Upstream event names and shapes re-verified against pi-subagents 0.34.8.
  * EVENT NAMES ONLY — never import from the package;
  * `test/helpers/fake-subagents.ts` fakes this exact surface.
+ *
+ * BACKGROUND LAUNCH, verified by reading the published source of 0.41.0 and
+ * 0.89.1 (read, never executed), and offered only on those lines
+ * (`SUBAGENTS_BACKGROUND_VERSION_LINES` in `src/protocol.ts`):
+ *  (a) a `subagent:slash:request` with `async: true` and no `foregroundOnly`
+ *      emits `started` and then answers on `subagent:slash:response` with a
+ *      launch RECEIPT: `details: { mode: "single", runId, results: [],
+ *      asyncId, asyncDir, … }`, where `asyncId` equals `runId`
+ *      (runs/background/async-execution, 0.41.0 line 1549);
+ *  (b) the end of that run is `subagent:async-complete`, carrying the result
+ *      file plus `runId`: `{ id, runId, success, state, results[] }`
+ *      (runs/background/result-watcher). It is emitted only in the session
+ *      that launched the run, so after a restart it never arrives;
+ *  (c) an async launch skips the session-wide `subagentInProgress` latch
+ *      that serializes foreground calls (runs/foreground/subagent-executor,
+ *      0.41.0 lines 5199-5208).
+ * 0.34.0 was read as well and fails (c): there every non-management call,
+ * async included, takes the single-dispatch guard for the length of the
+ * launch, so a background launch sent while a foreground run is in flight
+ * is refused as a duplicate. The bridge offers no background launch there.
+ * A `worktree` parameter of any value is rejected by 0.41+ before `started`,
+ * so a background launch never sends one. An async launch honors
+ * `timeoutMs`.
  */
 export const UPSTREAM_EVENTS = {
   /** `{requestId, params}` → runs `executor.execute` (slash-bridge.ts:74-158). */
@@ -97,6 +121,12 @@ export const UPSTREAM_EVENTS = {
   cancel: "subagent:slash:cancel",
   /** Detached child process has exited (verified against pi-subagents 0.41). */
   foregroundComplete: "subagent:foreground-complete",
+  /**
+   * `{id, runId, success, state, results[]}` — a background (async) run has
+   * ended; `runId` is the `asyncId` of its launch receipt. Verified against
+   * pi-subagents 0.41.0 and 0.89.1 (see the comment above).
+   */
+  asyncComplete: "subagent:async-complete",
 } as const;
 
 /**
@@ -141,8 +171,15 @@ export function resolveSubagentAgent(
   );
 }
 
-/** Accepted runs, including queued work. Upstream foreground calls are serial. */
+/**
+ * Accepted FOREGROUND runs, including queued work. Upstream foreground calls
+ * are serial. A background run (the outcome step) is not one of them: it
+ * takes no foreground slot upstream and is not counted here.
+ */
 export const PI_SUBAGENTS_MAX_CONCURRENCY = 4;
+
+/** How long a background outcome step may run upstream when none is configured (2 h). */
+export const PI_SUBAGENTS_BACKGROUND_TIMEOUT_MS = 7_200_000;
 
 /**
  * Deliberately above in-session's implicit 0: an operator who opted into
@@ -172,8 +209,10 @@ export interface PiSubagentsDeps {
 export interface PiSubagentsController {
   /** True when the bridge actually registered (configured + version-gated). */
   active(): boolean;
-  /** Number of live bridged runs (tests). */
+  /** Number of live bridged foreground runs, queued ones included (tests). */
   activeRunCount(): number;
+  /** Number of live background runs: launched, or awaiting their receipt (tests). */
+  backgroundRunCount(): number;
   /** Unsubscribe every event-bus handler (tests). */
   teardown(): void;
 }
@@ -239,6 +278,14 @@ type BridgedWorkspace = WorkflowWorkspace | { path: string };
 
 interface BridgedRun {
   detached?: { runId?: string; question: string };
+  /**
+   * Set on a BACKGROUND run (the outcome step). It is kept apart from the
+   * foreground runs: it is never queued, never the submitted foreground
+   * run, and takes none of the four accepted-run slots. `asyncId` is the
+   * upstream run id from the launch receipt, unset until that arrives; the
+   * run's end is the `subagent:async-complete` event carrying it.
+   */
+  background?: { asyncId?: string };
   workspace?: BridgedWorkspace;
   requestId: string;
   workflowRunId: string;
@@ -252,7 +299,8 @@ interface BridgedRun {
   recheck: boolean;
   /** messageId of the `run:request` (inReplyTo on accepted/rejected). */
   requestMessageId: string;
-  /** Accepted by our queue or by upstream's started event. */
+  /** Accepted by our queue or by upstream's started event (a background
+   *  run: by its launch receipt). */
   accepted: boolean;
   /** The request has been forwarded upstream. */
   submitted: boolean;
@@ -399,6 +447,77 @@ function requestedRecheck(
     });
   }
   return blockers;
+}
+
+/** What the core supplies to an outcome step beside the caller's instructions. */
+interface RequestedOutcomeReport {
+  issueId: string;
+  stamp: Record<string, unknown>;
+  finalization?: unknown;
+  instruction: string;
+}
+
+/**
+ * The `outcomeReport` of a background request, or undefined when it has none
+ * or the shape is wrong. A tolerated extra field like the reviewer's, so it
+ * arrives unvalidated and is checked here.
+ */
+function requestedOutcomeReport(
+  msg: RunRequestT & { outcomeReport?: unknown },
+): RequestedOutcomeReport | undefined {
+  const raw = msg.outcomeReport;
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return undefined;
+  }
+  const { issueId, stamp, finalization, instruction } = raw as {
+    issueId?: unknown;
+    stamp?: unknown;
+    finalization?: unknown;
+    instruction?: unknown;
+  };
+  if (
+    typeof issueId !== "string" ||
+    typeof instruction !== "string" ||
+    stamp === null ||
+    typeof stamp !== "object" ||
+    Array.isArray(stamp)
+  ) {
+    return undefined;
+  }
+  return {
+    issueId,
+    stamp: stamp as Record<string, unknown>,
+    ...(finalization !== undefined ? { finalization } : {}),
+    instruction,
+  };
+}
+
+/**
+ * The task prompt for a BACKGROUND run (the outcome step): the caller's
+ * instructions exactly as configured, then a separate block holding what the
+ * core supplied (the closed issue, its close stamp, the finalization result
+ * when there is one, and how to report). Nothing is put in front of the
+ * instructions and nothing is woven into them, and none of the workflow
+ * sentences {@link buildSubagentTask} adds for a supervised role appear: the
+ * issue is closed and this run is judged by nobody. A request whose
+ * `outcomeReport` is missing or malformed gets the instructions alone.
+ */
+export function buildOutcomeTask(
+  msg: RunRequestT & { outcomeReport?: unknown },
+): string {
+  const instructions = msg.instructions ?? "";
+  const report = requestedOutcomeReport(msg);
+  if (report === undefined) return instructions;
+  const block = [
+    "---",
+    `[workgraph outcome step] Issue ${report.issueId}: "${msg.issue.title}" is closed; its work was accepted. Supplied by the workgraph coordinator:`,
+    `Close stamp: ${JSON.stringify(report.stamp)}`,
+    ...(report.finalization !== undefined
+      ? [`Finalization result: ${JSON.stringify(report.finalization)}`]
+      : []),
+    report.instruction,
+  ];
+  return `${instructions}\n\n${block.join("\n")}`;
 }
 
 /** The task prompt an upstream agent receives for a bridged run. */
@@ -572,6 +691,7 @@ export function registerPiSubagentsExecutor(
   const inert: PiSubagentsController = {
     active: () => false,
     activeRunCount: () => 0,
+    backgroundRunCount: () => 0,
     teardown: () => {},
   };
 
@@ -603,8 +723,23 @@ export function registerPiSubagentsExecutor(
     return inert;
   }
 
-  /** Live bridged runs by upstream requestId. */
+  /**
+   * Whether the installed upstream line had its background launch verified.
+   * Decides `supportsBackground` on the offer and whether a background
+   * request is launched at all; an unverified line gets neither.
+   */
+  const backgroundCapable = subagentsSupportsBackground(version);
+
+  /** Live bridged FOREGROUND runs by upstream requestId, queued ones included. */
   const runs = new Map<string, BridgedRun>();
+  /**
+   * Live BACKGROUND runs by upstream requestId. A map of its own on
+   * purpose: everything that reads `runs` (the capacity count, the offer's
+   * `available`, the serial queue in `launchNext`) is about foreground
+   * calls, and a background run that sat there would hold one of the four
+   * slots for hours and could be submitted a second time.
+   */
+  const backgroundRuns = new Map<string, BridgedRun>();
   const unsubs: (() => void)[] = [];
   const haltedEpochs = new Map<string, number>();
   unsubs.push(
@@ -679,6 +814,8 @@ export function registerPiSubagentsExecutor(
   // pi-subagents rejects overlapping foreground calls, even though its slash
   // bridge emits started before checking that lock. Own queued requests so
   // they can be accepted within the protocol deadline and cancelled locally.
+  // Background runs are not in `runs` and never pass through here: upstream
+  // launches them outside that lock, so they are sent at once.
   function launchNext(): void {
     if ([...runs.values()].some((run) => run.submitted)) {
       reportQueue();
@@ -699,7 +836,9 @@ export function registerPiSubagentsExecutor(
     workflowRunId: string,
     executionId?: string,
   ): BridgedRun | undefined {
-    for (const run of runs.values()) {
+    // Foreground first: a cancel that names no execution means the run the
+    // coordinator supervises, never an outcome step that follows a close.
+    for (const run of [...runs.values(), ...backgroundRuns.values()]) {
       if (run.workflowRunId !== workflowRunId) continue;
       if (executionId !== undefined && run.executionId !== executionId)
         continue;
@@ -869,9 +1008,13 @@ export function registerPiSubagentsExecutor(
         inReplyTo: msg.messageId,
         executorId: PI_SUBAGENTS_EXECUTOR_ID,
         adapterVersion: PI_SUBAGENTS_ADAPTER_VERSION,
-        roles: deps.getConfig().finalization
-          ? [...PI_SUBAGENTS_ROLES, "finalizer"]
-          : [...PI_SUBAGENTS_ROLES],
+        // `finalizer` serves two steps: finalization (before the close) and
+        // the outcome step (after it, in the background). Offered once when
+        // either is configured.
+        roles:
+          deps.getConfig().finalization || deps.getConfig().outcome
+            ? [...PI_SUBAGENTS_ROLES, "finalizer"]
+            : [...PI_SUBAGENTS_ROLES],
         harness: "pi-subagents",
         isolation: "worktree",
         supportsCancellation: true,
@@ -880,6 +1023,7 @@ export function registerPiSubagentsExecutor(
         maxConcurrency: PI_SUBAGENTS_MAX_CONCURRENCY,
         available: runs.size < PI_SUBAGENTS_MAX_CONCURRENCY,
         priority: PI_SUBAGENTS_PRIORITY,
+        ...(backgroundCapable ? { supportsBackground: true } : {}),
       };
       pi.events.emit(CH.offer, offer);
     }),
@@ -914,7 +1058,25 @@ export function registerPiSubagentsExecutor(
       }
 
       const mapping = ROLE_MAP[msg.role];
-      if (msg.role === "finalizer" && !deps.getConfig().finalization) {
+      // A `finalizer` request is one of two steps, told apart by the
+      // background flag, and each needs the key that configures it.
+      const background = msg.background === true;
+      if (background) {
+        if (msg.role !== "finalizer") {
+          reject(`background launch is not supported for role ${msg.role}`);
+          return;
+        }
+        if (!deps.getConfig().outcome) {
+          reject("the outcome step is disabled");
+          return;
+        }
+        if (!backgroundCapable) {
+          reject(
+            `background launch is not verified for ${SUBAGENTS_PACKAGE_NAME} ${version}`,
+          );
+          return;
+        }
+      } else if (msg.role === "finalizer" && !deps.getConfig().finalization) {
         reject("finalization is disabled");
         return;
       }
@@ -930,7 +1092,8 @@ export function registerPiSubagentsExecutor(
         reject(`unsupported role: ${msg.role}`);
         return;
       }
-      if (runs.size >= PI_SUBAGENTS_MAX_CONCURRENCY) {
+      // Foreground capacity only: a background run takes no slot.
+      if (!background && runs.size >= PI_SUBAGENTS_MAX_CONCURRENCY) {
         reject("at-capacity");
         return;
       }
@@ -949,10 +1112,16 @@ export function registerPiSubagentsExecutor(
       //    judge work an in-session implementer left in the user's checkout.
       //    A request without a path keeps the older behavior: the retained
       //    worktree when finalization is configured, else an upstream one.
+      //  - a background finalizer (the outcome step): the directory the
+      //    request names, else the source checkout. Never a worktree cut for
+      //    it, and never the `worktree` parameter, which upstream lines that
+      //    can launch in the background reject outright.
       let workspace: BridgedWorkspace | undefined;
       const planning = msg.role === "planner" || msg.role === "plan_critic";
       if (!planning && msg.role !== "implementer" && msg.workspace.path) {
         workspace = { path: msg.workspace.path };
+      } else if (background) {
+        if (msg.workspace.repoPath) workspace = { path: msg.workspace.repoPath };
       } else if (
         msg.role === "implementer" ||
         (!planning && deps.getConfig().finalization)
@@ -1002,32 +1171,59 @@ export function registerPiSubagentsExecutor(
         started: false,
         cancelPending: false,
         ...(workspace ? { workspace } : {}),
-        params: {
-          agent,
-          // The slash response must contain the finished child result. Pi's
-          // default background mode returns a launch receipt immediately.
-          async: false,
-          foregroundOnly: true,
-          task: buildSubagentTask(msg),
-          // Workgraph owns this checkout. Modern upstream runtimes reject
-          // the legacy worktree option even when its value is false.
-          ...(workspace
-            ? { cwd: workspace.path }
-            : { worktree: mapping.worktree }),
-          ...(model ? { model } : {}),
-          ...(roleOptions?.skills ? { skill: roleOptions.skills } : {}),
-          ...(msg.role === "finalizer"
-            ? {
-                timeoutMs:
-                  deps.getConfig().finalization?.timeoutMs ?? 3_600_000,
-              }
-            : {}),
-          context: "fresh",
-          ...(msg.outputSchema !== undefined
-            ? { outputSchema: msg.outputSchema }
-            : {}),
-        },
+        ...(background ? { background: {} } : {}),
+        params: background
+          ? {
+              agent,
+              // The slash response is a launch receipt; the run's end comes
+              // later, as `subagent:async-complete`. No `foregroundOnly`.
+              async: true,
+              task: buildOutcomeTask(msg),
+              ...(workspace ? { cwd: workspace.path } : {}),
+              ...(model ? { model } : {}),
+              ...(roleOptions?.skills ? { skill: roleOptions.skills } : {}),
+              timeoutMs:
+                deps.getConfig().outcome?.timeoutMs ??
+                PI_SUBAGENTS_BACKGROUND_TIMEOUT_MS,
+              context: "fresh",
+            }
+          : {
+              agent,
+              // The slash response must contain the finished child result. Pi's
+              // default background mode returns a launch receipt immediately.
+              async: false,
+              foregroundOnly: true,
+              task: buildSubagentTask(msg),
+              // Workgraph owns this checkout. Modern upstream runtimes reject
+              // the legacy worktree option even when its value is false.
+              ...(workspace
+                ? { cwd: workspace.path }
+                : { worktree: mapping.worktree }),
+              ...(model ? { model } : {}),
+              ...(roleOptions?.skills ? { skill: roleOptions.skills } : {}),
+              ...(msg.role === "finalizer"
+                ? {
+                    timeoutMs:
+                      deps.getConfig().finalization?.timeoutMs ?? 3_600_000,
+                  }
+                : {}),
+              context: "fresh",
+              ...(msg.outputSchema !== undefined
+                ? { outputSchema: msg.outputSchema }
+                : {}),
+            },
       };
+      if (background) {
+        // Sent at once, whatever the foreground queue holds. Acceptance is
+        // the launch receipt, handled with the response below.
+        backgroundRuns.set(run.requestId, run);
+        run.submitted = true;
+        pi.events.emit(UPSTREAM_EVENTS.request, {
+          requestId: run.requestId,
+          params: run.params,
+        });
+        return;
+      }
       runs.set(run.requestId, run);
       // A queued acceptance reserves an execution owned by this adapter;
       // it does not claim that an upstream child has already started.
@@ -1045,6 +1241,13 @@ export function registerPiSubagentsExecutor(
       if (data === null || typeof data !== "object") return;
       const requestId = (data as { requestId?: unknown }).requestId;
       if (typeof requestId !== "string") return;
+      // A background run is accepted by its launch receipt, not by
+      // `started`: upstream emits `started` before it has launched anything.
+      const launching = backgroundRuns.get(requestId);
+      if (launching) {
+        launching.started = true;
+        return;
+      }
       const run = runs.get(requestId);
       if (!run || run.started) return;
       run.started = true;
@@ -1112,6 +1315,11 @@ export function registerPiSubagentsExecutor(
       if (data === null || typeof data !== "object") return;
       const payload = data as Partial<UpstreamResponse>;
       if (typeof payload.requestId !== "string") return;
+      const launching = backgroundRuns.get(payload.requestId);
+      if (launching) {
+        onBackgroundResponse(launching, payload);
+        return;
+      }
       const run = runs.get(payload.requestId);
       if (!run || !run.submitted) return; // not an upstream execution
       const first = firstResult(payload.result);
@@ -1226,6 +1434,16 @@ export function registerPiSubagentsExecutor(
         return;
       }
       const run = findByWorkflowRun(msg.workflowRunId, msg.executionId);
+      if (run?.background) {
+        // The acknowledgment is the run's end (`subagent:async-complete`).
+        // Before the receipt there is no upstream id to interrupt yet; the
+        // receipt handler sends the interrupt once it has one.
+        run.cancelPending = true;
+        if (run.background.asyncId !== undefined) {
+          interruptUpstream(run.background.asyncId);
+        }
+        return;
+      }
       if (run) {
         if (!run.submitted) {
           runs.delete(run.requestId);
@@ -1253,15 +1471,127 @@ export function registerPiSubagentsExecutor(
     }),
   );
 
+  /** Ask upstream to interrupt a run it owns by its own run id. The
+   *  management receipt that answers is ignored: it is not the run's exit. */
+  function interruptUpstream(runId: string): void {
+    pi.events.emit(UPSTREAM_EVENTS.request, {
+      requestId: newEnvelope(nowFn).messageId,
+      params: { action: "interrupt", id: runId },
+    });
+  }
+
   function cancelDetached(run: BridgedRun): void {
     if (!run.detached?.runId) return; // No target, no invented acknowledgment.
     // The original slash controller has gone away after detaching. Target
-    // the retained child, and ignore the management receipt: it is not exit.
-    pi.events.emit(UPSTREAM_EVENTS.request, {
-      requestId: newEnvelope(nowFn).messageId,
-      params: { action: "interrupt", id: run.detached.runId },
-    });
+    // the retained child.
+    interruptUpstream(run.detached.runId);
   }
+
+  /**
+   * The slash response to a background launch. A receipt (`asyncId`, no
+   * results, no error) ACCEPTS the run and is all the response ever says
+   * about it. Anything else means nothing was launched: a rejection, since
+   * the coordinator is still inside its accept window.
+   */
+  function onBackgroundResponse(
+    run: BridgedRun,
+    payload: Partial<UpstreamResponse>,
+  ): void {
+    if (run.background?.asyncId !== undefined) return; // repeated receipt
+    const details = (
+      payload.result as { details?: { asyncId?: unknown } } | null | undefined
+    )?.details;
+    const asyncId =
+      payload.isError !== true &&
+      typeof details?.asyncId === "string" &&
+      details.asyncId !== ""
+        ? details.asyncId
+        : undefined;
+    if (asyncId === undefined) {
+      backgroundRuns.delete(run.requestId);
+      if (run.cancelPending) {
+        emitCancelled(run);
+        return;
+      }
+      pi.events.emit(CH.runRejected, {
+        ...newEnvelope(nowFn),
+        inReplyTo: run.requestMessageId,
+        workflowRunId: run.workflowRunId,
+        issueId: run.issueId,
+        leaseEpoch: run.leaseEpoch,
+        executorId: PI_SUBAGENTS_EXECUTOR_ID,
+        reason:
+          typeof payload.errorText === "string" && payload.errorText.length > 0
+            ? `upstream: ${payload.errorText}`
+            : "upstream returned no background launch receipt",
+      });
+      return;
+    }
+    run.background = { asyncId };
+    accept(run);
+    // A cancel that arrived before the receipt had nothing to address.
+    if (run.cancelPending) interruptUpstream(asyncId);
+  }
+
+  // ---- upstream: async-complete → run:completed for a background run ----
+  unsubs.push(
+    pi.events.on(UPSTREAM_EVENTS.asyncComplete, (data) => {
+      if (!data || typeof data !== "object") return;
+      const event = data as {
+        id?: unknown;
+        runId?: unknown;
+        success?: unknown;
+        state?: unknown;
+      };
+      // Matched by the upstream run id of a receipt this bridge holds. An
+      // event for anything else (the user's own background runs, a repeat
+      // for a run already reported) changes nothing.
+      for (const run of backgroundRuns.values()) {
+        const asyncId = run.background?.asyncId;
+        if (
+          asyncId === undefined ||
+          (asyncId !== event.runId && asyncId !== event.id)
+        ) {
+          continue;
+        }
+        backgroundRuns.delete(run.requestId);
+        if (run.cancelPending) {
+          emitCancelled(run);
+          return;
+        }
+        const succeeded = event.success === true;
+        const state = typeof event.state === "string" ? event.state : "unknown";
+        // No structured result on purpose: the step reports through the
+        // outcome tool, and this only says that it ended and how.
+        const completed: RunCompletedT & { workspace?: BridgedWorkspace } = {
+          ...newEnvelope(nowFn),
+          workflowRunId: run.workflowRunId,
+          executionId: run.executionId,
+          issueId: run.issueId,
+          leaseEpoch: run.leaseEpoch,
+          outcome: succeeded ? "success" : "failure",
+          artifacts: [],
+          evidence: [
+            succeeded
+              ? "upstream background run completed"
+              : `upstream background run did not complete successfully (state: ${state})`,
+          ],
+          ...(!succeeded
+            ? { executionError: `upstream background run ended ${state}` }
+            : {}),
+          provenance: {
+            harness: "pi-subagents",
+            ...(typeof run.params.context === "string"
+              ? { context: run.params.context }
+              : {}),
+          },
+          ...(run.workspace ? { workspace: run.workspace } : {}),
+        };
+        pi.events.emit(CH.runCompleted, completed);
+        return;
+      }
+    }),
+  );
   unsubs.push(
     pi.events.on(UPSTREAM_EVENTS.foregroundComplete, (data) => {
       if (!data || typeof data !== "object") return;
@@ -1293,10 +1623,14 @@ export function registerPiSubagentsExecutor(
   return {
     active: () => true,
     activeRunCount: () => runs.size,
+    backgroundRunCount: () => backgroundRuns.size,
     teardown: () => {
       for (const off of unsubs) off();
       unsubs.length = 0;
       runs.clear();
+      // Background children are left running: they belong to closed issues
+      // and report through the outcome tool, not through this bridge.
+      backgroundRuns.clear();
     },
   };
 }

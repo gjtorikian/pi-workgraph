@@ -44,6 +44,10 @@ import {
   WORKGRAPH_GUARD_ALLOWED_BY_KEY,
   WORKGRAPH_GUARD_ALLOWED_KEY,
   WORKGRAPH_GUARD_ROUNDS_KEY,
+  WORKGRAPH_OUTCOME_DEADLINE_KEY,
+  WORKGRAPH_OUTCOME_EXECUTION_ID_KEY,
+  WORKGRAPH_OUTCOME_KEY,
+  WORKGRAPH_OUTCOME_STATUS_KEY,
   WORKGRAPH_LAST_VERDICT_KEY,
   WORKGRAPH_LIFECYCLE_VERSION_KEY,
   WORKGRAPH_PHASE_KEY,
@@ -344,6 +348,29 @@ export function guardAllowedByOf(issue: WorkIssue): string | undefined {
 /** The guards the pending decision is about; empty for an executor's own question. */
 export function decisionGatesOf(issue: WorkIssue): GuardGate[] {
   return guardList(issue, WORKGRAPH_DECISION_GATE_KEY);
+}
+
+/** The latest recorded outcome in its compact form (`needed_fixes:2`), if any. */
+export function outcomeOf(issue: WorkIssue): string | undefined {
+  return bindingValue(issue, WORKGRAPH_OUTCOME_KEY);
+}
+
+/** Where the issue's outcome stands: an outcome step is expected to report, or an outcome exists. */
+export function outcomeStatusOf(
+  issue: WorkIssue,
+): "pending" | "recorded" | undefined {
+  const raw = bindingValue(issue, WORKGRAPH_OUTCOME_STATUS_KEY);
+  return raw === "pending" || raw === "recorded" ? raw : undefined;
+}
+
+/** The execution of the outcome step launched for the latest close, if recorded. */
+export function outcomeExecutionIdOf(issue: WorkIssue): string | undefined {
+  return bindingValue(issue, WORKGRAPH_OUTCOME_EXECUTION_ID_KEY);
+}
+
+/** The ISO time a pending outcome stops being waited for, if recorded. */
+export function outcomeDeadlineOf(issue: WorkIssue): string | undefined {
+  return bindingValue(issue, WORKGRAPH_OUTCOME_DEADLINE_KEY);
 }
 
 // ---------------------------------------------------------------------------

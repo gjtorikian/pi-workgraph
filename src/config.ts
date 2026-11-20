@@ -4,9 +4,11 @@
  * then default. The timers are consumed by the Phase 2 lease layer; only the
  * identity override is load-bearing in Phase 1.
  *
- * A value that does not parse is ignored and logged, with three exceptions
- * that THROW instead: `finalization`, `policy` and `check`. Each decides
- * what may close, so a typo must not quietly become "the default".
+ * A value that does not parse is ignored and logged, with four exceptions
+ * that THROW instead: `finalization`, `outcome`, `policy` and `check`. The
+ * first, third and fourth decide what may close, and `outcome` is a task a
+ * human wrote to run by itself after every close, so a typo in any of them
+ * must not quietly become "the default".
  * `resolveConfig` runs on every `getConfig()` call, which is where an
  * invalid policy or check block stops dispatch; readers that consult
  * neither use {@link resolveConfigWithoutPolicy} and are not stopped by it.
@@ -88,6 +90,13 @@ export interface SubagentsExecutorConfig {
 export interface WorkgraphConfig {
   /** Optional caller-defined work after verification and before closure. */
   finalization?: { instructions: string; timeoutMs?: number };
+  /**
+   * Optional caller-defined step launched in an executor's background mode
+   * AFTER an issue closes (`src/outcome.ts`). `instructions` reach the step
+   * unchanged; `timeoutMs` is how long it may stay silent before its outcome
+   * is recorded as `unknown` (default 2 h). Flag or environment only.
+   */
+  outcome?: { instructions: string; timeoutMs?: number };
   /** Lease time-to-live in milliseconds (default 5 min). */
   leaseTtlMs: number;
   /** Heartbeat interval in milliseconds (default 60 s). */
@@ -268,6 +277,11 @@ const FLAGS = [
     name: "workgraph-finalization",
     description:
       "Optional post-verification task as JSON with instructions and timeoutMs (env WORKGRAPH_FINALIZATION)",
+  },
+  {
+    name: "workgraph-outcome",
+    description:
+      "Optional step launched in the background after an issue closes, as JSON with instructions and timeoutMs; it reports through workgraph_record_outcome (env WORKGRAPH_OUTCOME)",
   },
   {
     name: "workgraph-plan-approval",
@@ -561,6 +575,36 @@ function finalizationValue(pi: ExtensionAPI): WorkgraphConfig["finalization"] {
   };
 }
 
+/**
+ * The outcome step, parsed like {@link finalizationValue} and THROWING like
+ * it on a value that is not one. `instructions` are returned exactly as
+ * written inside the JSON: the step receives them verbatim.
+ */
+function outcomeValue(pi: ExtensionAPI): WorkgraphConfig["outcome"] {
+  const raw = stringValue(pi, "workgraph-outcome", "WORKGRAPH_OUTCOME");
+  if (!raw || raw === "false") return undefined;
+  const value: unknown = JSON.parse(raw);
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error("workgraph-outcome must contain instructions");
+  const input = value as Record<string, unknown>;
+  if (typeof input.instructions !== "string" || !input.instructions.trim())
+    throw new Error("workgraph-outcome requires nonempty instructions");
+  if (
+    input.timeoutMs !== undefined &&
+    (typeof input.timeoutMs !== "number" ||
+      !Number.isFinite(input.timeoutMs) ||
+      input.timeoutMs <= 0 ||
+      input.timeoutMs > 2_147_483_647)
+  )
+    throw new Error("workgraph-outcome timeoutMs must be positive");
+  return {
+    instructions: input.instructions,
+    ...(typeof input.timeoutMs === "number"
+      ? { timeoutMs: input.timeoutMs }
+      : {}),
+  };
+}
+
 function boolValue(
   pi: ExtensionAPI,
   flag: string,
@@ -616,6 +660,7 @@ export function resolveConfigWithoutPolicy(
   );
   return {
     finalization: finalizationValue(pi),
+    outcome: outcomeValue(pi),
     leaseTtlMs: timerValue(
       pi,
       "workgraph-lease-ttl-ms",
