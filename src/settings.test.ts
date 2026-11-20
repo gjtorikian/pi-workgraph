@@ -1,13 +1,15 @@
 /**
  * Declarative settings: the `workgraph` block in Pi's global and project
- * settings files, and the precedence that decides which tier table is in
- * force (flag > project settings > workspace store > global settings).
+ * settings files, the `workgraph.json` beside each, and the precedence that
+ * decides which tier table is in force (flag > project settings > workspace
+ * store > global settings).
  */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveConfig } from "./config.ts";
+import { PolicyConfigError } from "./policy.ts";
 import {
   effectiveTiers,
   noteSessionCwd,
@@ -37,6 +39,13 @@ function writeSettings(dir: string, sub: string | undefined, body: unknown): voi
   const target = sub ? join(dir, sub) : dir;
   mkdirSync(target, { recursive: true });
   writeFileSync(join(target, "settings.json"), typeof body === "string" ? body : JSON.stringify(body));
+}
+
+/** Write a `workgraph.json`: the block itself, with no `workgraph` key around it. */
+function writeWorkgraphFile(dir: string, sub: string | undefined, body: unknown): void {
+  const target = sub ? join(dir, sub) : dir;
+  mkdirSync(target, { recursive: true });
+  writeFileSync(join(target, "workgraph.json"), typeof body === "string" ? body : JSON.stringify(body));
 }
 
 afterEach(() => {
@@ -324,5 +333,117 @@ describe("gate policy from settings", () => {
     writeSettings(project, ".pi", { workgraph: { policy: { high: { maxRevisions: 1 } } } });
     expect(settingsPolicy({ agentDir, cwd: project })).toBe('{"high":{"maxRevisions":1}}');
     expect(settingsPolicy({ agentDir: tempDir("empty"), cwd: tempDir("plain") })).toBeUndefined();
+  });
+});
+
+describe("workgraph.json beside settings.json", () => {
+  it("reads the file as the block itself, in the agent dir and in the project's .pi", () => {
+    const agentDir = tempDir("agent");
+    const project = tempDir("project");
+    writeWorkgraphFile(agentDir, undefined, { tiers: { planner: "anthropic/claude-opus-*" }, store: "central" });
+    writeWorkgraphFile(project, ".pi", { planApproval: "auto" });
+    expect(workgraphSettings({ agentDir, cwd: project })).toEqual({
+      global: { tiers: { planner: { model: "anthropic/claude-opus-*" } }, store: "central" },
+      project: { planApproval: "auto" },
+    });
+  });
+
+  it("reads the two files of one directory as one block: workgraph.json wins per key, executors merge per role", () => {
+    const agentDir = tempDir("agent");
+    writeSettings(agentDir, undefined, {
+      workgraph: {
+        store: "central",
+        planApproval: "auto",
+        policy: { low: { gates: { scope: "off" } } },
+        executors: { planner: "in-session", implementer: "in-session" },
+      },
+    });
+    writeWorkgraphFile(agentDir, undefined, {
+      planApproval: "required",
+      policy: { high: { maxRevisions: 1 } },
+      executors: { implementer: "pi-subagents" },
+    });
+    expect(workgraphSettings({ agentDir, cwd: tempDir("plain") }).global).toEqual({
+      store: "central",
+      planApproval: "required",
+      // Replaced whole, as a project policy replaces a global one.
+      policy: '{"high":{"maxRevisions":1}}',
+      executors: { planner: "in-session", implementer: "pi-subagents" },
+    });
+  });
+
+  it("the directory decides before the file does: project > workspace store > global", async () => {
+    const agentDir = tempDir("agent");
+    const graph = makeScratchGraph({ prefix: "file" });
+    graphs.push(graph);
+    const cwd = graph.dir;
+    const location = { agentDir };
+
+    writeSettings(agentDir, undefined, { workgraph: { tiers: { planner: "g/settings" } } });
+    writeWorkgraphFile(agentDir, undefined, { tiers: { planner: "g/file" } });
+    expect(await effectiveTiers(undefined, cwd, location)).toEqual({
+      tiers: { planner: { model: "g/file" } },
+      origin: "global settings",
+    });
+
+    await storeTiers(cwd, { planner: { model: "w/workspace" } });
+    expect((await effectiveTiers(undefined, cwd, location))?.origin).toBe("workspace");
+
+    // A project settings.json outranks the global workgraph.json.
+    writeSettings(cwd, ".pi", { workgraph: { tiers: { planner: "p/settings" } } });
+    expect(await effectiveTiers(undefined, cwd, location)).toEqual({
+      tiers: { planner: { model: "p/settings" } },
+      origin: "project settings",
+    });
+
+    writeWorkgraphFile(cwd, ".pi", { tiers: { planner: "p/file" } });
+    expect(await effectiveTiers(undefined, cwd, location)).toEqual({
+      tiers: { planner: { model: "p/file" } },
+      origin: "project settings",
+    });
+  });
+
+  it("reports a broken workgraph.json once and leaves settings.json in force", () => {
+    const agentDir = tempDir("agent");
+    writeSettings(agentDir, undefined, { workgraph: { store: "central" } });
+    writeWorkgraphFile(agentDir, undefined, "{ not json");
+    const location = { agentDir, cwd: tempDir("plain") };
+    const { result, logged } = withLoggedErrors(() => [workgraphSettings(location), workgraphSettings(location)]);
+    expect(result).toEqual([{ global: { store: "central" } }, { global: { store: "central" } }]);
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toContain(`ignoring unreadable settings file ${join(agentDir, "workgraph.json")}`);
+  });
+
+  it("reports a pasted-in workgraph key once and reads only the top-level keys", () => {
+    const project = tempDir("project");
+    writeWorkgraphFile(project, ".pi", { workgraph: { planApproval: "auto" }, store: "central" });
+    const location = { agentDir: tempDir("agent"), cwd: project };
+    const { result, logged } = withLoggedErrors(() => [workgraphSettings(location), workgraphSettings(location)]);
+    expect(result).toEqual([{ project: { store: "central" } }, { project: { store: "central" } }]);
+    expect(logged).toEqual([
+      `[pi-workgraph] ${join(project, ".pi", "workgraph.json")}: ignoring the "workgraph" key — this file is the block itself, so move its keys to the top level`,
+    ]);
+  });
+
+  it("feeds config as the settings.json block does, and an invalid policy still stops it", () => {
+    const project = tempDir("project");
+    writeWorkgraphFile(project, ".pi", {
+      check: { command: "npm test" },
+      policy: { low: { gates: { scope: "off" } } },
+    });
+    const mock = makeMockPi();
+    const previous = process.env.WORKGRAPH_POLICY;
+    delete process.env.WORKGRAPH_POLICY;
+    try {
+      noteSessionCwd(project);
+      const config = resolveConfig(asExtensionAPI(mock));
+      expect(config.check).toEqual({ command: "npm test" });
+      expect(config.policy).toEqual({ low: { gates: { scope: "off" } } });
+
+      writeWorkgraphFile(project, ".pi", { policy: { low: { gateMode: "advisory" } } });
+      expect(() => resolveConfig(asExtensionAPI(mock))).toThrow(PolicyConfigError);
+    } finally {
+      if (previous !== undefined) process.env.WORKGRAPH_POLICY = previous;
+    }
   });
 });

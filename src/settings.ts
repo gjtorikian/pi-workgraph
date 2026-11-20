@@ -1,11 +1,12 @@
 /**
- * Declarative configuration from Pi's own settings files — "write the
+ * Declarative configuration from Pi's own settings directories — "write the
  * roster once, it just applies":
  *
- *   ~/.pi/agent/settings.json   (global, every repository)
- *   <repo>/.pi/settings.json    (project, this repository)
+ *   ~/.pi/agent/   (global, every repository)
+ *   <repo>/.pi/    (project, this repository)
  *
- * under one key:
+ * Each directory holds the block in either of two files, or split across
+ * both. In Pi's `settings.json` it sits under one key:
  *
  *   {
  *     "workgraph": {
@@ -19,6 +20,15 @@
  *       "check": { "command": "npm test", "setup": "npm ci" } // default check, and how to prepare a fresh worktree for it
  *     }
  *   }
+ *
+ * In a `workgraph.json` beside it, the file is the block itself, with no
+ * `workgraph` key around it:
+ *
+ *   { "tiers": { ... }, "check": { "command": "npm test" } }
+ *
+ * The two files of one directory are read as one block. Where both set a
+ * key, `workgraph.json` wins; `executors` merges per role, as it does
+ * between project and global.
  *
  * Precedence per value (most explicit wins):
  *   CLI flag / env  >  project settings  >  workspace store (workgraph_tiers tool)  >  global settings  >  default
@@ -42,8 +52,11 @@ import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { loadStoredTiers, parseTiersValue, type TierConfig } from "./tiers.ts";
 
-/** The settings key this extension owns. */
+/** The key this extension owns in Pi's `settings.json`. */
 export const SETTINGS_KEY = "workgraph";
+
+/** The file this extension owns beside each `settings.json`; its content is the block itself. */
+export const SETTINGS_FILE = "workgraph.json";
 
 export interface WorkgraphSettings {
   tiers?: TierConfig;
@@ -70,7 +83,7 @@ export interface SettingsSources {
 export interface SettingsLocation {
   /** Pi's agent dir (default: `getAgentDir()`, i.e. `~/.pi/agent`). */
   agentDir?: string;
-  /** Project directory holding `.pi/settings.json` (default: the session cwd). */
+  /** Project directory holding `.pi/` (default: the session cwd). */
   cwd?: string;
 }
 
@@ -108,10 +121,14 @@ function readJsonFile(path: string): Record<string, unknown> | undefined {
   }
 }
 
-/** Parse the `workgraph` block of one settings object. */
+/** Parse the `workgraph` block of one Pi settings object. */
 export function parseWorkgraphSettings(raw: unknown): WorkgraphSettings | undefined {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return undefined;
-  const block = (raw as Record<string, unknown>)[SETTINGS_KEY];
+  return parseWorkgraphBlock((raw as Record<string, unknown>)[SETTINGS_KEY]);
+}
+
+/** Parse the block itself: the value of the `workgraph` key, or the whole of a `workgraph.json`. */
+export function parseWorkgraphBlock(block: unknown): WorkgraphSettings | undefined {
   if (block === null || typeof block !== "object" || Array.isArray(block)) return undefined;
   const record = block as Record<string, unknown>;
   const out: WorkgraphSettings = {};
@@ -163,14 +180,46 @@ export function parseWorkgraphSettings(raw: unknown): WorkgraphSettings | undefi
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/**
+ * Read one `workgraph.json`. A `workgraph` key at its top level is the
+ * `settings.json` shape pasted in whole; it is reported once per path and
+ * not read, rather than guessed at beside the keys next to it.
+ */
+function readSettingsFile(path: string): WorkgraphSettings | undefined {
+  const raw = readJsonFile(path);
+  if (raw === undefined) return undefined;
+  if (raw[SETTINGS_KEY] !== undefined && !warned.has(`${path}#${SETTINGS_KEY}`)) {
+    warned.add(`${path}#${SETTINGS_KEY}`);
+    console.error(
+      `[pi-workgraph] ${path}: ignoring the "${SETTINGS_KEY}" key — this file is the block itself, so move its keys to the top level`,
+    );
+  }
+  return parseWorkgraphBlock(raw);
+}
+
+/**
+ * One directory's block: the `workgraph` key of its `settings.json` and its
+ * `workgraph.json`, combined the way project and global are — the more
+ * specific file wins per key, and `executors` merges per role.
+ */
+function readSettingsDir(dir: string): WorkgraphSettings | undefined {
+  const shared = parseWorkgraphSettings(readJsonFile(join(dir, "settings.json")));
+  const own = readSettingsFile(join(dir, SETTINGS_FILE));
+  if (!shared || !own) return own ?? shared;
+  const executors = { ...shared.executors, ...own.executors };
+  return {
+    ...shared,
+    ...own,
+    ...(Object.keys(executors).length > 0 ? { executors } : {}),
+  };
+}
+
 /** Read the global and project `workgraph` settings blocks. */
 export function workgraphSettings(location: SettingsLocation = {}): SettingsSources {
   const agentDir = location.agentDir ?? defaultAgentDir();
   const cwd = location.cwd ?? sessionCwd;
-  const global = parseWorkgraphSettings(readJsonFile(join(agentDir, "settings.json")));
-  const project = cwd
-    ? parseWorkgraphSettings(readJsonFile(join(cwd, ".pi", "settings.json")))
-    : undefined;
+  const global = readSettingsDir(agentDir);
+  const project = cwd ? readSettingsDir(join(cwd, ".pi")) : undefined;
   return {
     ...(global ? { global } : {}),
     ...(project ? { project } : {}),

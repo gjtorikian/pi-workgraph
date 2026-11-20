@@ -89,6 +89,9 @@ Tell workgraph how to check work in this repository, once, in
 { "workgraph": { "check": { "command": "npm test" } } }
 ```
 
+The block can also go in a file of its own; see
+[Where settings live](#where-settings-live).
+
 Then:
 
 ```bash
@@ -318,11 +321,43 @@ current repository (stored in its workspace), and `/workgraph tiers
 [json|off]` is the slash form. Precedence, most explicit first:
 
 1. `--workgraph-tiers` flag or `WORKGRAPH_TIERS` env (headless/CI overrides)
-2. `.pi/settings.json` in the repository
+2. `.pi/workgraph.json` or `.pi/settings.json` in the repository
 3. what `workgraph_tiers` stored in the repository's workspace
-4. `~/.pi/agent/settings.json`
+4. `~/.pi/agent/workgraph.json` or `~/.pi/agent/settings.json`
 
 `planApproval` follows the same files (flag/env > project > global).
+
+## Where settings live
+
+Every `"workgraph": { ... }` block in this README can sit in either of two
+files, in each of Pi's two settings directories:
+
+|                                               | Every repository             | One repository       |
+| --------------------------------------------- | ---------------------------- | -------------------- |
+| Pi's settings file, under the `workgraph` key | `~/.pi/agent/settings.json`  | `.pi/settings.json`  |
+| A file of its own                             | `~/.pi/agent/workgraph.json` | `.pi/workgraph.json` |
+
+A `workgraph.json` is the block itself, with no `workgraph` key around it:
+
+```json
+{
+  "check": { "command": "npm test" },
+  "planApproval": "required"
+}
+```
+
+Use it when the block has outgrown your Pi settings, or to keep a
+repository's workgraph settings in a file apart from its Pi ones. Nothing
+has to move: a block in `settings.json` keeps working.
+
+When a directory has both files, they are read as one block. Where both set
+the same key, `workgraph.json` wins; `executors` merges per role. The
+directory still decides first: a key set in the repository's `.pi/`
+outranks the same key in `~/.pi/agent/`, whichever file it is in.
+
+A `workgraph` key at the top of a `workgraph.json` is not read, and is
+reported once. `~/.pi/agent` follows `PI_CODING_AGENT_DIR`, as Pi's own
+files do.
 
 ## Where the store lives
 
@@ -1054,7 +1089,7 @@ check.
 
 ### The frozen bar
 
-Pi settings are read from a file inside the checkout on every lookup, and
+Settings are read from files inside the checkout on every lookup, and
 the issue's metadata sits in a database an agent with a shell can reach.
 So that an implementer cannot edit what it is judged against, the
 coordinator captures **the bar** when it claims an issue and uses only
