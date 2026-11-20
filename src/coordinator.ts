@@ -765,6 +765,16 @@ export function registerCoordinator(
      *  NOT held runs: no lease, no heartbeat, never in `heldRuns` or
      *  `inFlightCounts`. */
     outcomes: Map<string, OutcomeLaunch>;
+    /** Judgments an invalid config stopped, keyed by workflowRunId: the run
+     *  and the result it was judging. The first tick whose config resolves
+     *  resumes them (`resumeStalledJudgments`). */
+    stalledJudgments: Map<
+      string,
+      { run: CoordinatorRun; author: RunCompletedT }
+    >;
+    /** Startup reconciliation stopped on an invalid config and has not run
+     *  since. The first tick whose config resolves runs it again. */
+    reconcileOwed: boolean;
   }
 
   const state: CoordinatorState = {
@@ -779,6 +789,8 @@ export function registerCoordinator(
     lastSkipLog: null,
     seen: new SeenMessages(),
     outcomes: new Map(),
+    stalledJudgments: new Map(),
+    reconcileOwed: false,
   };
 
   pi.registerFlag(COORDINATOR_FLAG, {
@@ -842,6 +854,27 @@ export function registerCoordinator(
       logSkipOnce(msg);
       return lastConfig ?? DEFAULT_CONFIG;
     }
+  }
+
+  /** Whether the config validates right now. Logs nothing: the caller's own
+   *  path reports an invalid one. */
+  function configResolves(): boolean {
+    try {
+      currentConfig();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** The run under judgment whose work sits in `cwd`, if there is one: what
+   *  the claim-wait rule asks before a non-isolated executor starts there. */
+  function underReviewIn(cwd: string): CoordinatorRun | undefined {
+    return state.judged.find(
+      (judged) =>
+        judged.workspacePath !== undefined &&
+        samePath(judged.workspacePath, cwd),
+    );
   }
 
   function onInvalid(channel: string, error: ProtocolError): void {
@@ -2216,6 +2249,8 @@ export function registerCoordinator(
     box.closed = true;
     wakeInbox(box);
     state.inboxes.delete(workflowRunId);
+    // A judgment waiting on a valid config has nothing left to resume.
+    state.stalledJudgments.delete(workflowRunId);
   }
 
   /** Remove a run from judgment tracking (terminal, escalated, or stale). */
@@ -3232,6 +3267,22 @@ export function registerCoordinator(
         "no implementer-capable executor remained after planning",
       );
       return;
+    }
+    // CLAIM-WAIT, at the second place work can start in a checkout. The
+    // tick already held this claim back if the implementer it expected was
+    // non-isolated and the checkout was occupied, so this is the race: the
+    // offers changed while the plan was written. Starting here would change
+    // the tree the run under judgment is compared against, so the issue
+    // goes back to the pool and waits there like any other claim.
+    if (implementer.isolation === "none") {
+      const underReview = underReviewIn(run.cwd);
+      if (underReview) {
+        await handBackAfterPlanning(
+          run,
+          `workspace under review: ${underReview.lease.issueId}`,
+        );
+        return;
+      }
     }
 
     run.executorId = implementer.executorId;
@@ -4986,6 +5037,12 @@ export function registerCoordinator(
     // close without one is not graded, so there is nothing to launch for.
     const stamp = await latestStamp(cwd, issueId);
     if (stamp === undefined || stamp.workflowRunId !== run.workflowRunId) {
+      // Said, not skipped silently: the step is configured and the caller
+      // expects it to run. A close writes no stamp when the gates that feed
+      // one (`tree-binding` and `check`) are both off for it.
+      logSkipOnce(
+        `outcome step for ${issueId} not launched: the close wrote no stamp to grade (tree-binding and check are both off for it)`,
+      );
       return;
     }
     const closed = await show(cwd, issueId);
@@ -5268,8 +5325,16 @@ export function registerCoordinator(
       // Throws on an invalid policy: judge() logs the message and the run
       // stays parked in judging under its lease. Work is never judged while
       // the configuration does not validate, even though every decision
-      // below reads the FROZEN bar and not this config.
-      const config = currentConfig();
+      // below reads the FROZEN bar and not this config. The run and the
+      // result it was judging are remembered, so the first tick whose config
+      // resolves judges it again (`resumeStalledJudgments`).
+      let config: WorkgraphConfig;
+      try {
+        config = currentConfig();
+      } catch (e) {
+        state.stalledJudgments.set(run.workflowRunId, { run, author });
+        throw e;
+      }
       const issue = await show(run.cwd, run.lease.issueId);
       // The bar: frozen at claim. The live issue and config are read above
       // for what is not part of it (the attempt, the failure fingerprint,
@@ -6047,9 +6112,47 @@ export function registerCoordinator(
   // The tick
   // -------------------------------------------------------------------------
 
+  /**
+   * Judge again every run whose judgment an invalid config stopped, now
+   * that the config resolves. A run that was released, escalated or torn
+   * down meanwhile has no inbox and is skipped. The loop starts over for
+   * the result it had reached, as it does after a restart: its retry count
+   * and its excluded reviewers are not carried, and receipts already
+   * written for the tree are reused.
+   *
+   * DETACHED, like the completion chain that started each judgment the
+   * first time: a review can take whole rounds, and a tick stays bounded
+   * by its discovery and accept timeouts. judge() is error-isolated, so
+   * nothing is left unhandled. Synchronous up to each chain's first await,
+   * so the tick can call it before taking its latch.
+   */
+  function resumeStalledJudgments(): void {
+    if (state.stalledJudgments.size === 0 || !configResolves()) return;
+    const stalled = [...state.stalledJudgments.values()];
+    state.stalledJudgments.clear();
+    for (const { run, author } of stalled) {
+      if (!state.judged.includes(run)) continue;
+      if (!state.inboxes.has(run.workflowRunId)) continue;
+      void judge(run, author);
+    }
+  }
+
   async function tick(ctx: ExtensionContext): Promise<void> {
     if (state.ticking) return; // reentrant tick — checked/set before any await
     if (state.reconciling) return; // recovery first — ticks resume after
+    // WORK AN INVALID CONFIG STOPPED. Fixing the config is enough to pick
+    // it up again: no restart. A startup reconciliation that never read the
+    // store runs now, while its leases may still be live, and before this
+    // tick claims anything, as at startup. Only the adoption pass is
+    // awaited: the judgments it resumes run detached, so the tick still
+    // dispatches in the same pass. The pass takes its own latch, so the
+    // guards are read again after it.
+    if (state.reconcileOwed && configResolves()) {
+      await reconcilePass(ctx);
+      if (state.ticking || state.reconciling) return;
+    }
+    // Judgments parked on the same error start again.
+    resumeStalledJudgments();
     state.ticking = true;
     try {
       // Before the tick proper: that one stops on an invalid policy, on a
@@ -6238,12 +6341,33 @@ export function registerCoordinator(
     // compared against — so the claim waits for it to resolve. Review of
     // in-session work is therefore one issue at a time (decision log). The
     // rule is per process, and isolated executors are never held by it.
-    if (selected.isolation === "none") {
-      const underReview = state.judged.find(
-        (judged) =>
-          judged.workspacePath !== undefined &&
-          samePath(judged.workspacePath, ctx.cwd),
-      );
+    //
+    // An auto-approved plan reaches its implementer under this same claim
+    // (dispatchImplementation), so the executor claimed for is not the only
+    // one that will work under it: the implementer this discovery round
+    // would pick counts too. Waiting here, before the claim, is what keeps
+    // an isolated planner from planning an issue that would then be handed
+    // back, and planned again, for as long as the checkout is occupied.
+    let implementerAfterPlan: ExecutorOfferT | undefined;
+    if (role === "planner" && (config.planApproval ?? "required") === "auto") {
+      try {
+        implementerAfterPlan = selectExecutor(
+          offers,
+          { role: "implementer", requiresIsolation: false },
+          pinFor("implementer"),
+          inFlightCounts(),
+        );
+      } catch (e) {
+        // A pinned implementer that is absent: dispatchImplementation hands
+        // the issue back for that reason, and this rule has nothing to add.
+        if (!(e instanceof ExecutorSelectionError)) throw e;
+      }
+    }
+    if (
+      selected.isolation === "none" ||
+      implementerAfterPlan?.isolation === "none"
+    ) {
+      const underReview = underReviewIn(ctx.cwd);
       if (underReview) {
         logSkipOnce(`workspace under review: ${underReview.lease.issueId}`);
         return;
@@ -6598,6 +6722,8 @@ export function registerCoordinator(
     // the next start re-tracks from metadata, and the deadline settles
     // whatever never reports.
     state.outcomes.clear();
+    // The next session start reconciles for itself.
+    state.reconcileOwed = false;
     // Never throws: every held lease below must still be released.
     const config = heldConfig();
     const active = state.active;
@@ -6758,15 +6884,33 @@ export function registerCoordinator(
   // -------------------------------------------------------------------------
 
   async function reconcile(ctx: ExtensionContext): Promise<ReconcileReport> {
+    const { report, resumed } = await reconcilePass(ctx);
+    // Resumed judgment chains run OUTSIDE the latch (they can take whole
+    // discovery/review rounds); awaiting them here lets callers span the
+    // full convergence. judge() is error-isolated — nothing unwinds.
+    await Promise.all(resumed);
+    return report;
+  }
+
+  /**
+   * The adoption pass by itself: everything reconcile() does under its
+   * latch, returning the judgment chains it resumed instead of waiting for
+   * them. For the tick that runs a reconciliation an invalid config left
+   * owed, which must not wait out a review before it dispatches.
+   */
+  async function reconcilePass(
+    ctx: ExtensionContext,
+  ): Promise<{ report: ReconcileReport; resumed: Promise<void>[] }> {
     const report = emptyReport();
-    if (state.reconciling) return report; // one reconciliation at a time
-    state.reconciling = true; // synchronous — gates ticks before any await
     const resumed: Promise<void>[] = [];
+    if (state.reconciling) return { report, resumed }; // one at a time
+    state.reconciling = true; // synchronous — gates ticks before any await
     try {
       try {
         await ensureWorkspace(ctx.cwd);
       } catch {
-        return report; // no workspace here — nothing persisted to recover
+        // no workspace here — nothing persisted to recover
+        return { report, resumed };
       }
       // Outcome steps first, and before the config is read: they follow
       // CLOSED issues, hold no lease, and an invalid policy is no reason to
@@ -6775,7 +6919,17 @@ export function registerCoordinator(
       // past it is recorded as `unknown`. Not part of the report: nothing
       // here is a lease.
       await sweepOutcomes(ctx.cwd);
-      const config = currentConfig();
+      // Throws on an invalid policy, before any lease is read: nothing is
+      // adopted under a config that does not validate. The pass is owed
+      // from here on, and the first tick whose config resolves runs it.
+      let config: WorkgraphConfig;
+      try {
+        config = currentConfig();
+        state.reconcileOwed = false;
+      } catch (e) {
+        state.reconcileOwed = true;
+        throw e;
+      }
       const nowMs = nowFn();
       const issues = await listRunHeldInProgress(
         ctx.cwd,
@@ -7170,11 +7324,7 @@ export function registerCoordinator(
     } finally {
       state.reconciling = false;
     }
-    // Resumed judgment chains run OUTSIDE the latch (they can take whole
-    // discovery/review rounds); awaiting them here lets callers span the
-    // full convergence. judge() is error-isolated — nothing unwinds.
-    await Promise.all(resumed);
-    return report;
+    return { report, resumed };
   }
 
   pi.on("session_start", (_event, ctx) => {

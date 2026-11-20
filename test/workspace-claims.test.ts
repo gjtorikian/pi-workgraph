@@ -302,6 +302,169 @@ describe("claim-wait", () => {
       await t.cleanup();
     }
   }, 60_000);
+
+  /**
+   * The planner tier with `planApproval: "auto"`: the plan flows straight
+   * to an implementer under the claim the planner was given, so the rule has
+   * to look past the planner. One reviewed issue goes into review in the
+   * shared checkout; the second issue is planned, and its planner is
+   * isolated.
+   */
+  function setupPlanned() {
+    const repo = makeScratchRepo({ prefix: "wcplan", seed: 2 });
+    const [first, second] = repo.seededIds as [string, string];
+    approve(repo, first);
+    approve(repo, second, { workflowClass: "planned" });
+    const harness = makeHarness({ planApproval: "auto" });
+    const implementer = installFakeExecutor(harness.mock.events, {
+      executorId: "implementer-exec",
+      roles: ["implementer"],
+      isolation: "none",
+      workspace: { path: repo.dir },
+      provenance: IMPL_PROV,
+      onRequest: (request) =>
+        writeFileSync(join(repo.dir, `${request.issue.id}.txt`), "done\n"),
+    });
+    const reviewer = installFakeExecutor(harness.mock.events, {
+      executorId: "reviewer-exec",
+      roles: ["reviewer"],
+      behavior: "accept-stall",
+      provenance: REV_PROV,
+      roleScripts: { reviewer: { verdict: CLEAN_VERDICT } },
+    });
+    const ectx = makeEventContext(repo.dir);
+    return { repo, first, second, harness, implementer, reviewer, ectx };
+  }
+
+  /** No path-like targets: the scope guard has nothing to say about it. */
+  const PLAN = {
+    summary: "write the issue's file",
+    steps: [{ description: "write one file named after the issue" }],
+  };
+  const PLAN_PROV = { harness: "fake", model: "plan-model", provider: "prov-plan" };
+
+  it("a planned issue with an auto-approved plan waits too when its implementer is non-isolated, even though its planner is isolated", async () => {
+    const t = setupPlanned();
+    const { repo, first, second, reviewer, implementer } = t;
+    const { mock } = t.harness;
+    const planner = installFakeExecutor(mock.events, {
+      executorId: "planner-exec",
+      roles: ["planner"],
+      isolation: "worktree",
+      provenance: PLAN_PROV,
+      roleScripts: { planner: { plan: PLAN } },
+    });
+    const errors = captureErrors();
+    try {
+      await settle(mock, t.ectx.ctx);
+      await until(() => reviewer.requests.length === 1);
+      expect(metadataOf(repo, first)[WORKGRAPH_PHASE_KEY]).toBe("judging");
+
+      // The planner is isolated and free, but the plan it wrote would be
+      // implemented in the occupied checkout: no claim, and no plan.
+      await settle(mock, t.ectx.ctx);
+      await settle(mock, t.ectx.ctx);
+      expect(planner.requests).toEqual([]);
+      expect(implementer.requests.map((r) => r.issue.id)).toEqual([first]);
+      expect(repo.showIssue(second).status).toBe("open");
+      const waiting = metadataOf(repo, second);
+      expect(waiting[WORKGRAPH_PHASE_KEY]).toBe("ready");
+      expect(waiting[WORKGRAPH_WORKFLOW_RUN_ID_KEY]).toBeUndefined();
+      expect(
+        errors().filter((line) =>
+          line.includes(`workspace under review: ${first}`),
+        ),
+      ).toHaveLength(1);
+
+      // The review resolves and frees the checkout: planned, then built.
+      reviewer.complete();
+      await mock.flushEvents();
+      expect(repo.showIssue(first).status).toBe("closed");
+
+      await settle(mock, t.ectx.ctx);
+      await until(() => reviewer.requests.length === 2);
+      expect(planner.requests.map((r) => r.issue.id)).toEqual([second]);
+      expect(implementer.requests.map((r) => r.issue.id)).toEqual([first, second]);
+      expect(metadataOf(repo, second)[WORKGRAPH_PHASE_KEY]).toBe("judging");
+    } finally {
+      planner.uninstall();
+      t.implementer.uninstall();
+      t.reviewer.uninstall();
+      await t.harness.coordinator.teardown(t.ectx.ctx);
+      repo.cleanup();
+    }
+  }, 60_000);
+
+  it("when the offers change while the plan is written, the implementer does not start in the occupied checkout: the issue goes back to the pool and is not planned again", async () => {
+    const t = setupPlanned();
+    const { repo, first, second, reviewer, implementer } = t;
+    const { mock } = t.harness;
+    const errors = captureErrors();
+    let planner: ReturnType<typeof installFakeExecutor> | undefined;
+    let isolated: ReturnType<typeof installFakeExecutor> | undefined;
+    try {
+      await settle(mock, t.ectx.ctx);
+      await until(() => reviewer.requests.length === 1);
+      expect(metadataOf(repo, first)[WORKGRAPH_PHASE_KEY]).toBe("judging");
+
+      // An isolated implementer that outranks the in-checkout one comes
+      // online, so the tick expects the plan to be built in isolation and
+      // claims the planned issue. The planner stalls on it.
+      isolated = installFakeExecutor(mock.events, {
+        executorId: "isolated-impl",
+        roles: ["implementer"],
+        isolation: "worktree",
+        priority: 10,
+        workspace: { path: repo.dir, baseRevision: repo.head },
+        provenance: IMPL_PROV,
+      });
+      planner = installFakeExecutor(mock.events, {
+        executorId: "planner-exec",
+        roles: ["planner"],
+        isolation: "worktree",
+        behavior: "accept-stall",
+        provenance: PLAN_PROV,
+        roleScripts: { planner: { plan: PLAN } },
+      });
+      await settle(mock, t.ectx.ctx);
+      await until(() => planner!.requests.length === 1);
+      expect(metadataOf(repo, second)[WORKGRAPH_PHASE_KEY]).toBe("planning");
+      expect(heldLeases(repo.dir)).toHaveLength(2);
+
+      // The isolated implementer leaves before the plan lands. What remains
+      // is the non-isolated one, in a checkout that is still under review.
+      isolated.uninstall();
+      isolated = undefined;
+      planner.complete();
+      await until(() => heldLeases(repo.dir).length === 1);
+
+      expect(implementer.requests.map((r) => r.issue.id)).toEqual([first]);
+      expect(repo.showIssue(second).status).toBe("open");
+      expect(metadataOf(repo, second)[WORKGRAPH_PHASE_KEY]).toBe("ready");
+      expect(metadataOf(repo, first)[WORKGRAPH_PHASE_KEY]).toBe("judging");
+      expect(
+        errors().some((line) =>
+          line.includes(
+            `${second}: workspace under review: ${first} — returned to the ready pool`,
+          ),
+        ),
+      ).toBe(true);
+
+      // Back in the pool it waits like any other claim: the tick now sees
+      // the non-isolated implementer and does not have the plan rewritten.
+      await settle(mock, t.ectx.ctx);
+      await settle(mock, t.ectx.ctx);
+      expect(planner.requests).toHaveLength(1);
+      expect(implementer.requests.map((r) => r.issue.id)).toEqual([first]);
+    } finally {
+      planner?.uninstall();
+      isolated?.uninstall();
+      t.implementer.uninstall();
+      t.reviewer.uninstall();
+      await t.harness.coordinator.teardown(t.ectx.ctx);
+      repo.cleanup();
+    }
+  }, 60_000);
 });
 
 // ---------------------------------------------------------------------------

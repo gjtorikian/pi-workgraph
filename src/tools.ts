@@ -38,7 +38,11 @@ import {
   update,
 } from "./store.ts";
 import { approvalRefusal, authoredCheck, resolveCheck } from "./check.ts";
-import { resolveConfig, type WorkgraphConfig } from "./config.ts";
+import {
+  resolveConfig,
+  resolveConfigWithoutPolicy,
+  type WorkgraphConfig,
+} from "./config.ts";
 import {
   defaultLeaseActor,
   identitySnapshot,
@@ -273,6 +277,26 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     return config;
   }
 
+  /**
+   * The same prologue for the tools that protect or end work ALREADY under
+   * a lease, let a human take it back, or report on work that is closed:
+   * heartbeat, release, override, record_outcome. They read nothing of the
+   * policy or the check, so an invalid one must not stop them: a typo would
+   * otherwise let a held lease lapse and leave the recovery tools unusable
+   * until it was fixed. The coordinator makes the same split (`heldConfig`).
+   * The return type leaves `policy` and `check` out, so a tool that starts
+   * to read either has to move back to {@link prepare}.
+   */
+  async function prepareHeld(
+    ctx: ExtensionContext,
+  ): Promise<Omit<WorkgraphConfig, "policy" | "check">> {
+    const config = resolveConfigWithoutPolicy(pi);
+    setWorkerIdOverride(config.workerIdOverride);
+    noteSessionId(ctx.sessionManager.getSessionId());
+    await ensureWorkspace(ctx.cwd);
+    return config;
+  }
+
   pi.registerTool({
     name: "workgraph_ready",
     label: "Ready work",
@@ -365,7 +389,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     parameters: ReleaseParams,
     executionMode: "sequential",
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      await prepare(ctx);
+      await prepareHeld(ctx);
       const lease = getHeldLease(ctx.cwd, params.id);
       if (!lease) {
         // No unfenced fallback: an untracked release used to fall through to
@@ -700,7 +724,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     parameters: OverrideParams,
     executionMode: "sequential",
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      await prepare(ctx);
+      await prepareHeld(ctx);
       const actor = defaultLeaseActor();
       // A release of a lifecycle-v1 issue also resets the phase to draft:
       // without it the phase would stay wherever the run left it (judging,
@@ -1054,7 +1078,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     parameters: RecordOutcomeParams,
     executionMode: "sequential",
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      await prepare(ctx);
+      await prepareHeld(ctx);
       const actor = defaultLeaseActor();
       // An unknown id throws here, before any guard is read.
       const issue = await show(ctx.cwd, params.id);
@@ -1169,7 +1193,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     parameters: HeartbeatParams,
     executionMode: "sequential",
     async execute(_id, _params, _signal, _onUpdate, ctx) {
-      const config = await prepare(ctx);
+      const config = await prepareHeld(ctx);
       const leases = heldLeases(ctx.cwd);
       if (leases.length === 0) {
         return textResult("No active lease to renew — claim an issue first.", {

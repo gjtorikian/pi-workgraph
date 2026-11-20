@@ -1377,7 +1377,7 @@ describe("the outcome step", () => {
     }
   }, 60_000);
 
-  it("a close that left no stamp is not graded, so no step is launched for it", async () => {
+  it("a close that left no stamp is not graded, so no step is launched for it, and the log says why", async () => {
     const repo = makeScratchRepo({ prefix: "ocbare", seed: 1 });
     const id = repo.seededIds[0]!;
     approve(repo, id);
@@ -1389,6 +1389,7 @@ describe("the outcome step", () => {
     });
     const fake = installStepExecutor(mock, repo);
     const ectx = makeEventContext(repo.dir);
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       await drive(mock, ectx.ctx);
       expect(repo.showIssue(id).status).toBe("closed");
@@ -1396,6 +1397,13 @@ describe("the outcome step", () => {
       expect(backgroundRequests(fake)).toHaveLength(0);
       expect(metadataOf(repo, id)[WORKGRAPH_OUTCOME_STATUS_KEY]).toBeUndefined();
       expect(await payloads(repo.dir, id, OUTCOME_MARKER)).toHaveLength(0);
+      // A configured step that does not run is said, once for the close.
+      const lines = logged.mock.calls
+        .map((args) => args.join(" "))
+        .filter((line) => line.includes("outcome step for"));
+      expect(lines).toEqual([
+        `[pi-workgraph] coordinator skipping: outcome step for ${id} not launched: the close wrote no stamp to grade (tree-binding and check are both off for it)`,
+      ]);
     } finally {
       fake.uninstall();
       await coordinator.teardown(ectx.ctx);

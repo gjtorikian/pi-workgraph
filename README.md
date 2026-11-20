@@ -532,10 +532,16 @@ still run: they come before the review and need none.
 **An invalid policy stops dispatch.** An unknown tier, key, gate, or mode
 is an error that names it, as is JSON that does not parse. Until the
 policy is fixed the coordinator claims nothing and judges nothing, logs
-the message once, and the [tools](#tools) fail with the same message
-(all seventeen except `workgraph_init`). Leases the coordinator already
-holds keep renewing, and a run already in flight proceeds as far as
-judgment and waits there. An invalid `check` settings block
+the message once, and the [tools](#tools) that start, judge or report work
+fail with the same message. Five tools keep working: `workgraph_init`,
+which reads no policy, and `workgraph_heartbeat`, `workgraph_release`,
+`workgraph_override` and `workgraph_record_outcome`, so a held lease does
+not lapse over a typo, a human can still take work back, and an outcome
+step can still report. Leases the coordinator already holds keep renewing,
+and a run already in flight proceeds as far as judgment and waits there.
+Fixing the policy is enough, with no restart: the next poll judges the
+runs that were waiting, and a startup recovery the bad policy stopped runs
+then too. An invalid `check` settings block
 ([The check](#the-check)) does the same, for the same reason: dropping it
 would leave work unchecked without a word.
 
@@ -667,7 +673,10 @@ work is therefore reviewed one issue at a time. The log line `workspace
 under review: <issue id>` names the issue in the way. An issue parked in
 `judging` because nothing offers the `reviewer` role holds the checkout
 until a reviewer appears or you release it with `workgraph_override`.
-Isolated executors are never held by this rule. The rule covers the runs
+Isolated executors are never held by this rule. With `planApproval:
+"auto"` a plan flows straight to its implementer under the same claim, so
+a planned issue also waits when the implementer that would be picked is
+non-isolated, even if its planner is isolated. The rule covers the runs
 one coordinator supervises: a second Pi session in the same checkout is
 not held by it, and the comparisons are what catch the result.
 
@@ -1180,7 +1189,9 @@ stay silent.
   end only to the session that launched it, so after a restart a step that
   does not report ends at its deadline.
 - **Only stamped closes get a step.** With `tree-binding` and `check` both
-  `off` no stamp is written and no step is launched.
+  `off` no stamp is written and no step is launched. The log says so for
+  each such close: `outcome step for <issue id> not launched: the close
+  wrote no stamp to grade`.
 
 Three costs to know before you turn it on:
 

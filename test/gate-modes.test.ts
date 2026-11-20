@@ -244,6 +244,19 @@ async function toolText(
   return result.content.map((c) => (c.type === "text" ? (c.text ?? "") : "")).join("\n");
 }
 
+/**
+ * Poll a CHEAP, in-memory condition: for work the coordinator starts
+ * detached from the tick that asked for it, which no emit or flush awaits.
+ */
+async function until(cond: () => boolean, timeoutMs = 10_000): Promise<void> {
+  const start = Date.now();
+  for (;;) {
+    if (cond()) return;
+    if (Date.now() - start > timeoutMs) throw new Error("until: condition not met in time");
+    await new Promise((resolve) => setTimeout(resolve, 15));
+  }
+}
+
 /** Silence console.error and return the lines it was given. */
 function captureErrors(): () => string[] {
   const spy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -1403,6 +1416,118 @@ describe("an invalid policy", () => {
       fake.uninstall();
       await coordinator.teardown(ectx.ctx);
       graph.cleanup();
+    }
+  }, 60_000);
+
+  it("a judgment a broken policy stopped starts again on the first tick after it is fixed, with no restart", async () => {
+    const graph = makeScratchRepo({ prefix: "gmbadres", seed: 1 });
+    const id = graph.seededIds[0]!;
+    approve(graph, id);
+    const mock = makeMockPi();
+    const config = shippedConfig({ workerIdOverride: WORKER });
+    let broken = false;
+    setWorkerIdOverride(WORKER);
+    const coordinator = registerCoordinator(asExtensionAPI(mock), {
+      getConfig: () => {
+        if (broken) throw new PolicyConfigError("policy.medium.gates.chekc is not a gate");
+        return config;
+      },
+    });
+    const fake = installFakeExecutor(mock.events, {
+      workspace: isolatedIn(graph),
+      roles: ["implementer", "reviewer"],
+      roleScripts: {
+        implementer: { behavior: "accept-stall", provenance: IMPL_PROV },
+        reviewer: { provenance: REV_PROV, verdict: CLEAN_VERDICT },
+      },
+    });
+    const ectx = makeEventContext(graph.dir);
+    captureErrors();
+    try {
+      await drive(mock, ectx.ctx);
+      expect(coordinator.current()?.phase).toBe("accepted");
+
+      // The policy breaks, then the implementation completes: parked in
+      // judging, no review requested.
+      broken = true;
+      fake.complete();
+      await mock.flushEvents();
+      expect(metadataOf(graph, id)[WORKGRAPH_PHASE_KEY]).toBe("judging");
+      expect(fake.requests.map((r) => r.role)).toEqual(["implementer"]);
+
+      // Still broken: a tick resumes nothing.
+      await drive(mock, ectx.ctx);
+      expect(fake.requests.map((r) => r.role)).toEqual(["implementer"]);
+      expect(metadataOf(graph, id)[WORKGRAPH_PHASE_KEY]).toBe("judging");
+      expect(heldLeases(graph.dir)).toHaveLength(1);
+
+      // Fixed: the next tick judges the parked run under the lease it kept.
+      // The judgment runs detached from that tick, as the first one ran
+      // detached from the completion, so wait for the lease to be let go.
+      broken = false;
+      await drive(mock, ectx.ctx);
+      await until(() => heldLeases(graph.dir).length === 0);
+      expect(fake.requests.map((r) => r.role)).toEqual(["implementer", "reviewer"]);
+      expect(await verdictCount(graph.dir, id)).toBe(1);
+      expect(graph.showIssue(id).status).toBe("closed");
+      expect(heldLeases(graph.dir)).toHaveLength(0);
+
+      // Judged once: a later tick has nothing left to resume.
+      await drive(mock, ectx.ctx);
+      expect(fake.requests.map((r) => r.role)).toEqual(["implementer", "reviewer"]);
+    } finally {
+      fake.uninstall();
+      await coordinator.teardown(ectx.ctx);
+      graph.cleanup();
+    }
+  }, 60_000);
+
+  it("the tools that keep or hand back a lease still work: heartbeat, release and override are not stopped by the policy that stops status and claim", async () => {
+    const previousEnv = process.env.WORKGRAPH_POLICY;
+    delete process.env.WORKGRAPH_POLICY;
+    const graph = makeScratchRepo({ prefix: "gmbadtools", seed: 3 });
+    const [held, unclaimed, stuck] = graph.seededIds as [string, string, string];
+    for (const id of [held, unclaimed, stuck]) approve(graph, id);
+    const { mock, coordinator } = makeFlagHarness();
+    const ectx = makeEventContext(graph.dir);
+    captureErrors();
+    try {
+      // Claimed by hand while the policy was valid.
+      await toolText(mock, "workgraph_claim", { id: held }, graph.dir);
+      expect(heldLeases(graph.dir)).toHaveLength(1);
+      const before = Date.parse(leaseExpiresAtOf(graph.showIssue(held))!);
+
+      mock.setFlag("workgraph-policy", JSON.stringify({ medium: { gates: { chekc: "observe" } } }));
+      const BAD_KEY = "policy.medium.gates.chekc is not a gate";
+
+      // What starts or reports work still refuses, naming the key.
+      await expect(toolText(mock, "workgraph_status", { id: held }, graph.dir)).rejects.toThrow(BAD_KEY);
+      await expect(toolText(mock, "workgraph_claim", { id: unclaimed }, graph.dir)).rejects.toThrow(BAD_KEY);
+      expect(graph.showIssue(unclaimed).status).toBe("open");
+
+      // The lease it already holds keeps renewing.
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      await toolText(mock, "workgraph_heartbeat", {}, graph.dir);
+      const after = Date.parse(leaseExpiresAtOf(graph.showIssue(held))!);
+      expect(after).toBeGreaterThan(before);
+
+      // It can be handed back.
+      await toolText(mock, "workgraph_release", { id: held }, graph.dir);
+      expect(heldLeases(graph.dir)).toHaveLength(0);
+      expect(graph.showIssue(held).assignee ?? "").toBe("");
+
+      // And a human can still take work out of the pool.
+      await toolText(
+        mock,
+        "workgraph_override",
+        { id: stuck, action: "close", reason: "closed by hand while the policy was broken" },
+        graph.dir,
+      );
+      expect(graph.showIssue(stuck).status).toBe("closed");
+    } finally {
+      await coordinator.teardown(ectx.ctx);
+      graph.cleanup();
+      if (previousEnv !== undefined) process.env.WORKGRAPH_POLICY = previousEnv;
     }
   }, 60_000);
 });
