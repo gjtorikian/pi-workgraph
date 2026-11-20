@@ -34,9 +34,15 @@ import {
   release,
   setMetadata,
   show,
+  unsetMetadata,
   update,
 } from "./store.ts";
-import { resolveConfig, type WorkgraphConfig } from "./config.ts";
+import { approvalRefusal, authoredCheck, resolveCheck } from "./check.ts";
+import {
+  resolveConfig,
+  resolveConfigWithoutPolicy,
+  type WorkgraphConfig,
+} from "./config.ts";
 import {
   defaultLeaseActor,
   identitySnapshot,
@@ -56,10 +62,21 @@ import {
   renewLease,
   untrackLease,
 } from "./lease.ts";
+import { GUARD_ALLOW_ANSWER } from "./guards.ts";
 import {
   attemptOf,
+  checkOf,
+  checkWaiverOf,
+  decisionGatesOf,
+  guardAllowedByOf,
+  guardAllowedOf,
+  guardRoundsOf,
   isLifecycleV1,
   lastVerdictOf,
+  outcomeDeadlineOf,
+  outcomeExecutionIdOf,
+  outcomeOf,
+  outcomeStatusOf,
   phaseOf,
   planApprovedOf,
   reapprove,
@@ -69,8 +86,33 @@ import {
   workflowRunIdOf,
 } from "./lifecycle.ts";
 import { latestPlanCritique } from "./critique.ts";
+import {
+  compactOutcome,
+  DEFAULT_SCORECARD_WINDOW_DAYS,
+  gradableClose,
+  latestOutcome,
+  OVERRIDE_CLOSE_PREFIX,
+  recordOutcome,
+  renderScorecard,
+  scorecard,
+  scorecardRows,
+  type OutcomeT,
+} from "./outcome.ts";
 import { latestPlan, renderPlanForReview } from "./plan.ts";
-import { DEFAULT_RISK_TIER } from "./policy.ts";
+import {
+  DEFAULT_RISK_TIER,
+  GATES,
+  GUARD_GATES,
+  resolvePolicy,
+  type GateName,
+} from "./policy.ts";
+import {
+  latestGateRecords,
+  listGateRecords,
+  summarizeGates,
+  type GateRecord,
+  type GateSummary,
+} from "./proof.ts";
 import { resolveConfig as resolveFlags } from "./config.ts";
 import { effectiveTiers } from "./settings.ts";
 import {
@@ -82,6 +124,7 @@ import {
   type TierConfig,
 } from "./tiers.ts";
 import type { WorkIssue, WorkflowClassT } from "./types.ts";
+import { latestVerdictRecord, reviewContextOf } from "./verdict.ts";
 import {
   AnswerDecisionParams,
   ApproveParams,
@@ -89,19 +132,30 @@ import {
   ClaimParams,
   CloseParams,
   CreateParams,
+  GatesParams,
   HeartbeatParams,
   InitParams,
   OverrideParams,
   ReadyParams,
+  RecordOutcomeParams,
   ReleaseParams,
+  ScorecardParams,
   SplitParams,
   StatusParams,
   TiersParams,
   DEFAULT_WORKFLOW_CLASS,
+  WORKGRAPH_CHECK_KEY,
+  WORKGRAPH_CHECK_WAIVER_KEY,
   WORKGRAPH_DECISION_ANSWER_KEY,
+  WORKGRAPH_DECISION_GATE_KEY,
   WORKGRAPH_DECISION_QUESTION_KEY,
   WORKGRAPH_EXECUTOR_ID_KEY,
+  WORKGRAPH_GUARD_ALLOWED_BY_KEY,
+  WORKGRAPH_GUARD_ALLOWED_KEY,
+  WORKGRAPH_GUARD_KEYS,
+  WORKGRAPH_OUTCOME_KEYS,
   WORKGRAPH_PHASE_KEY,
+  WORKGRAPH_TREE_BINDING_KEYS,
   WORKGRAPH_PLAN_APPROVED_KEY,
   WORKGRAPH_PLAN_CRITIQUE_KEY,
   WORKGRAPH_PLAN_FEEDBACK_KEY,
@@ -109,6 +163,9 @@ import {
   WORKGRAPH_RISK_TIER_KEY,
   WORKGRAPH_WORKFLOW_CLASS_KEY,
 } from "./types.ts";
+
+/** The outcomes a caller may report (`workgraph_record_outcome`). */
+const REPORTABLE_OUTCOMES = ["clean", "needed_fixes", "abandoned"] as const;
 
 const CRITIQUE_UNAVAILABLE_PREFIX = "unavailable:";
 
@@ -135,6 +192,54 @@ function planCritiqueLine(summary: string, detailsReadable: boolean): string | u
   return detailsReadable
     ? `Critique (advisory): ${summary}, marked "?" under the steps they concern.`
     : `Critique (advisory): ${summary}, but its details could not be read.`;
+}
+
+/**
+ * One line of `workgraph_status`: what a gate last found on the issue. The
+ * mode shown is the one the gate ran under, which a later policy change may
+ * have moved on from (the `Gates:` line above it shows the current modes).
+ */
+function gateResultLine(record: GateRecord): string {
+  const effect = record.blocked ? ", blocked" : record.wouldBlock ? ", would block" : "";
+  const reason = record.reason !== undefined ? `: ${record.reason}` : "";
+  return `Gate ${record.gate}: ${record.result}${effect} (${record.mode}, attempt ${record.attempt})${reason}`;
+}
+
+/**
+ * One line of `workgraph_gates`: the issues a gate blocked and would have
+ * blocked, then (only when there are any) the issues a human waived it for,
+ * each with its reason, and the issues a diff guard could not decide. A
+ * gate with neither keeps the two-column line.
+ *
+ * `unknown` is listed for the diff guards only. For every other gate an
+ * `unknown` blocks, so the first two columns already count it; for a guard
+ * it never does, and this is the one place a blind guard shows.
+ */
+function gateReportLine(gate: GateName, summary: GateSummary): string {
+  if (summary.records === 0) return `${gate}: no records`;
+  const list = (ids: string[]): string => (ids.length > 0 ? ` (${ids.join(", ")})` : "");
+  const unknown =
+    summary.unknown.length > 0 && GUARD_GATES.some((guard) => guard === gate)
+      ? `, ${summary.unknown.length} unknown${list(summary.unknown)}`
+      : "";
+  const waived =
+    summary.waived.length > 0
+      ? `, ${summary.waived.length} not applicable, waived (${summary.waived
+          .map((w) => `${w.issueId}: ${w.reason}`)
+          .join("; ")})`
+      : "";
+  return (
+    `${gate}: ${summary.blocked.length} blocked${list(summary.blocked)}, ` +
+    `${summary.wouldBlock.length} would block${list(summary.wouldBlock)}${waived}${unknown}`
+  );
+}
+
+/** The metadata a check or a waiver given at creation is stored as. */
+function checkMetadata(authored: { check?: string; waiver?: string }): Record<string, string> {
+  return {
+    ...(authored.check !== undefined ? { [WORKGRAPH_CHECK_KEY]: authored.check } : {}),
+    ...(authored.waiver !== undefined ? { [WORKGRAPH_CHECK_WAIVER_KEY]: authored.waiver } : {}),
+  };
 }
 
 function textResult<TDetails>(
@@ -166,6 +271,26 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
    */
   async function prepare(ctx: ExtensionContext): Promise<WorkgraphConfig> {
     const config = resolveConfig(pi);
+    setWorkerIdOverride(config.workerIdOverride);
+    noteSessionId(ctx.sessionManager.getSessionId());
+    await ensureWorkspace(ctx.cwd);
+    return config;
+  }
+
+  /**
+   * The same prologue for the tools that protect or end work ALREADY under
+   * a lease, let a human take it back, or report on work that is closed:
+   * heartbeat, release, override, record_outcome. They read nothing of the
+   * policy or the check, so an invalid one must not stop them: a typo would
+   * otherwise let a held lease lapse and leave the recovery tools unusable
+   * until it was fixed. The coordinator makes the same split (`heldConfig`).
+   * The return type leaves `policy` and `check` out, so a tool that starts
+   * to read either has to move back to {@link prepare}.
+   */
+  async function prepareHeld(
+    ctx: ExtensionContext,
+  ): Promise<Omit<WorkgraphConfig, "policy" | "check">> {
+    const config = resolveConfigWithoutPolicy(pi);
     setWorkerIdOverride(config.workerIdOverride);
     noteSessionId(ctx.sessionManager.getSessionId());
     await ensureWorkspace(ctx.cwd);
@@ -264,7 +389,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     parameters: ReleaseParams,
     executionMode: "sequential",
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      await prepare(ctx);
+      await prepareHeld(ctx);
       const lease = getHeldLease(ctx.cwd, params.id);
       if (!lease) {
         // No unfenced fallback: an untracked release used to fall through to
@@ -359,23 +484,40 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     name: "workgraph_split",
     label: "Split work",
     description:
-      "Split an issue into child issues; the parent is blocked until every child closes",
+      "Split an issue into child issues; the parent is blocked until every child closes. " +
+      "A child created approved at medium or high risk (the default tier is medium) needs its own check command, a repository default, or a checkWaiver; " +
+      "a child does not inherit the parent's.",
     promptSnippet: "Split a work-graph issue into children",
     promptGuidelines: [
       "Use workgraph_split when an issue is too large to claim whole.",
+      "Give each approved child the check command the human named; pass checkWaiver only on explicit human instruction, with the human's reason.",
     ],
     parameters: SplitParams,
     executionMode: "sequential",
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      await prepare(ctx);
+      const config = await prepare(ctx);
       const actor = workerId();
       // Fail before creating anything if the parent doesn't exist.
       const parent = await show(ctx.cwd, params.id);
 
+      // Every child is validated before any is created: a refusal on the
+      // third child must not leave two behind. An approved child with no
+      // tier is medium by policy, so it is held to the medium rule.
+      const authored = params.children.map((child) => {
+        const given = authoredCheck(child);
+        if (child.approved) {
+          const refusal = approvalRefusal(child.riskTier, given, config);
+          if (refusal !== undefined) {
+            throw new Error(`Cannot split ${params.id}: child "${child.title}": ${refusal}`);
+          }
+        }
+        return given;
+      });
+
       // Create children first, deps second; on partial failure report exactly
       // what exists so no orphan is silently left behind.
       const created: WorkIssue[] = [];
-      for (const child of params.children) {
+      for (const [index, child] of params.children.entries()) {
         try {
           created.push(
             await createIssue(
@@ -392,6 +534,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
                   | "planned"
                   | undefined,
                 approved: child.approved,
+                metadata: checkMetadata(authored[index]!),
               },
               actor,
             ),
@@ -435,18 +578,21 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     name: "workgraph_approve",
     label: "Approve work",
     description:
-      "Approve a draft or legacy issue for dispatch: records acceptance criteria, " +
+      "Approve a draft or legacy issue for dispatch: records acceptance criteria and the check command, " +
       "stamps lifecycle v1 with a risk tier and workflow class, and transitions the issue to phase ready. " +
       "Also re-approves escalated work (back to ready, reopened). " +
-      "The coordinator only dispatches approved ready work.",
+      "The coordinator only dispatches approved ready work, and runs the check itself before any review. " +
+      "Medium- and high-risk work is refused without a check (here, already on the issue, or the repository default in Pi settings) " +
+      "unless checkWaiver records why no check applies; waived work closes stamped waived.",
     promptSnippet: "Approve a work-graph issue for dispatch",
     promptGuidelines: [
-      "Use workgraph_approve to move a draft, legacy, or escalated issue into the dispatchable ready pool, with acceptance criteria the judgment gate will check.",
+      "Use workgraph_approve to move a draft, legacy, or escalated issue into the dispatchable ready pool, with acceptance criteria the judgment gate will check and the check command the human named.",
+      "Pass checkWaiver only on explicit human instruction, with the human's reason; never invent a waiver to get an approval through.",
     ],
     parameters: ApproveParams,
     executionMode: "sequential",
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      await prepare(ctx);
+      const config = await prepare(ctx);
       const actor = defaultLeaseActor();
       const cur = await show(ctx.cwd, params.id);
       const phase = phaseOf(cur);
@@ -474,11 +620,31 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
         requestedWorkflowClass === "oneshot" && riskTier !== "low"
           ? "reviewed"
           : requestedWorkflowClass;
+      // The check rule, after the two guards above and before any write. A
+      // check or a waiver already on the issue (a draft created with one, a
+      // re-approval) satisfies it; a new one replaces the other kind, so an
+      // issue never carries both.
+      const given = authoredCheck(params);
+      const replaces = given.check !== undefined || given.waiver !== undefined;
+      const check = given.check ?? (replaces ? undefined : checkOf(cur));
+      const waiver = given.waiver ?? (replaces ? undefined : checkWaiverOf(cur));
+      const refusal = approvalRefusal(riskTier, { check, waiver }, config);
+      if (refusal !== undefined) {
+        throw new Error(`Cannot approve ${params.id}: ${refusal}`);
+      }
       const approvalFields = {
         [WORKGRAPH_RISK_TIER_KEY]: riskTier,
         [WORKGRAPH_WORKFLOW_CLASS_KEY]: workflowClass,
         // A re-approved planned issue plans afresh; stale approvals never carry.
         [WORKGRAPH_PLAN_APPROVED_KEY]: false,
+        // Rides the guarded write: an approval that loses the race leaves
+        // the stored check as it was.
+        ...(replaces
+          ? {
+              [WORKGRAPH_CHECK_KEY]: given.check ?? "",
+              [WORKGRAPH_CHECK_WAIVER_KEY]: given.waiver ?? "",
+            }
+          : {}),
       };
       if (phase === "escalated") {
         // The re-approve recovery path (failure-modes table: "escalation is
@@ -519,6 +685,8 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
           workflowClass,
           requestedWorkflowClass,
           acceptanceCriteria: params.acceptanceCriteria ?? null,
+          check: check ?? null,
+          checkWaiver: waiver ?? null,
           actor: identitySnapshot(actor),
         },
         actor.bdActor,
@@ -527,8 +695,16 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
         `Approved ${params.id} for dispatch (workflow ${workflowClass}, risk tier ${riskTier}, phase ready).` +
           (workflowClass !== requestedWorkflowClass
             ? ` Requested ${requestedWorkflowClass} was promoted because only low-risk work may skip independent review.`
-            : ""),
-        { id: params.id, riskTier, workflowClass, requestedWorkflowClass },
+            : "") +
+          (waiver !== undefined ? ` Check waived: ${waiver}` : ""),
+        {
+          id: params.id,
+          riskTier,
+          workflowClass,
+          requestedWorkflowClass,
+          check: check ?? null,
+          checkWaiver: waiver ?? null,
+        },
       );
     },
   });
@@ -548,7 +724,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     parameters: OverrideParams,
     executionMode: "sequential",
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      await prepare(ctx);
+      await prepareHeld(ctx);
       const actor = defaultLeaseActor();
       // A release of a lifecycle-v1 issue also resets the phase to draft:
       // without it the phase would stay wherever the run left it (judging,
@@ -574,7 +750,12 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
         actor.bdActor,
       );
       if (params.action === "close") {
-        await close(ctx.cwd, params.id, `override: ${params.reason}`, actor.bdActor);
+        await close(
+          ctx.cwd,
+          params.id,
+          `${OVERRIDE_CLOSE_PREFIX}${params.reason}`,
+          actor.bdActor,
+        );
         untrackLease(ctx.cwd, params.id);
         return textResult(
           `Override-closed ${params.id} (reason: ${params.reason}) — audited as ${actor.bdActor}.`,
@@ -584,6 +765,24 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
       // Release: the deliberate unfenced path — clears the assignee and the
       // lease holder/expiry metadata regardless of who holds it.
       await release(ctx.cwd, params.id, actor.bdActor);
+      // A released issue starts over: its next run must not inherit the
+      // previous one's workspace, base or result tree. This is the one
+      // place those keys are cleared — a re-claim, a promotion and a
+      // re-approval all keep the base on purpose (`src/snapshot.ts`). The
+      // diff-guard keys go with them: a spent revision round and a human's
+      // allowance both belong to the work that was just given up. So do the
+      // outcome keys: an outcome grades one close, and the next close of
+      // this issue starts with none (and with no stale deadline to sweep).
+      await unsetMetadata(
+        ctx.cwd,
+        params.id,
+        [
+          ...WORKGRAPH_TREE_BINDING_KEYS,
+          ...WORKGRAPH_GUARD_KEYS,
+          ...WORKGRAPH_OUTCOME_KEYS,
+        ],
+        actor.bdActor,
+      );
       if (resetsPhase) {
         await setMetadata(
           ctx.cwd,
@@ -610,10 +809,13 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     description:
       "Answer the question a run of this issue parked for a human (phase escalated, decision pending). " +
       "Records the answer, audits it, and clears the block; then workgraph_approve resumes the issue and " +
-      "every later run receives the question and the answer.",
+      "every later run receives the question and the answer. " +
+      "When the question comes from a diff guard (weakened-tests, unproven-tests, scope), the exact answer allow " +
+      "accepts the change: that guard passes for the rest of the issue. Any other answer is carried as instructions and the guard still applies.",
     promptSnippet: "Answer a parked decision request on a work-graph issue",
     promptGuidelines: [
       "When workgraph_approve refuses an escalated issue because it needs a human decision, read the question with workgraph_status, get the human's answer, call workgraph_answer_decision with it, then approve again.",
+      "Answer allow to a diff-guard question only when the human said to accept the change it names; never choose allow yourself to get work through.",
     ],
     parameters: AnswerDecisionParams,
     executionMode: "sequential",
@@ -629,6 +831,17 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
         throw new Error(`${params.id} has no pending decision request.`);
       }
       const question = metadata[WORKGRAPH_DECISION_QUESTION_KEY];
+      // A guard question is one the CORE marked with the gates it is about.
+      // The text of the question decides nothing: an executor can write a
+      // question that reads like a guard's, and its answer must never
+      // switch a guard off.
+      const guards = decisionGatesOf(cur);
+      const allows =
+        guards.length > 0 &&
+        params.answer.trim().toLowerCase() === GUARD_ALLOW_ANSWER;
+      const allowed = allows
+        ? [...new Set([...guardAllowedOf(cur), ...guards])]
+        : [];
       // Audit FIRST, as override does: a half-applied answer must still be visible.
       await recordLeaseEvent(
         ctx.cwd,
@@ -638,6 +851,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
           decisionId: metadata.workgraph_decision_id,
           question,
           answer: params.answer,
+          ...(guards.length > 0 ? { gates: guards, allowed: allows } : {}),
           actor: identitySnapshot(actor),
         },
         actor.bdActor,
@@ -649,12 +863,33 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
           workgraph_decision_pending: false,
           [WORKGRAPH_DECISION_ANSWER_KEY]: params.answer,
           workgraph_decision_answered_at: new Date().toISOString(),
+          // Answered: the next question starts unmarked.
+          [WORKGRAPH_DECISION_GATE_KEY]: "",
+          // The allowance and who gave it, in the same write as the answer.
+          ...(allows
+            ? {
+                [WORKGRAPH_GUARD_ALLOWED_KEY]: allowed.join(","),
+                [WORKGRAPH_GUARD_ALLOWED_BY_KEY]: actor.bdActor,
+              }
+            : {}),
         },
         actor.bdActor,
       );
+      // Say which of the two happened: `"allow"` in quotes or `Allow.` is
+      // not the answer, and a human who meant it should learn that now.
+      const outcome = allows
+        ? ` Allowed ${guards.join(", ")}: from the next run on, that guard records these changes as accepted for this issue.`
+        : guards.length > 0
+          ? ` The answer was not exactly "${GUARD_ALLOW_ANSWER}", so ${guards.join(", ")} still applies: the next run receives the answer as instructions, and another violation parks the issue again.`
+          : "";
       return textResult(
-        `Answered the decision on ${params.id}. Re-approve it with workgraph_approve; every later run receives the question and this answer.`,
-        { id: params.id, question: question ?? null },
+        `Answered the decision on ${params.id}.${outcome} Re-approve it with workgraph_approve; every later run receives the question and this answer.`,
+        {
+          id: params.id,
+          question: question ?? null,
+          guards,
+          allowed: allows,
+        },
       );
     },
   });
@@ -663,8 +898,10 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     name: "workgraph_status",
     label: "Work status",
     description:
-      "Show one issue's full workgraph state: lifecycle phase, acceptance criteria, risk tier, " +
-      "workflow run, attempt, last verdict, executor, and the lease (holder, epoch, expiry).",
+      "Show one issue's full workgraph state: lifecycle phase, acceptance criteria, the check command or its waiver, risk tier, " +
+      "workflow run, attempt, last verdict and the context its review ran in, the gate modes that apply and each gate's latest result, " +
+      "the outcome recorded after the close (or that an outcome step is still expected to report), " +
+      "executor, and the lease (holder, epoch, expiry).",
     promptSnippet: "Show a work-graph issue's lifecycle and lease state",
     promptGuidelines: [
       "Use workgraph_status to inspect where an issue is in the lifecycle before acting on it.",
@@ -672,7 +909,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     parameters: StatusParams,
     executionMode: "sequential",
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      await prepare(ctx);
+      const config = await prepare(ctx);
       const issue = await show(ctx.cwd, params.id);
       const phase = phaseOf(issue);
       const metadata = issue.metadata ?? {};
@@ -687,6 +924,18 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
       ];
       if (issue.acceptance_criteria) {
         lines.push(`Acceptance: ${issue.acceptance_criteria}`);
+      }
+      // The check as it would be frozen at the next claim: the issue's own
+      // command, else its waiver, else the repository default.
+      const effectiveCheck = resolveCheck(issue, config);
+      if (effectiveCheck.spec !== undefined) {
+        lines.push(
+          `Check: ${effectiveCheck.spec.command}${
+            effectiveCheck.source === "repository default" ? " (repository default)" : ""
+          }`,
+        );
+      } else if (effectiveCheck.waiver !== undefined) {
+        lines.push(`Check waived: ${effectiveCheck.waiver}`);
       }
       const riskTier = riskTierOf(issue);
       if (riskTier) lines.push(`Risk tier: ${riskTier}`);
@@ -726,6 +975,46 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
       }
       const verdict = lastVerdictOf(issue);
       if (verdict) lines.push(`Last verdict: ${verdict}`);
+      // The context the latest recorded review ran in, as its executor
+      // reported it (`fresh`: launched with no memory of the implementation).
+      // Read from the verdict record: the summary above is metadata and
+      // carries no provenance.
+      const reviewContext = reviewContextOf(
+        await latestVerdictRecord(ctx.cwd, params.id),
+      );
+      if (reviewContext) lines.push(`Review context: ${reviewContext}`);
+      // The gate modes in force for this issue's tier (a missing or unknown
+      // tier resolves to medium, as it does for the gate itself), then what
+      // each gate last found. Kept below the plan block: readers of a parked
+      // plan find its lines relative to the review header.
+      const policy = resolvePolicy(riskTier, config.policy);
+      lines.push(`Gates: ${GATES.map((gate) => `${gate}=${policy.gates[gate]}`).join(" ")}`);
+      const gateResults = latestGateRecords(await listGateRecords(ctx.cwd, params.id));
+      for (const record of gateResults) lines.push(gateResultLine(record));
+      // What happened after the close, printed only when there is something
+      // to print: a record for the latest close, or a step still expected
+      // to report. Below the gate results, like them clear of the plan
+      // block.
+      const outcomeStatus = outcomeStatusOf(issue);
+      const outcome =
+        outcomeOf(issue) !== undefined || outcomeStatus !== undefined
+          ? await latestOutcome(ctx.cwd, params.id)
+          : undefined;
+      if (outcome !== undefined) {
+        lines.push(
+          `Outcome: ${compactOutcome(outcome)}: ${outcome.summary}${
+            outcome.actor !== undefined ? ` (recorded by ${outcome.actor})` : ""
+          }`,
+        );
+      } else if (outcomeStatus === "pending") {
+        const step = outcomeExecutionIdOf(issue);
+        const deadline = outcomeDeadlineOf(issue);
+        lines.push(
+          `Outcome: pending${step !== undefined ? `, outcome step ${step}` : ""}${
+            deadline !== undefined ? `, recorded as unknown after ${deadline}` : ""
+          }`,
+        );
+      }
       const question = metadata[WORKGRAPH_DECISION_QUESTION_KEY];
       if (
         metadata.workgraph_decision_pending === true ||
@@ -734,6 +1023,17 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
         lines.push(`Decision awaiting your answer (workgraph_answer_decision, then workgraph_approve): ${question}`);
       } else if (typeof metadata[WORKGRAPH_DECISION_ANSWER_KEY] === "string") {
         lines.push(`Decision answered: ${question} → ${metadata[WORKGRAPH_DECISION_ANSWER_KEY]}`);
+      }
+      // The diff guards a human allowed for this issue, and the ones whose
+      // one revision round is spent (the next violation asks a human).
+      const guardsAllowed = guardAllowedOf(issue);
+      if (guardsAllowed.length > 0) {
+        const by = guardAllowedByOf(issue);
+        lines.push(`Guards allowed: ${guardsAllowed.join(", ")}${by !== undefined ? ` (by ${by})` : ""}`);
+      }
+      const guardsSpent = guardRoundsOf(issue).filter((gate) => !guardsAllowed.includes(gate));
+      if (guardsSpent.length > 0) {
+        lines.push(`Guard revision round spent: ${guardsSpent.join(", ")}`);
       }
       const holder = leaseHolderOf(issue);
       if (holder) {
@@ -753,6 +1053,130 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
         workflowRunId: runId ?? null,
         attempt: attemptOf(issue) ?? null,
         lastVerdict: verdict ?? null,
+        reviewContext: reviewContext ?? null,
+        check: effectiveCheck.spec?.command ?? null,
+        checkWaiver: effectiveCheck.waiver ?? null,
+        gates: policy.gates,
+        gateResults,
+        outcome: outcome ?? null,
+        outcomeStatus: outcome !== undefined ? "recorded" : outcomeStatus ?? null,
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "workgraph_record_outcome",
+    label: "Record outcome",
+    description:
+      "Record what happened to accepted work after it closed. " +
+      "The issue must be closed by the gate and carry its close stamp; an open issue or one closed by workgraph_override is refused. " +
+      "Recording again is allowed: the latest record counts and the earlier ones stay on the trail.",
+    promptSnippet: "Record what happened to accepted work after it closed",
+    promptGuidelines: [
+      "Use workgraph_record_outcome only for what actually happened after the close: clean when nothing more was needed, needed_fixes with the number of fix rounds, abandoned when the work was dropped or reverted. Do not record clean for work nobody followed up on.",
+    ],
+    parameters: RecordOutcomeParams,
+    executionMode: "sequential",
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      await prepareHeld(ctx);
+      const actor = defaultLeaseActor();
+      // An unknown id throws here, before any guard is read.
+      const issue = await show(ctx.cwd, params.id);
+      const gradable = await gradableClose(ctx.cwd, issue);
+      if (!gradable.ok) throw new Error(gradable.refusal);
+      const summary = params.summary.trim();
+      if (summary === "") {
+        throw new Error("workgraph_record_outcome needs a one-line summary.");
+      }
+      // Pi checks parameters against the schema before `execute`; a direct
+      // caller gets the same answer here. `unknown` is the core's own word
+      // for a step that never reported, and is not a caller's to write.
+      const reported = REPORTABLE_OUTCOMES.find((value) => value === params.outcome);
+      if (reported === undefined) {
+        throw new Error(
+          `workgraph_record_outcome takes outcome ${REPORTABLE_OUTCOMES.join(", ")}; got "${params.outcome}".`,
+        );
+      }
+      const outcome: OutcomeT = {
+        outcome: reported,
+        ...(params.fixRounds !== undefined ? { fixRounds: params.fixRounds } : {}),
+        summary,
+      };
+      // The reporter does not know which execution it is: while a step is
+      // still expected to report, the record takes the launched step's id.
+      const executionId =
+        outcomeStatusOf(issue) === "pending"
+          ? outcomeExecutionIdOf(issue)
+          : undefined;
+      await recordOutcome(
+        ctx.cwd,
+        params.id,
+        outcome,
+        {
+          actor: actor.bdActor,
+          ...(executionId !== undefined ? { executionId } : {}),
+          workflowRunId: gradable.stamp.workflowRunId,
+        },
+        actor.bdActor,
+      );
+      return textResult(
+        `Recorded outcome ${compactOutcome(outcome)} for ${params.id}.`,
+        {
+          id: params.id,
+          outcome: params.outcome,
+          fixRounds: params.fixRounds ?? null,
+          executionId: executionId ?? null,
+        },
+      );
+    },
+  });
+
+  pi.registerTool({
+    name: "workgraph_scorecard",
+    label: "Scorecard",
+    description:
+      "Report how accepted work held up: of the issues the gate closed in the window (default 7 days), how many needed nothing, needed fixes, " +
+      "were abandoned, ended unknown, or have no outcome recorded (never counted as clean), split by whether their check passed or was waived, " +
+      "with the issues that fared worst. Under ten counted issues it prints counts, not a percentage.",
+    promptSnippet: "Report how accepted work held up after it closed",
+    promptGuidelines: [
+      "Use workgraph_scorecard to see whether accepted work needed fixes after it closed; an issue with no outcome recorded is not a clean one.",
+    ],
+    parameters: ScorecardParams,
+    executionMode: "sequential",
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      await prepare(ctx);
+      const card = scorecard(await scorecardRows(ctx.cwd), {
+        now: new Date(),
+        windowDays: params.windowDays ?? DEFAULT_SCORECARD_WINDOW_DAYS,
+      });
+      return textResult(renderScorecard(card), { scorecard: card });
+    },
+  });
+
+  pi.registerTool({
+    name: "workgraph_gates",
+    label: "Gate report",
+    description:
+      "Report what the proof gates did: for each gate, the issues it blocked (mode enforce) and the issues it would have blocked (mode observe). " +
+      "A gate that is off records nothing. Work whose check was waived is listed under check as not applicable, with the waiver reason. " +
+      "A diff guard (weakened-tests, unproven-tests, scope) also lists the issues it could not decide as unknown: a guard that is blind in this repository shows there. " +
+      "Pass an id to narrow the report to one issue.",
+    promptSnippet: "Report which gates blocked work, or would have",
+    promptGuidelines: [
+      "Use workgraph_gates to see what each gate blocked or would have blocked before changing a gate's mode in the policy.",
+    ],
+    parameters: GatesParams,
+    executionMode: "sequential",
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      await prepare(ctx);
+      // An unknown id is an error, not an empty report.
+      if (params.id !== undefined) await show(ctx.cwd, params.id);
+      const summary = summarizeGates(await listGateRecords(ctx.cwd, params.id));
+      const lines = GATES.map((gate) => gateReportLine(gate, summary[gate]));
+      return textResult(lines.join("\n"), {
+        id: params.id ?? null,
+        gates: summary,
       });
     },
   });
@@ -769,7 +1193,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     parameters: HeartbeatParams,
     executionMode: "sequential",
     async execute(_id, _params, _signal, _onUpdate, ctx) {
-      const config = await prepare(ctx);
+      const config = await prepareHeld(ctx);
       const leases = heldLeases(ctx.cwd);
       if (leases.length === 0) {
         return textResult("No active lease to renew — claim an issue first.", {
@@ -824,7 +1248,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     promptSnippet: "Initialize a work-graph workspace here",
     promptGuidelines: [
       "Use workgraph_init once per repository before creating issues; calling it again is harmless.",
-      "When asked to set up workgraph for a feature: call workgraph_init, then workgraph_create with approve: true, workflowClass planned, and acceptance criteria derived from the request; if the request names models for roles, call workgraph_tiers first (otherwise the roster in Pi settings applies).",
+      "When asked to set up workgraph for a feature: call workgraph_init, then workgraph_create with approve: true, workflowClass planned, acceptance criteria derived from the request, and check set to the command that proves the work (the repository's test command, e.g. npm test) unless Pi settings already name a default under workgraph.check; if the request names models for roles, call workgraph_tiers first (otherwise the roster in Pi settings applies).",
     ],
     parameters: InitParams,
     executionMode: "sequential",
@@ -842,19 +1266,30 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
     label: "Create work",
     description:
       "Create an issue in the work graph. With approve: true it is dispatchable immediately (phase ready); " +
-      "workflowClass planned makes the coordinator plan first and wait for workgraph_approve_plan before any code is written.",
+      "workflowClass planned makes the coordinator plan first and wait for workgraph_approve_plan before any code is written. " +
+      "check is the shell command the core itself runs against the result before any review. " +
+      "With approve: true, medium- and high-risk work (the default tier is medium) is refused without a check or a repository default " +
+      "unless checkWaiver records why no check applies.",
     promptSnippet: "Create a work-graph issue",
     promptGuidelines: [
-      "Use workgraph_create to add work. Pass approve: true with acceptance criteria to dispatch it; use workflowClass planned when you want to review a plan before implementation.",
+      "Use workgraph_create to add work. Pass approve: true with acceptance criteria and a check command to dispatch it; use workflowClass planned when you want to review a plan before implementation.",
+      "Pass checkWaiver only on explicit human instruction, with the human's reason; never invent a waiver to get work approved.",
     ],
     parameters: CreateParams,
     executionMode: "sequential",
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      await prepare(ctx);
+      const config = await prepare(ctx);
       const actor = defaultLeaseActor();
       const riskTier = params.riskTier ?? (params.approve ? DEFAULT_RISK_TIER : undefined);
       const requestedWorkflowClass =
         params.workflowClass ?? (params.approve ? DEFAULT_WORKFLOW_CLASS : undefined);
+      // A draft may carry a check or a waiver for its later approval; the
+      // rule itself applies only to work created approved.
+      const given = authoredCheck(params);
+      if (params.approve) {
+        const refusal = approvalRefusal(riskTier, given, config);
+        if (refusal !== undefined) throw new Error(`Cannot create approved work: ${refusal}`);
+      }
       const issue = await createIssue(
         ctx.cwd,
         {
@@ -867,6 +1302,7 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
           workflowClass: requestedWorkflowClass as WorkflowClassT | undefined,
           approved: params.approve,
           dependsOn: params.dependsOn,
+          metadata: checkMetadata(given),
         },
         actor.bdActor,
       );
@@ -880,6 +1316,8 @@ export function registerWorkgraphTools(pi: ExtensionAPI): void {
             workflowClass: workflowClassOf(issue),
             requestedWorkflowClass,
             acceptanceCriteria: params.acceptanceCriteria ?? null,
+            check: given.check ?? null,
+            checkWaiver: given.waiver ?? null,
             actor: identitySnapshot(actor),
             via: "workgraph_create",
           },

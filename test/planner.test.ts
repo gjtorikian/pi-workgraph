@@ -46,6 +46,7 @@ import {
   WORKGRAPH_PLANNER_PROVENANCE_KEY,
   type PlanT,
 } from "../src/types.ts";
+import { preProofConfig } from "./helpers/config.ts";
 import { installFakeExecutor } from "./helpers/fake-executor.ts";
 import {
   asExtensionAPI,
@@ -57,19 +58,12 @@ import { makeScratchGraph, type ScratchGraph } from "./helpers/scratch.ts";
 
 const WORKER = "planner-test-worker";
 
-const CONFIG: WorkgraphConfig = {
-  leaseTtlMs: 300_000,
-  heartbeatMs: 600_000,
-  pollMs: 600_000,
-  sweepIntervalMs: 600_000,
-  discoveryTimeoutMs: 40,
-  acceptTimeoutMs: 150,
-  compatInSessionExecutor: false,
+const CONFIG = preProofConfig({
   workerIdOverride: WORKER,
   // The human gate has its own suite (test/plan-gate.test.ts); this one
   // pins the auto-flow topology.
   planApproval: "auto",
-};
+});
 
 /** Distinct provenance per tier — independent under every policy. */
 const PLAN_PROV = {
@@ -109,7 +103,7 @@ interface Harness {
 
 function makeHarness(overrides: Partial<WorkgraphConfig> = {}): Harness {
   const mock = makeMockPi();
-  const config: WorkgraphConfig = { ...CONFIG, ...overrides };
+  const config = preProofConfig({ ...CONFIG, ...overrides });
   setWorkerIdOverride(WORKER);
   const coordinator = registerCoordinator(asExtensionAPI(mock), {
     getConfig: () => config,

@@ -59,10 +59,29 @@ export interface RoleScript {
    *  plan_critic transport). Presence, not truthiness, decides: `null` and
    *  malformed values are sent as-is so tests can drive the invalid paths. */
   critique?: unknown;
+  /**
+   * Attached verbatim as the completion's extra `recheck` field (the answer
+   * to a blocker recheck, which arrives as a `reviewer` request carrying
+   * `recheck`). A recheck request takes the NEXT entry of a reviewer array
+   * like any other reviewer request, so a sequence scripts it in order
+   * (`[{ verdict }, { recheck }]`); a single non-array script may carry both
+   * fields, since the review reads one and the recheck the other.
+   */
+  recheck?: unknown;
   finalization?: unknown;
   provenance?: RunCompletedT["provenance"];
   artifacts?: string[];
   rejectReason?: string;
+  /** Reported as the completion's `workspace` (where the work is). */
+  workspace?: FakeWorkspace;
+  /**
+   * Runs when the scripted run does its "work": synchronously, after the
+   * accept and BEFORE the completion is emitted (for `accept-stall`, when
+   * the test calls `complete()`). The hook is how a fake edits files in the
+   * workspace — an implementer that writes a file, a reviewer or finalizer
+   * that should not have.
+   */
+  onRequest?: (request: RunRequestT) => void;
 }
 
 /**
@@ -91,6 +110,12 @@ export interface FakeExecutorOptions {
   rejectReason?: string;
   /** Default provenance on completions (default `{harness: "fake"}`). */
   provenance?: RunCompletedT["provenance"];
+  /** Default `workspace` on every completion (a role script's wins). An
+   *  isolated fake reports `{ path, baseRevision }`; the default fake
+   *  reports nothing, like an executor that predates the field. */
+  workspace?: FakeWorkspace;
+  /** Default `onRequest` hook for every role (a role script's wins). */
+  onRequest?: (request: RunRequestT) => void;
   /** Per-role response scripts (phase-3 judgment playground). */
   roleScripts?: Partial<Record<ExecutorRoleT, RoleScript | RoleScript[]>>;
   /** Delay the discovery offer (late-offer / deadline tests). */
@@ -103,6 +128,18 @@ export interface FakeExecutorOptions {
   /** Offer flags (phase 4; both default false, matching protocol history). */
   supportsCancellation?: boolean;
   supportsReconciliation?: boolean;
+  /** Advertise `supportsBackground` on the offer (omitted unless true). */
+  supportsBackground?: boolean;
+  /**
+   * Script for BACKGROUND requests (`background: true`: the outcome step
+   * that follows a close). Kept apart from `roleScripts.finalizer`, whose
+   * role such a request shares, so a suite can script finalization and the
+   * outcome step without interleaving one array. Consumed like a role
+   * script; when unset, a background request falls back to the finalizer
+   * script. A background run is never "the most recently accepted run":
+   * `complete()` does not see it, `completeBackground()` does.
+   */
+  background?: RoleScript | RoleScript[];
   /** `run:cancel` handling: `"ack"` (default) emits a correlated
    *  `run:cancelled` — including for unknown/finished runs (the no-op-ack
    *  contract); `"ignore"` drives the unacked-cancel abandon path. */
@@ -111,15 +148,20 @@ export interface FakeExecutorOptions {
   status?: FakeStatusScript;
 }
 
+/** Where a fake says its work is; rides `run:completed` as `workspace`. */
+export type FakeWorkspace = NonNullable<RunCompletedT["workspace"]>;
+
 export interface CompleteOverrides {
   /** Override the echoed lease epoch (stale-result tests). */
   leaseEpoch?: number;
   outcome?: RunOutcomeT;
   verdict?: unknown;
+  recheck?: unknown;
   plan?: unknown;
   finalization?: unknown;
   provenance?: RunCompletedT["provenance"];
   artifacts?: string[];
+  workspace?: FakeWorkspace;
 }
 
 export interface FakeExecutorHandle {
@@ -134,6 +176,15 @@ export interface FakeExecutorHandle {
   /** Complete the most recently accepted run (accept-stall flows). Returns
    *  the emitted message so tests can re-emit it verbatim. */
   complete(overrides?: CompleteOverrides): RunCompletedT;
+  /**
+   * Complete an accepted background run that has not completed yet
+   * (`background: { behavior: "accept-stall" }` flows): the one for
+   * `issueId`, or the most recently accepted one. Throws when there is none.
+   */
+  completeBackground(
+    issueId?: string,
+    overrides?: CompleteOverrides,
+  ): RunCompletedT;
   /** Re-emit a previously emitted completion verbatim (duplicate delivery). */
   reemit(message: RunCompletedT): void;
   /** Unsubscribe from the bus. */
@@ -154,6 +205,13 @@ export function installFakeExecutor(
     executionId: string;
     script: RoleScript;
   } | null = null;
+  /** Accepted background runs still waiting for their completion, oldest first. */
+  const backgroundPending: {
+    request: RunRequestT;
+    executionId: string;
+    script: RoleScript;
+  }[] = [];
+  let backgroundCursor = 0;
   let executionCounter = 0;
   const scriptCursor = new Map<ExecutorRoleT, number>();
   const unsubs: (() => void)[] = [];
@@ -169,6 +227,17 @@ export function installFakeExecutor(
     return entry[Math.min(cursor, entry.length - 1)]!;
   }
 
+  /** Next scripted response for a background request (same array rules). */
+  function backgroundScript(): RoleScript {
+    const entry = opts.background;
+    if (entry === undefined) return scriptFor("finalizer");
+    if (!Array.isArray(entry)) return entry;
+    if (entry.length === 0) return {};
+    const cursor = backgroundCursor;
+    backgroundCursor += 1;
+    return entry[Math.min(cursor, entry.length - 1)]!;
+  }
+
   function buildCompletion(
     request: RunRequestT,
     executionId: string,
@@ -176,9 +245,11 @@ export function installFakeExecutor(
     script: RoleScript = {},
   ): RunCompletedT {
     const verdict = overrides.verdict ?? script.verdict;
+    const recheck = overrides.recheck ?? script.recheck;
     const plan = overrides.plan ?? script.plan;
     const finalization = overrides.finalization ?? script.finalization;
     const critique = script.critique;
+    const workspace = overrides.workspace ?? script.workspace ?? opts.workspace;
     return {
       ...newEnvelope(),
       workflowRunId: request.workflowRunId,
@@ -202,12 +273,24 @@ export function installFakeExecutor(
       provenance: overrides.provenance ??
         script.provenance ??
         opts.provenance ?? { harness: "fake" },
-      // Extra v1-tolerated fields — the verdict, plan, and critique transports.
+      // Extra v1-tolerated fields — the verdict, recheck, plan, and critique
+      // transports.
       ...(verdict !== undefined ? { verdict } : {}),
+      ...(recheck !== undefined ? { recheck } : {}),
       ...(plan !== undefined ? { plan } : {}),
       ...(critique !== undefined ? { critique } : {}),
       ...(finalization !== undefined ? { finalization } : {}),
+      ...(workspace !== undefined ? { workspace } : {}),
     } as RunCompletedT;
+  }
+
+  /**
+   * Run the scripted `onRequest` hook. BEFORE the completion is built and
+   * emitted: the coordinator snapshots the workspace inside its completion
+   * handler, so an edit made any later would not be in the result tree.
+   */
+  function runHook(script: RoleScript, request: RunRequestT): void {
+    (script.onRequest ?? opts.onRequest)?.(request);
   }
 
   function emitCompletion(message: RunCompletedT): void {
@@ -238,6 +321,7 @@ export function installFakeExecutor(
         ...(opts.maxConcurrency !== undefined
           ? { maxConcurrency: opts.maxConcurrency }
           : {}),
+        ...(opts.supportsBackground ? { supportsBackground: true } : {}),
       };
       if (opts.offerDelayMs !== undefined) {
         setTimeout(() => events.emit(CH.offer, offer), opts.offerDelayMs);
@@ -258,7 +342,8 @@ export function installFakeExecutor(
       if (msg.executorId !== executorId) return; // addressed elsewhere
       requests.push(msg);
 
-      const script = scriptFor(msg.role);
+      const background = msg.background === true;
+      const script = background ? backgroundScript() : scriptFor(msg.role);
       const behavior = script.behavior ?? opts.behavior ?? "accept-complete";
       if (behavior === "silent") return;
       if (behavior === "reject") {
@@ -279,7 +364,13 @@ export function installFakeExecutor(
       // (e.g. a pre- and post-restart pair) must never collide on the
       // independence check's executionId floor.
       const executionId = `${executorId}-exec-${executionCounter}`;
-      lastAccepted = { request: msg, executionId, script };
+      if (background) {
+        if (behavior !== "accept-complete") {
+          backgroundPending.push({ request: msg, executionId, script });
+        }
+      } else {
+        lastAccepted = { request: msg, executionId, script };
+      }
       events.emit(CH.runAccepted, {
         ...newEnvelope(),
         inReplyTo: msg.messageId,
@@ -291,6 +382,7 @@ export function installFakeExecutor(
       });
 
       if (behavior === "accept-complete") {
+        runHook(script, msg);
         const completion = buildCompletion(msg, executionId, {}, script);
         emitCompletion(completion);
         if (opts.duplicateCompletion) {
@@ -367,11 +459,34 @@ export function installFakeExecutor(
       if (!lastAccepted) {
         throw new Error("fake executor: no accepted run to complete");
       }
+      runHook(lastAccepted.script, lastAccepted.request);
       const message = buildCompletion(
         lastAccepted.request,
         lastAccepted.executionId,
         overrides,
         lastAccepted.script,
+      );
+      emitCompletion(message);
+      return message;
+    },
+    completeBackground(issueId, overrides = {}) {
+      const index =
+        issueId === undefined
+          ? backgroundPending.length - 1
+          : backgroundPending.findIndex(
+              (entry) => entry.request.issue.id === issueId,
+            );
+      const entry = backgroundPending[index];
+      if (!entry) {
+        throw new Error("fake executor: no background run to complete");
+      }
+      backgroundPending.splice(index, 1);
+      runHook(entry.script, entry.request);
+      const message = buildCompletion(
+        entry.request,
+        entry.executionId,
+        overrides,
+        entry.script,
       );
       emitCompletion(message);
       return message;

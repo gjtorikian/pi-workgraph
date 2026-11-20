@@ -19,6 +19,7 @@ import {
 } from "../src/lease.ts";
 import { findExpired, reclaim, registerSweep } from "../src/sweep.ts";
 import type { Lease } from "../src/types.ts";
+import { preProofConfig } from "./helpers/config.ts";
 import {
   asExtensionAPI,
   makeEventContext,
@@ -246,17 +247,11 @@ describe("production sweep wiring (phase 1)", () => {
     const ectx = makeEventContext(graph.dir);
     try {
       const controller = registerSweep(asExtensionAPI(mock), {
-        // Huge interval: the timer never fires mid-test; ticks are driven
-        // through the controller (the test/dispatch.test.ts pattern).
-        getConfig: () => ({
-          leaseTtlMs: TTL,
-          heartbeatMs: 600_000,
-          pollMs: 600_000,
-          sweepIntervalMs: 600_000,
-          discoveryTimeoutMs: 40, // unused by the sweep — config-shape only
-          acceptTimeoutMs: 150,
-          compatInSessionExecutor: false,
-        }),
+        // The shared timers. Huge interval: the timer never fires mid-test;
+        // ticks are driven through the controller (the
+        // test/dispatch.test.ts pattern). The protocol timeouts are unused
+        // by the sweep — config shape only.
+        getConfig: () => preProofConfig({ leaseTtlMs: TTL }),
       });
 
       // Warm-up tick (one-time workspace probes), then measure a solo tick.

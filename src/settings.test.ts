@@ -16,6 +16,7 @@ import {
   settingsExecutors,
   settingsPlanApproval,
   settingsPlanCritique,
+  settingsPolicy,
   settingsStore,
   workgraphSettings,
 } from "./settings.ts";
@@ -289,5 +290,39 @@ describe("store policy from settings", () => {
       if (previousAgent !== undefined) process.env.PI_CODING_AGENT_DIR = previousAgent;
       else delete process.env.PI_CODING_AGENT_DIR;
     }
+  });
+});
+
+describe("gate policy from settings", () => {
+  it("carries the policy through as raw JSON, valid or not, and never logs or drops it", () => {
+    const { result, logged } = withLoggedErrors(() => [
+      parseWorkgraphSettings({ workgraph: { policy: { low: { gates: { scope: "off" } } } } }),
+      // Not validated here: config.ts rejects this one, so it must arrive.
+      parseWorkgraphSettings({ workgraph: { policy: { low: { gateMode: "advisory" } } } }),
+      parseWorkgraphSettings({ workgraph: { policy: ["not", "a", "policy"] } }),
+      parseWorkgraphSettings({ workgraph: { policy: " {} " } }),
+    ]);
+    expect(result).toEqual([
+      { policy: '{"low":{"gates":{"scope":"off"}}}' },
+      { policy: '{"low":{"gateMode":"advisory"}}' },
+      { policy: '["not","a","policy"]' },
+      { policy: "{}" },
+    ]);
+    expect(logged).toEqual([]);
+  });
+
+  it("treats an empty string or null as unset", () => {
+    expect(parseWorkgraphSettings({ workgraph: { policy: "  " } })).toBeUndefined();
+    expect(parseWorkgraphSettings({ workgraph: { policy: null } })).toBeUndefined();
+  });
+
+  it("the project value replaces the global one whole", () => {
+    const agentDir = tempDir("agent");
+    const project = tempDir("project");
+    writeSettings(agentDir, undefined, { workgraph: { policy: { low: { gates: { scope: "off" } } } } });
+    expect(settingsPolicy({ agentDir, cwd: project })).toBe('{"low":{"gates":{"scope":"off"}}}');
+    writeSettings(project, ".pi", { workgraph: { policy: { high: { maxRevisions: 1 } } } });
+    expect(settingsPolicy({ agentDir, cwd: project })).toBe('{"high":{"maxRevisions":1}}');
+    expect(settingsPolicy({ agentDir: tempDir("empty"), cwd: tempDir("plain") })).toBeUndefined();
   });
 });

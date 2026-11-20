@@ -30,9 +30,14 @@
  * so no call to `renderPlan` can leak one into a prompt.
  *
  * WHAT A PLAN IS NOT: it is evidence, never authority. The core does not
- * interpret steps, does not enforce `targets`, and does not let a planner's
- * `acceptanceCriteria` overwrite the approved criteria on the issue — a
- * planner that could rewrite its own bar would defeat the judgment gate.
+ * interpret steps and does not let a planner's `acceptanceCriteria`
+ * overwrite the approved criteria on the issue — a planner that could
+ * rewrite its own bar would defeat the judgment gate.
+ *
+ * THE ONE THING THE CORE READS: the file paths among a plan's `targets`
+ * ({@link planPathTargets}). Once a human approved the plan at the plan
+ * gate, the `scope` guard (`src/guards.ts`) compares the change against
+ * them. Only then: a plan nobody approved binds nothing.
  */
 import { Value } from "typebox/value";
 import { addComment, listComments } from "./store.ts";
@@ -258,8 +263,8 @@ export function renderPlanForReview(plan: PlanT, critique?: PlanCritiqueT): stri
  * `workgraph-plan plan {json}` — steps capped/truncated, extra context
  * (`details`: workflowRunId, executionId, planner provenance, attempt)
  * folded in. Resolves (never rejects) even when the write fails, mirroring
- * `recordVerdict` and `recordLeaseEvent`: a broken comment surface must not
- * take the lifecycle down.
+ * `recordLeaseEvent`: a broken comment surface must not take the lifecycle
+ * down.
  */
 export async function recordPlan(
   cwd: string,
@@ -325,4 +330,52 @@ export async function latestPlan(cwd: string, issueId: string): Promise<PlanT | 
     }
   }
   return undefined;
+}
+
+/** What a model tends to wrap a path in, or leave after it. */
+const TARGET_WRAPPING = /^[`'"<]+|[`'">,;.]+$/g;
+
+/** `:42` or `:42:7` after a path. */
+const TARGET_LINE_SUFFIX = /:\d+(?::\d+)?$/;
+
+/**
+ * One target as a repository path, or undefined when it does not read as
+ * one. A target is path-like when it has no whitespace and no parenthesis
+ * and either contains a `/` or ends in a file extension: `src/a.ts`,
+ * `src/lib/`, `docs/*.md` and `package.json` are, `parseConfig()`,
+ * `RetryPolicy` and `the retry loop` are not. What a model adds around a
+ * path is removed first: backticks and quotes, a trailing comma or period,
+ * a leading `./`, a `:line` suffix.
+ */
+function pathTarget(raw: string): string | undefined {
+  let target = raw.trim().replace(TARGET_WRAPPING, "").trim();
+  if (target.endsWith(TRUNCATION_MARKER)) return undefined; // a cut path names nothing
+  target = target.replace(TARGET_LINE_SUFFIX, "");
+  while (target.startsWith("./")) target = target.slice(2);
+  target = target.replace(/\/{2,}/g, "/");
+  if (target === "" || /[\s()]/.test(target)) return undefined;
+  const last = target.slice(target.lastIndexOf("/") + 1);
+  const hasExtension = /\.[A-Za-z0-9_-]+$/.test(last);
+  if (!target.includes("/") && !hasExtension) return undefined;
+  return target;
+}
+
+/**
+ * The path-like targets of a plan, each once, in plan order: what the
+ * `scope` guard holds an approved plan to. Symbol names and prose are
+ * dropped. An absolute path is returned as written; the caller that knows
+ * the repository makes it relative.
+ *
+ * Read from the plan as recorded, so the recording caps apply: at most
+ * {@link MAX_TARGETS} per step and {@link MAX_STEPS} steps.
+ */
+export function planPathTargets(plan: PlanT): string[] {
+  const targets: string[] = [];
+  for (const step of plan.steps) {
+    for (const raw of step.targets ?? []) {
+      const target = pathTarget(raw);
+      if (target !== undefined && !targets.includes(target)) targets.push(target);
+    }
+  }
+  return targets;
 }

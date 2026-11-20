@@ -3,15 +3,35 @@
  * override. Resolution order per value: CLI flag, then environment variable,
  * then default. The timers are consumed by the Phase 2 lease layer; only the
  * identity override is load-bearing in Phase 1.
+ *
+ * A value that does not parse is ignored and logged, with four exceptions
+ * that THROW instead: `finalization`, `outcome`, `policy` and `check`. The
+ * first, third and fourth decide what may close, and `outcome` is a task a
+ * human wrote to run by itself after every close, so a typo in any of them
+ * must not quietly become "the default".
+ * `resolveConfig` runs on every `getConfig()` call, which is where an
+ * invalid policy or check block stops dispatch; readers that consult
+ * neither use {@link resolveConfigWithoutPolicy} and are not stopped by it.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { PolicyOverrides } from "./policy.ts";
+import {
+  CheckConfigError,
+  validateCheckSettings,
+  type CheckSettings,
+} from "./check.ts";
+import {
+  PolicyConfigError,
+  validatePolicyOverrides,
+  type PolicyOverrides,
+} from "./policy.ts";
 import type { WorkflowClassT } from "./types.ts";
 import {
   parseExecutorPins,
+  settingsCheck,
   settingsExecutors,
   settingsPlanApproval,
   settingsPlanCritique,
+  settingsPolicy,
   settingsStore,
   settingsSubagentsExecutor,
 } from "./settings.ts";
@@ -70,6 +90,13 @@ export interface SubagentsExecutorConfig {
 export interface WorkgraphConfig {
   /** Optional caller-defined work after verification and before closure. */
   finalization?: { instructions: string; timeoutMs?: number };
+  /**
+   * Optional caller-defined step launched in an executor's background mode
+   * AFTER an issue closes (`src/outcome.ts`). `instructions` reach the step
+   * unchanged; `timeoutMs` is how long it may stay silent before its outcome
+   * is recorded as `unknown` (default 2 h). Flag or environment only.
+   */
+  outcome?: { instructions: string; timeoutMs?: number };
   /** Lease time-to-live in milliseconds (default 5 min). */
   leaseTtlMs: number;
   /** Heartbeat interval in milliseconds (default 60 s). */
@@ -106,13 +133,25 @@ export interface WorkgraphConfig {
   /** Optional worker identity override; wins over the derived id. */
   workerIdOverride?: string;
   /**
-   * Per-risk-tier judgment-gate policy overrides, merged over
-   * `DEFAULT_POLICY` by `resolvePolicy` (defaults: low = advisory,
-   * medium/high = blocking with author independence, maxRevisions 3).
-   * Optional so existing config literals keep compiling; a partial object
-   * never drops a knob.
+   * Per-risk-tier policy overrides, merged over `DEFAULT_POLICY` by
+   * `resolvePolicy` (defaults: the `check` gate enforces at every tier, the
+   * other six gates enforce at medium/high and observe at low; medium/high
+   * require author independence; maxRevisions 3). From the flag/env, else
+   * Pi settings; validated by `validatePolicyOverrides`, which throws on an
+   * unknown tier, knob, gate or mode. Optional so config literals keep
+   * compiling; a partial object never drops a knob or a gate.
    */
   policy?: PolicyOverrides;
+  /**
+   * The repository's check settings, from the `workgraph.check` key of Pi
+   * settings (there is no flag): `command` is the check run for every issue
+   * that names none of its own, `timeoutMs` bounds any check (default 10
+   * minutes), `setup` prepares a throwaway worktree of a base tree before a
+   * check runs there, and `testGlobs` replaces the default globs that say
+   * which files are tests (`src/guards.ts`). Validated by
+   * `validateCheckSettings`, which throws on an unknown key or a bad value.
+   */
+  check?: CheckSettings;
   /**
    * Opt-in: let the coordinator auto-dispatch LEGACY issues (no
    * `workgraph_lifecycle_version`). Default FALSE — legacy issues are
@@ -164,6 +203,21 @@ export const DEFAULT_POLL_MS = 30_000;
 export const DEFAULT_DISCOVERY_TIMEOUT_MS = 2_000;
 export const DEFAULT_ACCEPT_TIMEOUT_MS = 10_000;
 
+/**
+ * Every required value at its default, with nothing optional set. What the
+ * coordinator runs its timers on when no configuration has resolved yet
+ * (an invalid policy at session start).
+ */
+export const DEFAULT_CONFIG = {
+  leaseTtlMs: DEFAULT_LEASE_TTL_MS,
+  heartbeatMs: DEFAULT_HEARTBEAT_MS,
+  pollMs: DEFAULT_POLL_MS,
+  sweepIntervalMs: DEFAULT_POLL_MS,
+  discoveryTimeoutMs: DEFAULT_DISCOVERY_TIMEOUT_MS,
+  acceptTimeoutMs: DEFAULT_ACCEPT_TIMEOUT_MS,
+  compatInSessionExecutor: true,
+} satisfies WorkgraphConfig;
+
 const FLAGS = [
   {
     name: "workgraph-lease-ttl-ms",
@@ -207,7 +261,7 @@ const FLAGS = [
   {
     name: "workgraph-policy",
     description:
-      'Per-risk-tier judgment-gate policy overrides as a JSON object, e.g. {"low":{"maxRevisions":1}} (env WORKGRAPH_POLICY; defaults: low advisory, medium/high blocking)',
+      'Per-risk-tier policy overrides as a JSON object, e.g. {"low":{"gates":{"review":"enforce"}}}; each gate is off, observe or enforce (headless override of Pi settings; env WORKGRAPH_POLICY; defaults: check enforces everywhere, the other gates enforce at medium/high and observe at low; an invalid policy stops dispatch)',
   },
   {
     name: "workgraph-compat-legacy-issues",
@@ -223,6 +277,11 @@ const FLAGS = [
     name: "workgraph-finalization",
     description:
       "Optional post-verification task as JSON with instructions and timeoutMs (env WORKGRAPH_FINALIZATION)",
+  },
+  {
+    name: "workgraph-outcome",
+    description:
+      "Optional step launched in the background after an issue closes, as JSON with instructions and timeoutMs; it reports through workgraph_record_outcome (env WORKGRAPH_OUTCOME)",
   },
   {
     name: "workgraph-plan-approval",
@@ -292,30 +351,61 @@ function timerValue(
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+/**
+ * The policy overrides: flag, then environment, then the `workgraph.policy`
+ * settings key. THROWS {@link PolicyConfigError} on anything that is not a
+ * valid policy, unparseable JSON included, naming the bad key and where the
+ * value came from. Never falls back to the defaults (see the module comment).
+ */
 function policyValue(
   pi: ExtensionAPI,
   flag: string,
   envVar: string,
 ): PolicyOverrides | undefined {
-  const raw = stringValue(pi, flag, envVar);
+  const fromFlag = stringValue(pi, flag, envVar);
+  const raw = fromFlag ?? settingsPolicy();
   if (raw === undefined) return undefined;
+  const source =
+    fromFlag !== undefined
+      ? `${flag}/${envVar}`
+      : 'the "workgraph.policy" setting';
+  let parsed: unknown;
   try {
-    const parsed: unknown = JSON.parse(raw);
-    if (
-      parsed === null ||
-      typeof parsed !== "object" ||
-      Array.isArray(parsed)
-    ) {
-      return undefined;
-    }
-    // Structural trust boundary ends here: resolvePolicy merges per-knob
-    // over the defaults, so a partially-shaped override degrades safely.
-    return parsed as PolicyOverrides;
+    parsed = JSON.parse(raw);
   } catch {
-    console.error(
-      `[pi-workgraph] ignoring unparseable ${flag}/${envVar} value (not JSON)`,
+    throw new PolicyConfigError(
+      `policy is not valid JSON (set by ${source})`,
     );
-    return undefined;
+  }
+  try {
+    return validatePolicyOverrides(parsed);
+  } catch (e) {
+    if (!(e instanceof PolicyConfigError)) throw e;
+    throw new PolicyConfigError(`${e.message} (set by ${source})`);
+  }
+}
+
+/**
+ * The `workgraph.check` settings block. THROWS {@link CheckConfigError} on
+ * anything that is not a valid block, as {@link policyValue} does for the
+ * policy and for the same reason: a dropped repository default would leave
+ * work unchecked without a word.
+ */
+function checkValue(): CheckSettings | undefined {
+  const raw = settingsCheck();
+  if (raw === undefined) return undefined;
+  const source = 'the "workgraph.check" setting';
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new CheckConfigError(`check is not valid JSON (set by ${source})`);
+  }
+  try {
+    return validateCheckSettings(parsed);
+  } catch (e) {
+    if (!(e instanceof CheckConfigError)) throw e;
+    throw new CheckConfigError(`${e.message} (set by ${source})`);
   }
 }
 
@@ -485,6 +575,36 @@ function finalizationValue(pi: ExtensionAPI): WorkgraphConfig["finalization"] {
   };
 }
 
+/**
+ * The outcome step, parsed like {@link finalizationValue} and THROWING like
+ * it on a value that is not one. `instructions` are returned exactly as
+ * written inside the JSON: the step receives them verbatim.
+ */
+function outcomeValue(pi: ExtensionAPI): WorkgraphConfig["outcome"] {
+  const raw = stringValue(pi, "workgraph-outcome", "WORKGRAPH_OUTCOME");
+  if (!raw || raw === "false") return undefined;
+  const value: unknown = JSON.parse(raw);
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error("workgraph-outcome must contain instructions");
+  const input = value as Record<string, unknown>;
+  if (typeof input.instructions !== "string" || !input.instructions.trim())
+    throw new Error("workgraph-outcome requires nonempty instructions");
+  if (
+    input.timeoutMs !== undefined &&
+    (typeof input.timeoutMs !== "number" ||
+      !Number.isFinite(input.timeoutMs) ||
+      input.timeoutMs <= 0 ||
+      input.timeoutMs > 2_147_483_647)
+  )
+    throw new Error("workgraph-outcome timeoutMs must be positive");
+  return {
+    instructions: input.instructions,
+    ...(typeof input.timeoutMs === "number"
+      ? { timeoutMs: input.timeoutMs }
+      : {}),
+  };
+}
+
 function boolValue(
   pi: ExtensionAPI,
   flag: string,
@@ -504,8 +624,34 @@ function boolValue(
   return fallback;
 }
 
-/** Resolve the effective configuration (flag > env > default). */
+/**
+ * Resolve the effective configuration (flag > env > settings > default).
+ * THROWS `PolicyConfigError` when the policy is invalid and
+ * `CheckConfigError` when the `check` block is: this is the reader for
+ * everything that starts work under them or reports them (the coordinator,
+ * the tools).
+ */
 export function resolveConfig(pi: ExtensionAPI): WorkgraphConfig {
+  const check = checkValue();
+  return {
+    ...resolveConfigWithoutPolicy(pi),
+    policy: policyValue(pi, "workgraph-policy", "WORKGRAPH_POLICY"),
+    ...(check !== undefined ? { check } : {}),
+  };
+}
+
+/**
+ * The effective configuration minus `policy` and `check`, which are neither
+ * read nor validated. For readers that consult neither and must keep
+ * working under an invalid one: executor adapters, the expiry sweep, the
+ * compaction takeover, session wiring. The return type leaves both out, so
+ * reading `.policy` or `.check` off this result is a type error rather than
+ * a silent "defaults". (It is still assignable to `WorkgraphConfig`, where
+ * both are optional: never wire it into something that judges work.)
+ */
+export function resolveConfigWithoutPolicy(
+  pi: ExtensionAPI,
+): Omit<WorkgraphConfig, "policy" | "check"> {
   const pollMs = timerValue(
     pi,
     "workgraph-poll-ms",
@@ -514,6 +660,7 @@ export function resolveConfig(pi: ExtensionAPI): WorkgraphConfig {
   );
   return {
     finalization: finalizationValue(pi),
+    outcome: outcomeValue(pi),
     leaseTtlMs: timerValue(
       pi,
       "workgraph-lease-ttl-ms",
@@ -563,7 +710,6 @@ export function resolveConfig(pi: ExtensionAPI): WorkgraphConfig {
       "workgraph-worker-id",
       "WORKGRAPH_WORKER_ID",
     ),
-    policy: policyValue(pi, "workgraph-policy", "WORKGRAPH_POLICY"),
     compatLegacyIssues: boolValue(
       pi,
       "workgraph-compat-legacy-issues",

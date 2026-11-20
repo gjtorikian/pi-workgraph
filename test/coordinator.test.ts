@@ -13,7 +13,7 @@
  *
  * Run via `npm run test:coordinator`.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   registerInSessionExecutor,
   IN_SESSION_EXECUTOR_ID,
@@ -55,6 +55,7 @@ import {
   WORKGRAPH_PHASE_KEY,
   WORKGRAPH_WORKFLOW_RUN_ID_KEY,
 } from "../src/types.ts";
+import { preProofConfig } from "./helpers/config.ts";
 import { installFakeExecutor } from "./helpers/fake-executor.ts";
 import {
   asExtensionAPI,
@@ -66,22 +67,16 @@ import { makeScratchGraph, type ScratchGraph } from "./helpers/scratch.ts";
 
 const WORKER = "coord-test-worker";
 
-/** Huge scheduling timers (event-driven ticks only), tiny REAL protocol
- *  timeouts (bounded waits resolve fast). */
-const CONFIG: WorkgraphConfig = {
-  leaseTtlMs: 300_000,
-  heartbeatMs: 600_000,
-  pollMs: 600_000,
-  sweepIntervalMs: 600_000,
-  discoveryTimeoutMs: 40,
-  acceptTimeoutMs: 150,
+/** The shared timers — huge scheduling timers (event-driven ticks only),
+ *  tiny REAL protocol timeouts (bounded waits resolve fast). */
+const CONFIG = preProofConfig({
   compatInSessionExecutor: false, // integration tests override per-harness
   // This suite exercises protocol coordination over legacy scratch issues;
   // the phase-3 approved-only rule (and its default legacy skip) has its
   // own coverage in test/judgment.test.ts.
   compatLegacyIssues: true,
   workerIdOverride: WORKER,
-};
+});
 
 function makeOffer(overrides: Partial<ExecutorOfferT> = {}): ExecutorOfferT {
   return {
@@ -106,7 +101,7 @@ interface Harness {
 
 function makeHarness(overrides: Partial<WorkgraphConfig> = {}): Harness {
   const mock = makeMockPi();
-  const config: WorkgraphConfig = { ...CONFIG, ...overrides };
+  const config = preProofConfig({ ...CONFIG, ...overrides });
   setWorkerIdOverride(WORKER);
   const coordinator = registerCoordinator(asExtensionAPI(mock), {
     getConfig: () => config,
@@ -775,7 +770,7 @@ describe("in-session adapter (standalone)", () => {
     config: WorkgraphConfig;
   } {
     const mock = makeMockPi();
-    const config: WorkgraphConfig = { ...CONFIG, compatInSessionExecutor: compat };
+    const config = preProofConfig({ ...CONFIG, compatInSessionExecutor: compat });
     const adapter = registerInSessionExecutor(asExtensionAPI(mock), {
       getConfig: () => config,
     });
@@ -874,7 +869,12 @@ describe("in-session adapter (standalone)", () => {
       leaseEpoch: 7,
       outcome: "success",
       provenance: { harness: "pi", profile: "initiating" },
+      // Where the work is: the session's own checkout. No base revision —
+      // this executor is not isolated, so the core recorded the base
+      // itself before the request went out.
+      workspace: { path: "/tmp/unused" },
     });
+    expect(completions[0]!.workspace).not.toHaveProperty("baseRevision");
     expect(adapter.activeRun()).toBeNull();
 
     // Re-settles (user chatter after the run) report nothing more.
@@ -950,12 +950,12 @@ describe("in-session adapter (standalone)", () => {
 // ---------------------------------------------------------------------------
 
 describe("in-session integration", () => {
-  it("the coordinator drains through the adapter: wakes come from the adapter alone", async () => {
+  it("the coordinator drains through the adapter one issue at a time: wakes come from the adapter alone", async () => {
     resetLeasesForTest();
     const graph = makeScratchGraph({ prefix: "coordis", seed: 2 });
     const mock = makeMockPi();
     setWorkerIdOverride(WORKER);
-    const config: WorkgraphConfig = { ...CONFIG, compatInSessionExecutor: true };
+    const config = preProofConfig({ ...CONFIG, compatInSessionExecutor: true });
     // Registration order matters and mirrors index.ts: the ADAPTER first,
     // so within one settled dispatch it observes the run state from the
     // previous tick and never completes a run the same instant it accepted.
@@ -964,26 +964,39 @@ describe("in-session integration", () => {
       getConfig: () => config,
     });
     const ectx = makeEventContext(graph.dir);
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       resetOpLog();
-      // Each issue takes two settles: claim+wake, then settle→completion.
+      // An issue takes two settles: claim+wake, then settle→completion.
+      // Four settles would have drained both issues before the claim-wait
+      // rule; now the extra two find the checkout occupied.
       for (let round = 0; round < 4; round++) {
         await settle(mock, ectx.ctx);
         await mock.flushEvents();
       }
 
-      for (const id of graph.seededIds) {
-        const metadata = metadataOf(graph, id);
-        expect(metadata[WORKGRAPH_PHASE_KEY], `${id} reaches judging`).toBe(
-          "judging",
-        );
-        expect(metadata[WORKGRAPH_EXECUTOR_ID_KEY]).toBe(IN_SESSION_EXECUTOR_ID);
-        expect(graph.showIssue(id).status).toBe("in_progress");
-      }
+      // The first issue is under judgment in the session's own checkout
+      // (nothing here offers the reviewer role, so it parks there).
+      const [first, second] = graph.seededIds as [string, string];
+      const metadata = metadataOf(graph, first);
+      expect(metadata[WORKGRAPH_PHASE_KEY]).toBe("judging");
+      expect(metadata[WORKGRAPH_EXECUTOR_ID_KEY]).toBe(IN_SESSION_EXECUTOR_ID);
+      expect(graph.showIssue(first).status).toBe("in_progress");
 
-      // One wake per issue — and EVERY sendMessage is the adapter's wake;
-      // the coordinator itself never calls sendMessage.
-      expect(mock.sendMessages).toHaveLength(2);
+      // CLAIM-WAIT: the in-session executor is not isolated, so a second
+      // issue is not claimed into a checkout that holds one under review —
+      // whatever the tree-binding mode (this suite runs with it off).
+      expect(graph.showIssue(second).status).toBe("open");
+      expect(metadataOf(graph, second)[WORKGRAPH_PHASE_KEY]).toBeUndefined();
+      expect(
+        errors.mock.calls.some((args) =>
+          String(args[0]).includes(`workspace under review: ${first}`),
+        ),
+      ).toBe(true);
+
+      // One wake — and EVERY sendMessage is the adapter's wake; the
+      // coordinator itself never calls sendMessage.
+      expect(mock.sendMessages).toHaveLength(1);
       for (const sent of mock.sendMessages) {
         expect(sent.message.customType).toBe(DISPATCH_MESSAGE_TYPE);
         expect(sent.options).toEqual({ triggerTurn: true, deliverAs: "followUp" });
@@ -992,11 +1005,12 @@ describe("in-session integration", () => {
       // Claims still go through bd's atomic claim path, exclusively —
       // claim-by-id since phase 3 (`update <id> --claim`).
       const claims = getOpLog().filter((e) => (e.op === "claim" || e.op === "claimNext"));
-      expect(claims).toHaveLength(2);
+      expect(claims).toHaveLength(1);
       for (const claim of claims) {
         expect(claim.op).toBe("claim");
       }
     } finally {
+      errors.mockRestore();
       await coordinator.teardown(ectx.ctx);
       graph.cleanup();
     }
@@ -1012,7 +1026,7 @@ describe("in-session integration", () => {
     const graph = makeScratchGraph({ prefix: "coordtd", seed: 1 });
     const mock = makeMockPi();
     setWorkerIdOverride(WORKER);
-    const config: WorkgraphConfig = { ...CONFIG, compatInSessionExecutor: true };
+    const config = preProofConfig({ ...CONFIG, compatInSessionExecutor: true });
     registerInSessionExecutor(asExtensionAPI(mock), { getConfig: () => config });
     const coordinator = registerCoordinator(asExtensionAPI(mock), {
       getConfig: () => config,

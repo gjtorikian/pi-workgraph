@@ -19,7 +19,6 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getOpLog, resetOpLog } from "../src/store.ts";
-import type { WorkgraphConfig } from "../src/config.ts";
 import {
   registerCoordinator,
   type CoordinatorController,
@@ -34,28 +33,24 @@ import {
   makeToolContext,
   type MockPi,
 } from "./helpers/mock-pi.ts";
+import { preProofConfig } from "./helpers/config.ts";
 import { makeScratchGraph } from "./helpers/scratch.ts";
 
 const WORKER = "invariant-worker";
 
-// Huge scheduling intervals: ticks and beats fire only from the events a
-// test emits, never from timers (the test/dispatch.test.ts pattern). The
-// protocol timeouts are tiny and REAL — pin 2's tick must wait out the
-// discovery window before deciding not to claim.
-const TEST_CONFIG: WorkgraphConfig = {
-  leaseTtlMs: 300_000,
-  heartbeatMs: 600_000,
-  pollMs: 600_000,
-  sweepIntervalMs: 600_000, // the sweep never fires mid-test either
-  discoveryTimeoutMs: 40,
-  acceptTimeoutMs: 150,
+// The shared timers. Huge scheduling intervals: ticks, beats and the sweep
+// fire only from the events a test emits, never from timers (the
+// test/dispatch.test.ts pattern). The protocol timeouts are tiny and REAL —
+// pin 2's tick must wait out the discovery window before deciding not to
+// claim.
+const TEST_CONFIG = preProofConfig({
   compatInSessionExecutor: false, // pin 2 requires an executorless bus
   // Pin 2 seeds a LEGACY issue: without the compat opt-in the phase-3
   // approved-only filter would skip it BEFORE discovery, and the pin would
   // pass for the wrong reason (no eligible issue rather than no executor).
   compatLegacyIssues: true,
   workerIdOverride: WORKER,
-};
+});
 
 let mock: MockPi;
 let controller: CoordinatorController;

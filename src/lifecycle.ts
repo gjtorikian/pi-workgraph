@@ -25,21 +25,40 @@
  * override tool bypasses phases entirely, always audited).
  */
 import { setMetadata, show, type MetadataValue } from "./store.ts";
+import { GUARD_GATES, type GuardGate } from "./policy.ts";
 import type { WorkIssue, WorkflowClassT, WorkgraphPhase } from "./types.ts";
 import {
   DEFAULT_WORKFLOW_CLASS,
+  WORKGRAPH_ACCEPTED_TREE_KEY,
   WORKGRAPH_ACTIVE_EXECUTION_ID_KEY,
   WORKGRAPH_ATTEMPT_KEY,
+  WORKGRAPH_BAR_DIGEST_KEY,
+  WORKGRAPH_BASE_COMMIT_KEY,
+  WORKGRAPH_BASE_TREE_KEY,
+  WORKGRAPH_CHECK_KEY,
+  WORKGRAPH_CHECK_WAIVER_KEY,
+  WORKGRAPH_DECISION_GATE_KEY,
   WORKGRAPH_EXECUTOR_ID_KEY,
   WORKGRAPH_FAILURE_FINGERPRINT_KEY,
+  WORKGRAPH_FINALIZED_TREE_KEY,
+  WORKGRAPH_GUARD_ALLOWED_BY_KEY,
+  WORKGRAPH_GUARD_ALLOWED_KEY,
+  WORKGRAPH_GUARD_ROUNDS_KEY,
+  WORKGRAPH_OUTCOME_DEADLINE_KEY,
+  WORKGRAPH_OUTCOME_EXECUTION_ID_KEY,
+  WORKGRAPH_OUTCOME_KEY,
+  WORKGRAPH_OUTCOME_STATUS_KEY,
   WORKGRAPH_LAST_VERDICT_KEY,
   WORKGRAPH_LIFECYCLE_VERSION_KEY,
   WORKGRAPH_PHASE_KEY,
   WORKGRAPH_PLAN_APPROVED_KEY,
   WORKGRAPH_PLAN_FEEDBACK_KEY,
+  WORKGRAPH_RESULT_COMMIT_KEY,
+  WORKGRAPH_RESULT_TREE_KEY,
   WORKGRAPH_RISK_TIER_KEY,
   WORKGRAPH_WORKFLOW_CLASS_KEY,
   WORKGRAPH_WORKFLOW_RUN_ID_KEY,
+  WORKGRAPH_WORKSPACE_PATH_KEY,
 } from "./types.ts";
 
 export type { WorkgraphPhase } from "./types.ts";
@@ -215,8 +234,8 @@ export function executorIdOf(issue: WorkIssue): string | undefined {
 }
 
 /** The persisted executor-side execution id, if any. Empty string reads as
- *  undefined — the sweep CLEARS this key by writing "" (the store's setMetadata
- *  cannot unset), so one branch covers both cleared and never-written. */
+ *  undefined — the sweep CLEARS this key by writing "", so one branch covers
+ *  both cleared and never-written. */
 export function activeExecutionIdOf(issue: WorkIssue): string | undefined {
   const raw = issue.metadata?.[WORKGRAPH_ACTIVE_EXECUTION_ID_KEY];
   return typeof raw === "string" && raw !== "" ? raw : undefined;
@@ -232,6 +251,126 @@ export function planApprovedOf(issue: WorkIssue): boolean {
 export function planFeedbackOf(issue: WorkIssue): string | undefined {
   const raw = issue.metadata?.[WORKGRAPH_PLAN_FEEDBACK_KEY];
   return typeof raw === "string" && raw.trim() !== "" ? raw : undefined;
+}
+
+/** A tree-binding key's value; "" (cleared) and non-strings read as unset. */
+function bindingValue(issue: WorkIssue, key: string): string | undefined {
+  const raw = issue.metadata?.[key];
+  return typeof raw === "string" && raw !== "" ? raw : undefined;
+}
+
+/** The directory the issue's work was last reported in, if any. */
+export function workspacePathOf(issue: WorkIssue): string | undefined {
+  return bindingValue(issue, WORKGRAPH_WORKSPACE_PATH_KEY);
+}
+
+/** The commit the work in {@link workspacePathOf} started from, if recorded. */
+export function baseCommitOf(issue: WorkIssue): string | undefined {
+  return bindingValue(issue, WORKGRAPH_BASE_COMMIT_KEY);
+}
+
+/** The tree the work in {@link workspacePathOf} started from, if recorded. */
+export function baseTreeOf(issue: WorkIssue): string | undefined {
+  return bindingValue(issue, WORKGRAPH_BASE_TREE_KEY);
+}
+
+/** The anchored snapshot commit of the latest result, if recorded. */
+export function resultCommitOf(issue: WorkIssue): string | undefined {
+  return bindingValue(issue, WORKGRAPH_RESULT_COMMIT_KEY);
+}
+
+/** The tree of the latest result, if recorded. */
+export function resultTreeOf(issue: WorkIssue): string | undefined {
+  return bindingValue(issue, WORKGRAPH_RESULT_TREE_KEY);
+}
+
+/** The tree the close stamp accepted, if any. */
+export function acceptedTreeOf(issue: WorkIssue): string | undefined {
+  return bindingValue(issue, WORKGRAPH_ACCEPTED_TREE_KEY);
+}
+
+/** The tree after finalization, set only when finalization changed it. */
+export function finalizedTreeOf(issue: WorkIssue): string | undefined {
+  return bindingValue(issue, WORKGRAPH_FINALIZED_TREE_KEY);
+}
+
+/** The issue's own check command, trimmed; "" and whitespace read as unset. */
+export function checkOf(issue: WorkIssue): string | undefined {
+  const raw = issue.metadata?.[WORKGRAPH_CHECK_KEY];
+  // A command is stored as a string, but a hand-written `true` may have
+  // landed as a boolean: it is still the shell builtin.
+  const text = typeof raw === "boolean" ? String(raw) : raw;
+  return typeof text === "string" && text.trim() !== "" ? text.trim() : undefined;
+}
+
+/** Why no check applies to the issue, trimmed; "" and whitespace read as unset. */
+export function checkWaiverOf(issue: WorkIssue): string | undefined {
+  const raw = issue.metadata?.[WORKGRAPH_CHECK_WAIVER_KEY];
+  return typeof raw === "string" && raw.trim() !== "" ? raw.trim() : undefined;
+}
+
+/** The digest of the bar frozen at the latest claim, if recorded. */
+export function barDigestOf(issue: WorkIssue): string | undefined {
+  return bindingValue(issue, WORKGRAPH_BAR_DIGEST_KEY);
+}
+
+/**
+ * A guard key's value as a list of guard gates, each once, in the order
+ * written. "" (cleared), a non-string and any name that is not a guard gate
+ * read as nothing: a hand-written `review` in the list allows no gate.
+ */
+function guardList(issue: WorkIssue, key: string): GuardGate[] {
+  const raw = issue.metadata?.[key];
+  if (typeof raw !== "string") return [];
+  const gates: GuardGate[] = [];
+  for (const part of raw.split(",")) {
+    const gate = GUARD_GATES.find((candidate) => candidate === part.trim());
+    if (gate !== undefined && !gates.includes(gate)) gates.push(gate);
+  }
+  return gates;
+}
+
+/** The guards whose one revision round this issue has already spent. */
+export function guardRoundsOf(issue: WorkIssue): GuardGate[] {
+  return guardList(issue, WORKGRAPH_GUARD_ROUNDS_KEY);
+}
+
+/** The guards a human allowed for this issue. */
+export function guardAllowedOf(issue: WorkIssue): GuardGate[] {
+  return guardList(issue, WORKGRAPH_GUARD_ALLOWED_KEY);
+}
+
+/** Who gave the latest guard allowance, if recorded. */
+export function guardAllowedByOf(issue: WorkIssue): string | undefined {
+  return bindingValue(issue, WORKGRAPH_GUARD_ALLOWED_BY_KEY);
+}
+
+/** The guards the pending decision is about; empty for an executor's own question. */
+export function decisionGatesOf(issue: WorkIssue): GuardGate[] {
+  return guardList(issue, WORKGRAPH_DECISION_GATE_KEY);
+}
+
+/** The latest recorded outcome in its compact form (`needed_fixes:2`), if any. */
+export function outcomeOf(issue: WorkIssue): string | undefined {
+  return bindingValue(issue, WORKGRAPH_OUTCOME_KEY);
+}
+
+/** Where the issue's outcome stands: an outcome step is expected to report, or an outcome exists. */
+export function outcomeStatusOf(
+  issue: WorkIssue,
+): "pending" | "recorded" | undefined {
+  const raw = bindingValue(issue, WORKGRAPH_OUTCOME_STATUS_KEY);
+  return raw === "pending" || raw === "recorded" ? raw : undefined;
+}
+
+/** The execution of the outcome step launched for the latest close, if recorded. */
+export function outcomeExecutionIdOf(issue: WorkIssue): string | undefined {
+  return bindingValue(issue, WORKGRAPH_OUTCOME_EXECUTION_ID_KEY);
+}
+
+/** The ISO time a pending outcome stops being waited for, if recorded. */
+export function outcomeDeadlineOf(issue: WorkIssue): string | undefined {
+  return bindingValue(issue, WORKGRAPH_OUTCOME_DEADLINE_KEY);
 }
 
 // ---------------------------------------------------------------------------

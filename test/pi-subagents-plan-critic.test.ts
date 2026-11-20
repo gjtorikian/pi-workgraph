@@ -37,6 +37,7 @@ import {
   type PlanCritiqueT,
   type PlanT,
 } from "../src/types.ts";
+import { preProofConfig } from "./helpers/config.ts";
 import { installFakeSubagents } from "./helpers/fake-subagents.ts";
 import {
   asExtensionAPI,
@@ -49,16 +50,7 @@ import { makeScratchGraph, type ScratchGraph } from "./helpers/scratch.ts";
 
 const WORKER = "bridge-critic-worker";
 
-const CONFIG: WorkgraphConfig = {
-  leaseTtlMs: 300_000,
-  heartbeatMs: 600_000,
-  pollMs: 600_000,
-  sweepIntervalMs: 600_000,
-  discoveryTimeoutMs: 40,
-  acceptTimeoutMs: 150,
-  compatInSessionExecutor: false,
-  subagentsExecutor: { enabled: true },
-};
+const CONFIG = preProofConfig({ subagentsExecutor: { enabled: true } });
 
 const PLAN: PlanT = {
   summary: "add retry backoff to the client",
@@ -90,7 +82,7 @@ function makeBridgeHarness(
   overrides: Partial<WorkgraphConfig> = {},
 ): BridgeHarness {
   const mock = makeMockPi();
-  const config: WorkgraphConfig = { ...CONFIG, ...overrides };
+  const config = preProofConfig({ ...CONFIG, ...overrides });
   const bridge = registerPiSubagentsExecutor(asExtensionAPI(mock), {
     getConfig: () => config,
     probeVersion: () => "0.34.8",
@@ -420,8 +412,12 @@ describe("buildSubagentTask for a plan critic", () => {
   // these byte-identical. Update a literal here only when that role's prompt
   // is changed on purpose.
   const ROLE_SENTENCE: Record<string, string> = {
-    planner:
+    // Two lines: the second asks for the file paths the `scope` guard holds
+    // an approved plan to.
+    planner: [
       "Produce a concrete implementation plan as structured output matching the provided schema. Do not modify product code.",
+      "In each step's targets, list the repository-relative file paths the step expects to change (a directory covers everything under it). Once the plan is approved, a change to a file outside those paths is flagged as out of scope; test files, and a lockfile beside a changed manifest, are exempt.",
+    ].join("\n"),
     implementer:
       "Implement and validate the changes. Leave the result in this workspace for independent review and subsequent workflow stages.",
     reviewer:
@@ -686,11 +682,11 @@ describe("plan critique through the bridge, under the coordinator", () => {
     const id = graph.seededIds[0]!;
     approvePlanned(graph, id);
     const mock = makeMockPi();
-    const config: WorkgraphConfig = {
+    const config = preProofConfig({
       ...CONFIG,
       workerIdOverride: WORKER,
       planCritique: "high-risk",
-    };
+    });
     setWorkerIdOverride(WORKER);
     registerWorkgraphTools(asExtensionAPI(mock));
     const coordinator = registerCoordinator(asExtensionAPI(mock), {

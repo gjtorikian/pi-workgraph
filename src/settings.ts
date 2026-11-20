@@ -14,7 +14,9 @@
  *       "subagentsExecutor": true,                   // or the bridge's JSON block
  *       "store": "central",                          // keep databases out of checkouts
  *       "planApproval": "required",                // or "auto"
- *       "planCritique": "off"                      // or "high-risk"
+ *       "planCritique": "off",                     // or "high-risk"
+ *       "policy": { "low": { "gates": { "scope": "off" } } }, // gate modes per risk tier
+ *       "check": { "command": "npm test", "setup": "npm ci" } // default check, and how to prepare a fresh worktree for it
  *     }
  *   }
  *
@@ -26,6 +28,14 @@
  * next session without a flag dance. Malformed JSON is reported once per
  * path and treated as absent — a typo in settings must never take the
  * extension down.
+ *
+ * TWO EXCEPTIONS: `policy` and `check`. This module carries both through
+ * unvalidated, and config.ts rejects an invalid one instead of dropping it.
+ * A dropped policy would fall back to the default gate modes without a
+ * word, so work would close, or be blocked, under modes nobody chose; a
+ * dropped `check` would leave every issue that relies on the repository
+ * default unchecked. The reader stays non-throwing; the rejection stops
+ * dispatch and names the bad key.
  */
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -46,6 +56,10 @@ export interface WorkgraphSettings {
   subagentsExecutor?: string;
   /** Where databases live: "repo" (default), "central" (~/.pi/agent/workgraph), or an absolute directory. */
   store?: string;
+  /** The gate policy as raw JSON, for config.ts to validate: the object `--workgraph-policy` takes. */
+  policy?: string;
+  /** The `check` block as raw JSON, for config.ts to validate: `{ command?, timeoutMs?, setup?, testGlobs? }`. */
+  check?: string;
 }
 
 export interface SettingsSources {
@@ -119,6 +133,18 @@ export function parseWorkgraphSettings(raw: unknown): WorkgraphSettings | undefi
         : JSON.stringify(record.subagentsExecutor);
   }
   if (typeof record.store === "string" && record.store.trim()) out.store = record.store.trim();
+  // Carried through as written, valid or not: config.ts validates it and
+  // rejects a bad one (see the module comment). An empty string is unset,
+  // as it is for the flag.
+  if (typeof record.policy === "string") {
+    if (record.policy.trim()) out.policy = record.policy.trim();
+  } else if (record.policy !== undefined && record.policy !== null) {
+    out.policy = JSON.stringify(record.policy);
+  }
+  // Carried through as written, like the policy: config.ts validates it.
+  if (record.check !== undefined && record.check !== null) {
+    out.check = JSON.stringify(record.check);
+  }
   if (record.planApproval === "required" || record.planApproval === "auto") {
     out.planApproval = record.planApproval;
   } else if (record.planApproval !== undefined) {
@@ -228,6 +254,26 @@ export function settingsExecutors(location: SettingsLocation = {}): Record<strin
 export function settingsSubagentsExecutor(location: SettingsLocation = {}): string | undefined {
   const sources = workgraphSettings(location);
   return sources.project?.subagentsExecutor ?? sources.global?.subagentsExecutor;
+}
+
+/**
+ * The raw gate policy from settings (project over global), for config.ts's
+ * validator. The project value replaces the global one whole: two files
+ * merged tier by tier would hide which file set a gate's mode.
+ */
+export function settingsPolicy(location: SettingsLocation = {}): string | undefined {
+  const sources = workgraphSettings(location);
+  return sources.project?.policy ?? sources.global?.policy;
+}
+
+/**
+ * The raw `check` block from settings (project over global), for config.ts's
+ * validator. The project block replaces the global one whole, as the policy
+ * does.
+ */
+export function settingsCheck(location: SettingsLocation = {}): string | undefined {
+  const sources = workgraphSettings(location);
+  return sources.project?.check ?? sources.global?.check;
 }
 
 /** The store policy from settings (project over global), if either sets it. */

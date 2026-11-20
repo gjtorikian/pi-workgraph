@@ -33,6 +33,7 @@ import {
   type MockEventContext,
   type MockPi,
 } from "../test/helpers/mock-pi.ts";
+import { preProofConfig } from "../test/helpers/config.ts";
 import {
   makeScratchGraph,
   type ScratchGraph,
@@ -43,18 +44,11 @@ const WORKER = "dispatch-test-worker";
 /**
  * Timers are injected config — production floors live in index.ts only.
  * Ticks and beats are driven explicitly through the controller, so the
- * default intervals are long enough to never fire mid-test.
+ * shared intervals are long enough that neither they nor the sweep fire
+ * mid-test. The protocol timeouts are unused by deprecated dispatch —
+ * config shape only.
  */
-const TEST_CONFIG: WorkgraphConfig = {
-  leaseTtlMs: 300_000,
-  heartbeatMs: 600_000,
-  pollMs: 600_000,
-  sweepIntervalMs: 600_000, // the sweep never fires mid-test either
-  discoveryTimeoutMs: 40, // unused by deprecated dispatch — config-shape only
-  acceptTimeoutMs: 150,
-  compatInSessionExecutor: false,
-  workerIdOverride: undefined,
-};
+const TEST_CONFIG = preProofConfig({ workerIdOverride: undefined });
 
 let nowMs = Date.now();
 const graphs: ScratchGraph[] = [];
@@ -78,7 +72,7 @@ function makeHarness(
 ): Harness {
   const mock = makeMockPi();
   const controller = registerDispatch(asExtensionAPI(mock), {
-    getConfig: () => ({ ...TEST_CONFIG, ...config }),
+    getConfig: () => preProofConfig({ ...TEST_CONFIG, ...config }),
     now: () => nowMs,
   });
   controllers.push(controller);

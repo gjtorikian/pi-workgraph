@@ -19,17 +19,37 @@
  *
  * This module owns the pure/protocol pieces — enumeration, partition, the
  * correlated status exchange, and audit-trail reconstruction of a judging
- * run's author completion. The ADOPTION itself (coordinator state, inboxes,
+ * run's author completion, of its tree binding (workspace path, base
+ * and result tree) and of the bar it was claimed under. The ADOPTION itself (coordinator state, inboxes,
  * heartbeats, the judgment loop) lives in coordinator.ts's `reconcile()`,
  * which composes these. Everything here is fenced + idempotent: a
  * reconciliation that crashes midway is safe to re-run — unprocessed issues
  * simply wait for the next start or the sweep.
+ *
+ * OUTCOME STEPS are the one thing recovered here that holds no lease. A step
+ * launched after a close (`src/outcome.ts`) is recorded on the CLOSED issue
+ * as `workgraph_outcome_status: "pending"` with its execution id and a
+ * deadline. {@link pendingOutcomes} reads those back and splits them on the
+ * deadline: one still inside it is re-tracked and left alone, since its
+ * child may be running and can still report through the outcome tool; one
+ * past it is the coordinator's to record as `unknown`.
  */
 import type { EventBus } from "@earendil-works/pi-coding-agent";
 import { AUDIT_PREFIX } from "./audit.ts";
+import { parseBar, type Bar } from "./check.ts";
 import { listComments, listInProgressUpdatedBefore } from "./store.ts";
+import { listPendingOutcomes, outcomeDeadlinePassed } from "./outcome.ts";
 import { leaseExpiresAtOf, leaseHolderOf, rfc3339 } from "./lease.ts";
-import { workflowRunIdOf } from "./lifecycle.ts";
+import {
+  baseCommitOf,
+  baseTreeOf,
+  outcomeDeadlineOf,
+  outcomeExecutionIdOf,
+  resultCommitOf,
+  resultTreeOf,
+  workflowRunIdOf,
+  workspacePathOf,
+} from "./lifecycle.ts";
 import {
   CH,
   newEnvelope,
@@ -84,6 +104,42 @@ export function isRunHeld(issue: WorkIssue): boolean {
     holder.startsWith(WORKFLOW_RUN_PREFIX) &&
     workflowRunIdOf(issue) !== undefined
   );
+}
+
+/** An outcome step a closed issue is still waiting on, as its metadata recorded it. */
+export interface PendingOutcome {
+  issueId: string;
+  /** The closed run the step follows (absent only on hand-written metadata). */
+  workflowRunId?: string;
+  executionId?: string;
+  deadline?: string;
+}
+
+/**
+ * Every closed issue whose outcome is still `pending`, split on its
+ * deadline against `nowMs`: `due` (the deadline passed, or cannot be read)
+ * and `waiting`. Reads metadata only; what to do with either list is the
+ * coordinator's.
+ */
+export async function pendingOutcomes(
+  cwd: string,
+  nowMs: number,
+): Promise<{ due: PendingOutcome[]; waiting: PendingOutcome[] }> {
+  const due: PendingOutcome[] = [];
+  const waiting: PendingOutcome[] = [];
+  for (const issue of await listPendingOutcomes(cwd)) {
+    const workflowRunId = workflowRunIdOf(issue);
+    const executionId = outcomeExecutionIdOf(issue);
+    const deadline = outcomeDeadlineOf(issue);
+    const pending: PendingOutcome = {
+      issueId: issue.id,
+      ...(workflowRunId !== undefined ? { workflowRunId } : {}),
+      ...(executionId !== undefined ? { executionId } : {}),
+      ...(deadline !== undefined ? { deadline } : {}),
+    };
+    (outcomeDeadlinePassed(issue, nowMs) ? due : waiting).push(pending);
+  }
+  return { due, waiting };
 }
 
 /**
@@ -287,6 +343,152 @@ export async function reconstructAuthorCompletion(
         : {}),
       provenance,
     };
+  }
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Tree-binding reconstruction for judging/revising/verifying re-adoption
+// ---------------------------------------------------------------------------
+
+const WORKSPACE_CHANGED_PREFIX = `${AUDIT_PREFIX} workspace-changed `;
+
+/** What a restarted coordinator can recover about a run's workspace and trees. */
+export interface RecoveredBinding {
+  /** Where the work lives. */
+  workspacePath?: string;
+  /** The result tree recorded for THIS run, if any. */
+  resultTree?: string;
+  /** The anchored snapshot commit holding `resultTree`, when still on record. */
+  resultCommit?: string;
+  baseCommit?: string;
+  baseTree?: string;
+}
+
+/**
+ * Rebuild a run's workspace path, base and result tree after a restart.
+ *
+ * The RESULT TREE comes from the audit trail, not from
+ * `workgraph_result_tree`: metadata survives a re-claim, so after a crash
+ * that key can still hold the previous run's tree. The newest
+ * `run-completed` (implementer or revision) or `workspace-changed` event
+ * carrying THIS run's id is the tree currently under judgment. An event
+ * with no tree — a run from before tree binding, or one whose snapshot
+ * failed — yields none, and the caller snapshots at re-adoption.
+ *
+ * The BASE comes from metadata, and only when it belongs to the same
+ * workspace: the base is keyed by workspace path.
+ */
+export async function reconstructBinding(
+  cwd: string,
+  issue: WorkIssue,
+): Promise<RecoveredBinding> {
+  const workflowRunId = workflowRunIdOf(issue);
+  let eventPath: string | undefined;
+  let eventTree: string | undefined;
+  if (workflowRunId !== undefined) {
+    let comments: Awaited<ReturnType<typeof listComments>> = [];
+    try {
+      comments = await listComments(cwd, issue.id);
+    } catch {
+      comments = []; // no trail readable — fall back to metadata for the path
+    }
+    for (let i = comments.length - 1; i >= 0; i--) {
+      const text = comments[i]!.text;
+      const prefix = text.startsWith(RUN_COMPLETED_PREFIX)
+        ? RUN_COMPLETED_PREFIX
+        : text.startsWith(WORKSPACE_CHANGED_PREFIX)
+          ? WORKSPACE_CHANGED_PREFIX
+          : undefined;
+      if (prefix === undefined) continue;
+      let details: Record<string, unknown>;
+      try {
+        const parsed: unknown = JSON.parse(text.slice(prefix.length));
+        if (
+          parsed === null ||
+          typeof parsed !== "object" ||
+          Array.isArray(parsed)
+        ) {
+          continue;
+        }
+        details = parsed as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      if (details.workflowRunId !== workflowRunId) continue;
+      if (details.role === "planner") continue; // a plan has no result tree
+      if (typeof details.workspacePath === "string" && details.workspacePath) {
+        eventPath = details.workspacePath;
+      }
+      if (typeof details.tree === "string" && details.tree) {
+        eventTree = details.tree;
+      }
+      break; // the newest matching event decides, tree or no tree
+    }
+  }
+  const workspacePath = eventPath ?? workspacePathOf(issue);
+  const sameWorkspace =
+    workspacePath !== undefined && workspacePathOf(issue) === workspacePath;
+  const baseCommit = sameWorkspace ? baseCommitOf(issue) : undefined;
+  const baseTree = sameWorkspace ? baseTreeOf(issue) : undefined;
+  const resultCommit =
+    eventTree !== undefined && resultTreeOf(issue) === eventTree
+      ? resultCommitOf(issue)
+      : undefined;
+  return {
+    ...(workspacePath !== undefined ? { workspacePath } : {}),
+    ...(eventTree !== undefined ? { resultTree: eventTree } : {}),
+    ...(resultCommit !== undefined ? { resultCommit } : {}),
+    ...(baseCommit !== undefined ? { baseCommit } : {}),
+    ...(baseTree !== undefined ? { baseTree } : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// The frozen bar
+// ---------------------------------------------------------------------------
+
+const BAR_FROZEN_PREFIX = `${AUDIT_PREFIX} bar-frozen `;
+
+/**
+ * The bar a run was claimed under, from the newest `bar-frozen` event that
+ * carries THIS run's id. Undefined when there is none: a run claimed before
+ * the bar existed, or one whose event write was lost. The caller then
+ * freezes a bar at re-adoption and says so on the trail.
+ *
+ * Read from the event and never rebuilt from the issue and the settings:
+ * both may have been edited since the claim, which is exactly what a frozen
+ * bar is there to ignore.
+ */
+export async function reconstructBar(
+  cwd: string,
+  issue: WorkIssue,
+): Promise<Bar | undefined> {
+  const workflowRunId = workflowRunIdOf(issue);
+  if (workflowRunId === undefined) return undefined;
+  let comments: Awaited<ReturnType<typeof listComments>>;
+  try {
+    comments = await listComments(cwd, issue.id);
+  } catch {
+    return undefined;
+  }
+  for (let i = comments.length - 1; i >= 0; i--) {
+    const text = comments[i]!.text;
+    if (!text.startsWith(BAR_FROZEN_PREFIX)) continue;
+    let details: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(text.slice(BAR_FROZEN_PREFIX.length));
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        continue;
+      }
+      details = parsed as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (details.workflowRunId !== workflowRunId) continue;
+    // The newest event for this run decides, readable or not: falling
+    // through to an older one could resurrect a bar that was replaced.
+    return parseBar(details.bar);
   }
   return undefined;
 }

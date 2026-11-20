@@ -138,6 +138,15 @@ export const ExecutorOffer = Type.Object({
   maxConcurrency: Type.Optional(Type.Number()),
   available: Type.Optional(Type.Boolean()),
   priority: Type.Optional(Type.Number()),
+  /**
+   * True when the executor can launch a run in the BACKGROUND: the run is
+   * accepted on a launch receipt, takes none of the executor's foreground
+   * capacity, and its end is still reported as `run:completed`. Absent or
+   * false means every run is a foreground run. Only the outcome step
+   * (`src/outcome.ts`) asks for one, and it asks only an executor that
+   * offers this.
+   */
+  supportsBackground: Type.Optional(Type.Boolean()),
 });
 export type ExecutorOfferT = Static<typeof ExecutorOffer>;
 
@@ -173,12 +182,24 @@ export const RunRequest = Type.Object({
   /** Caller-supplied instructions for this role, separate from issue content. */
   instructions: Type.Optional(Type.String()),
   workspace: Type.Object({
+    /** The commit the work started from; "" when the core recorded none. */
     baseRevision: Type.String(),
     requiresIsolation: Type.Boolean(),
     /** Source checkout; an adapter can retain one worktree for this workflow. */
     repoPath: Type.Optional(Type.String()),
     /** Retained workspace from a previous run of this issue (human follow-up). */
     sourceWorkflowRunId: Type.Optional(Type.String({ minLength: 1 })),
+    /**
+     * Where the implementer's work lives, as its completion reported it.
+     * Set on every request AFTER the implementation (reviewer, revision,
+     * finalizer): the role runs in this directory. Absent on planning-time
+     * and implementer requests.
+     */
+    path: Type.Optional(Type.String({ minLength: 1 })),
+    /** Tree the work started from; with `tree`, the change is `git diff <baseTree> <tree>`. */
+    baseTree: Type.Optional(Type.String({ minLength: 1 })),
+    /** Tree of the result under judgment. */
+    tree: Type.Optional(Type.String({ minLength: 1 })),
   }),
   outputSchema: Type.Optional(Type.Unknown()),
   /** Prior judgment findings — used from phase 3. */
@@ -193,8 +214,10 @@ export const RunRequest = Type.Object({
    */
   plan: Type.Optional(Type.String()),
   /**
-   * Human feedback from a rejected plan, attached to the NEXT planner run of
-   * the same issue (planner role only). Optional and v1-safe.
+   * What the previous run of this role left undone, for the NEXT run to
+   * address. Planner: the human's feedback on a rejected plan. Reviewer:
+   * the acceptance criteria its last verdict left unanswered. Optional and
+   * v1-safe.
    */
   feedback: Type.Optional(Type.String()),
   /**
@@ -205,6 +228,17 @@ export const RunRequest = Type.Object({
   decision: Type.Optional(
     Type.Object({ question: Type.String(), answer: Type.String() }),
   ),
+  /**
+   * Launch the run in the executor's background mode (see
+   * `ExecutorOffer.supportsBackground`). Sent only with role `finalizer`,
+   * for the outcome step that follows a close: the issue is closed and no
+   * lease is held, so `leaseEpoch` is the closed run's last epoch and
+   * serves correlation only. `instructions` are the caller's own and must
+   * reach the run unchanged; what the core adds travels in a tolerated
+   * extra field, `outcomeReport`. Optional and v1-safe, but validated once
+   * present: a value that is not a boolean fails the whole request.
+   */
+  background: Type.Optional(Type.Boolean()),
 });
 export type RunRequestT = Static<typeof RunRequest>;
 
@@ -289,7 +323,28 @@ export const RunCompleted = Type.Object({
     profile: Type.Optional(Type.String()),
     model: Type.Optional(Type.String()),
     provider: Type.Optional(Type.String()),
+    /**
+     * The context the run was launched in, as the adapter knows it: `fresh`
+     * for a run that started with no memory of earlier runs of the issue.
+     * Recorded on a review's verdict record; no policy reads it. Optional
+     * and v1-safe, but VALIDATED when present: a `context` that is not a
+     * string fails the whole message.
+     */
+    context: Type.Optional(Type.String()),
   }),
+  /**
+   * Where the work is. An implementer reports the directory it wrote in, so
+   * the core can snapshot it and send every later role there; an isolated
+   * executor adds the revision its workspace was cut from. Optional and
+   * v1-safe, but VALIDATED when present: a `workspace` without a non-empty
+   * string `path` fails the whole message.
+   */
+  workspace: Type.Optional(
+    Type.Object({
+      path: Type.String({ minLength: 1 }),
+      baseRevision: Type.Optional(Type.String()),
+    }),
+  ),
 });
 export type RunCompletedT = Static<typeof RunCompleted>;
 
@@ -406,6 +461,29 @@ export type ActivityT = Static<typeof Activity>;
  */
 export const SUBAGENTS_PACKAGE_NAME = "pi-subagents";
 export const SUBAGENTS_SUPPORTED_VERSION_RANGE = "0.34";
+
+/**
+ * The upstream `major.minor` lines whose BACKGROUND launch the bridge has
+ * verified by reading the published source (never by running it): an async
+ * request answers with a launch receipt carrying the run's id, the end of
+ * that run is announced as `subagent:async-complete` with the same id, and
+ * an async launch does not take the foreground lock. The bridge offers
+ * `supportsBackground` only on one of these lines. 0.34 is absent on
+ * purpose: there an async launch goes through the same single-dispatch
+ * guard as a foreground call, so one sent while a foreground run is in
+ * flight is refused as a duplicate.
+ */
+export const SUBAGENTS_BACKGROUND_VERSION_LINES: readonly string[] = [
+  "0.41",
+  "0.89",
+];
+
+/** True when `version` is on a line whose background launch was verified. */
+export function subagentsSupportsBackground(version: string): boolean {
+  return SUBAGENTS_BACKGROUND_VERSION_LINES.some((line) =>
+    subagentsVersionInRange(version, line),
+  );
+}
 
 /** True when `version` (e.g. "0.34.8") falls inside a `major.minor` prefix range. */
 export function subagentsVersionInRange(

@@ -116,6 +116,103 @@ export const WORKGRAPH_DECISION_QUESTION_KEY = "workgraph_decision_question";
 export const WORKGRAPH_DECISION_ANSWER_KEY = "workgraph_decision_answer";
 
 /**
+ * Tree-binding keys (`src/snapshot.ts`): where an issue's work lives and the
+ * git trees its proof records name. All scalar strings; a cleared key holds
+ * "". Not to be confused with `workgraph_workspace_run_id`, which names the
+ * RUN whose retained worktree a human follow-up reuses.
+ */
+/** The directory the implementer's work was reported in. The base below belongs to it. */
+export const WORKGRAPH_WORKSPACE_PATH_KEY = "workgraph_workspace_path";
+/** The commit (an anchored snapshot, or the reported base revision) the work started from. */
+export const WORKGRAPH_BASE_COMMIT_KEY = "workgraph_base_commit";
+/** The tree of {@link WORKGRAPH_BASE_COMMIT_KEY}. */
+export const WORKGRAPH_BASE_TREE_KEY = "workgraph_base_tree";
+/** The anchored snapshot of the latest implementation or revision result. */
+export const WORKGRAPH_RESULT_COMMIT_KEY = "workgraph_result_commit";
+/** The tree of {@link WORKGRAPH_RESULT_COMMIT_KEY}: what the verdict judges. */
+export const WORKGRAPH_RESULT_TREE_KEY = "workgraph_result_tree";
+/** The tree the close stamp accepted. */
+export const WORKGRAPH_ACCEPTED_TREE_KEY = "workgraph_accepted_tree";
+/** The tree after finalization, written only when finalization changed it. */
+export const WORKGRAPH_FINALIZED_TREE_KEY = "workgraph_finalized_tree";
+
+/** Every tree-binding key, for the one writer that clears them all (override release). */
+export const WORKGRAPH_TREE_BINDING_KEYS: readonly string[] = [
+  WORKGRAPH_WORKSPACE_PATH_KEY,
+  WORKGRAPH_BASE_COMMIT_KEY,
+  WORKGRAPH_BASE_TREE_KEY,
+  WORKGRAPH_RESULT_COMMIT_KEY,
+  WORKGRAPH_RESULT_TREE_KEY,
+  WORKGRAPH_ACCEPTED_TREE_KEY,
+  WORKGRAPH_FINALIZED_TREE_KEY,
+];
+
+/**
+ * Check keys (`src/check.ts`). The check command and the waiver are set by a
+ * human through create, approve or split and are mutually exclusive; a
+ * cleared key holds "". The command is always stored as a string, so `true`
+ * (the shell builtin) stays a command and never becomes a boolean.
+ */
+/** The shell command the core runs against the result tree. */
+export const WORKGRAPH_CHECK_KEY = "workgraph_check";
+/** Why no check applies to this issue, in the approver's words. */
+export const WORKGRAPH_CHECK_WAIVER_KEY = "workgraph_check_waiver";
+/** Digest of the bar frozen at the latest claim (the bar itself is in the `bar-frozen` event). */
+export const WORKGRAPH_BAR_DIGEST_KEY = "workgraph_bar_digest";
+
+/**
+ * Diff-guard keys (`src/guards.ts`). The first two hold a comma-joined list
+ * of guard gate names; a cleared key holds "". They outlive a claim on
+ * purpose: a guard gets one revision round per issue, and a human's
+ * allowance covers the gate for the rest of the issue. Only an override
+ * release clears them.
+ */
+/** The guards whose one revision round was already spent on this issue. */
+export const WORKGRAPH_GUARD_ROUNDS_KEY = "workgraph_guard_rounds";
+/** The guards a human allowed for this issue (the answer `allow` to a guard question). */
+export const WORKGRAPH_GUARD_ALLOWED_KEY = "workgraph_guard_allowed";
+/** Who gave the latest allowance: the actor of that `workgraph_answer_decision` call. */
+export const WORKGRAPH_GUARD_ALLOWED_BY_KEY = "workgraph_guard_allowed_by";
+/**
+ * The guards a pending decision is about, written by the core with the
+ * question. It is what makes a question a guard question: an executor's own
+ * question clears it, so text that merely reads like a guard question can
+ * never turn the answer `allow` into an allowance.
+ */
+export const WORKGRAPH_DECISION_GATE_KEY = "workgraph_decision_gate";
+
+/** Every diff-guard key, for the one writer that clears them all (override release). */
+export const WORKGRAPH_GUARD_KEYS: readonly string[] = [
+  WORKGRAPH_GUARD_ROUNDS_KEY,
+  WORKGRAPH_GUARD_ALLOWED_KEY,
+  WORKGRAPH_GUARD_ALLOWED_BY_KEY,
+  WORKGRAPH_DECISION_GATE_KEY,
+];
+
+/**
+ * Outcome keys (`src/outcome.ts`): what happened to accepted work after it
+ * closed. All scalar strings; a cleared key holds "". They describe ONE
+ * close, so an override release clears them with the keys above: an issue
+ * that is closed again starts with no outcome.
+ */
+/** The latest recorded outcome, compact: `clean`, `needed_fixes:2`, `abandoned`, `unknown`. */
+export const WORKGRAPH_OUTCOME_KEY = "workgraph_outcome";
+/** `pending` while an outcome step is expected to report, `recorded` once an outcome exists. */
+export const WORKGRAPH_OUTCOME_STATUS_KEY = "workgraph_outcome_status";
+/** The execution of the outcome step launched for the latest close. */
+export const WORKGRAPH_OUTCOME_EXECUTION_ID_KEY = "workgraph_outcome_execution_id";
+/** ISO time after which a pending outcome is recorded as `unknown`. */
+export const WORKGRAPH_OUTCOME_DEADLINE_KEY = "workgraph_outcome_deadline";
+
+/** Every outcome key, for the one writer that clears them all (override release). */
+export const WORKGRAPH_OUTCOME_KEYS: readonly string[] = [
+  WORKGRAPH_OUTCOME_KEY,
+  WORKGRAPH_OUTCOME_STATUS_KEY,
+  WORKGRAPH_OUTCOME_EXECUTION_ID_KEY,
+  WORKGRAPH_OUTCOME_DEADLINE_KEY,
+];
+
+/**
  * The lifecycle phase union (README "Durable lifecycle metadata"). the store'
  * four native statuses stay untouched; this is workgraph semantics stored in
  * `workgraph_phase`. Legal edges live in `src/lifecycle.ts`'s LEGAL table.
@@ -196,8 +293,13 @@ export type LeaseEvent =
   | "executor-rejected"
   /** Coordinator (phase 2): no accept/reject inside the deadline — released. */
   | "accept-timeout"
-  /** Coordinator (phase 2): a fenced run:completed landed; issue → judging. */
+  /** Coordinator (phase 2): a fenced run:completed landed; issue → judging.
+   *  An implementer or revision completion also carries `workspacePath` and,
+   *  when a result snapshot was taken, its `tree`. */
   | "run-completed"
+  /** Tree binding: the workspace no longer matched the recorded result tree
+   *  and was snapshotted again; the new tree goes back through review. */
+  | "workspace-changed"
   /** Coordinator (phase 2): a run:completed failed the fencing triple — ignored. */
   | "stale-result-rejected"
   /** workgraph_approve: draft/legacy issue approved into the ready phase. */
@@ -243,47 +345,129 @@ export type LeaseEvent =
    *  lease left INTACT for TTL reclaim (never released under a live mutator). */
   | "abandoned-unacked-cancel"
   /** Phase 4: best-effort run:cancel published for a recorded execution. */
-  | "cancel-published";
+  | "cancel-published"
+  /** The bar a run is judged against (risk tier, gate policy, criteria, check
+   *  or waiver) was captured at claim. Carries the bar and its digest; a
+   *  restart rebuilds the run's bar from it. */
+  | "bar-frozen"
+  /** The issue or the configuration no longer matches the frozen bar. Names
+   *  the fields that differ. The run keeps the frozen bar; the change
+   *  applies to the next claim. */
+  | "bar-changed"
+  /** Judgment: the second look at a reviewer's blocking findings could not
+   *  be obtained (rejected, not accepted or not finished in time, a failed
+   *  or non-independent completion, an invalid answer). The blockers stand. */
+  | "recheck-failed"
+  /** The caller-defined outcome step was accepted by an executor for a
+   *  closed issue. Carries its execution id and the deadline after which a
+   *  silent step is recorded as `unknown`. No lease is held for it. */
+  | "outcome-launched"
+  /** An outcome record was written for a closed issue: by the outcome tool,
+   *  or by the core as `unknown` when the step could not run or never
+   *  reported. Carries the outcome and who recorded it. */
+  | "outcome-recorded";
 
 // ---------------------------------------------------------------------------
-// Verdict shapes (phase 3). A reviewer completion carries a `verdict` field
+// Verdict shapes. A reviewer completion carries a `verdict` field
 // (protocol-v1 schemas are non-strict, so the extra field rides RunCompleted
 // untouched); `src/verdict.ts` validates it against these schemas before the
-// judgment gate acts on it.
+// judgment gate acts on it. A verdict is two lists: `findings`, what the
+// reviewer objects to, and `criteria`, one answer per numbered acceptance
+// criterion (`src/criteria.ts`). An empty `findings` list is not a pass by
+// itself: the `criteria-evidence` gate reads the answers.
 // ---------------------------------------------------------------------------
 
 export const Finding = Type.Object({
   /** The acceptance criterion (or invariant) this finding is about. */
   criterion: Type.String(),
-  /** `blocking` findings gate continuation under a blocking policy;
-   *  `advisory` findings are persisted but never block. */
+  /** `blocking` findings gate continuation when the `review` gate
+   *  enforces; `advisory` findings are persisted but never block. */
   severity: StringEnum(["blocking", "advisory"]),
   note: Type.Optional(Type.String()),
   evidence: Type.Optional(Type.String()),
+  /**
+   * The file and 1-based line the finding points at. A reviewer's blocking
+   * finding needs one that exists in the reviewed tree (here, or as the
+   * first `path:line` in `evidence`); without it the core downgrades the
+   * finding to advisory (`checkCitations` in `src/verdict.ts`).
+   */
+  citation: Type.Optional(
+    Type.Object({ path: Type.String(), line: Type.Integer({ minimum: 1 }) }),
+  ),
+  /**
+   * Who wrote the finding. `code` marks a finding the core produced itself
+   * (a failed check). Never taken from a reviewer: `parseVerdict` removes
+   * the field from every reported finding, so a reviewer cannot claim it.
+   * `reviewer` is set by the core too, on a finding it builds from a
+   * reviewer's `unmet` criterion answer.
+   */
+  author: Type.Optional(StringEnum(["reviewer", "code"])),
 });
 export type FindingT = Static<typeof Finding>;
 
+/** A reviewer's answer to one numbered acceptance criterion. */
+export const CriterionAnswer = Type.Object({
+  /** The criterion's id: `C1`, `C2`, ... */
+  id: Type.String(),
+  /** `met` counts only with non-empty `evidence`. */
+  status: StringEnum(["met", "unmet", "unanswered"]),
+  /** `met`: what proves it. `unmet`: what is missing. */
+  evidence: Type.Optional(Type.String()),
+});
+export type CriterionAnswerT = Static<typeof CriterionAnswer>;
+
 export const Verdict = Type.Object({
   findings: Type.Array(Finding),
+  /** Optional in the schema so a verdict without it still parses; a
+   *  criterion with no answer is `unanswered`, never a pass. */
+  criteria: Type.Optional(Type.Array(CriterionAnswer)),
   summary: Type.Optional(Type.String()),
 });
 export type VerdictT = Static<typeof Verdict>;
+
+/**
+ * The answer to a blocker recheck: the reviewer executor's second look at
+ * the blocking findings of its own verdict, numbered as the request listed
+ * them. Rides a reviewer completion as an extra `recheck` field, the way
+ * the verdict rides as `verdict`.
+ */
+export const BlockerRecheck = Type.Object({
+  answers: Type.Array(
+    Type.Object({
+      /** The blocker's number in the request. */
+      n: Type.Integer({ minimum: 1 }),
+      /** `keep`: it stands. `downgrade`: it becomes advisory. */
+      decision: StringEnum(["keep", "downgrade"]),
+      reason: Type.String(),
+    }),
+  ),
+});
+export type BlockerRecheckT = Static<typeof BlockerRecheck>;
 
 // ---------------------------------------------------------------------------
 // Plan shapes (planner role). Same TRANSPORT trick as the verdict: a planner
 // completion carries a `plan` field on the non-strict RunCompleted schema, and
 // `src/plan.ts` validates it before the plan is persisted or handed to the
 // implementer. Deliberately thin — the plan is EVIDENCE the implementer reads,
-// never something the core interprets. The core's only structural interest is
-// the acceptance criteria the planner refined, because the judgment gate
-// reviews against them.
+// and the core does not interpret its steps. The core reads two things: the
+// acceptance criteria the planner refined, because the judgment gate reviews
+// against them, and the file paths among a step's `targets`, which the
+// `scope` guard compares the change with once a human approved the plan
+// (`src/guards.ts`).
 // ---------------------------------------------------------------------------
 
 export const PlanStep = Type.Object({
   /** One bounded unit of implementation work, in order. */
   description: Type.String(),
-  /** Files/symbols the step is expected to touch (advisory, never enforced). */
-  targets: Type.Optional(Type.Array(Type.String())),
+  /** What the step is expected to change. Entries that read as file paths
+   *  are what the `scope` guard holds an approved plan to; symbol names are
+   *  ignored. */
+  targets: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Repository-relative file paths this step expects to change (a directory covers everything under it).",
+    }),
+  ),
   /** Why this step exists — the rationale the implementer would otherwise
    *  have to re-derive. */
   rationale: Type.Optional(Type.String()),
@@ -387,7 +571,10 @@ export const SplitParams = Type.Object({
         }),
       ),
       acceptanceCriteria: Type.Optional(
-        Type.String({ description: "Acceptance criteria for the child issue" }),
+        Type.String({
+          description:
+            "Acceptance criteria for the child issue, one criterion per line",
+        }),
       ),
       riskTier: Type.Optional(
         StringEnum(["low", "medium", "high"], {
@@ -400,6 +587,12 @@ export const SplitParams = Type.Object({
           description:
             "Create the child already approved (lifecycle v1, phase ready) instead of draft",
         }),
+      ),
+      check: Type.Optional(
+        Type.String({ minLength: 1, description: "Shell command the core runs against the result before review, e.g. npm test; it must exit 0. Comes from the human" }),
+      ),
+      checkWaiver: Type.Optional(
+        Type.String({ minLength: 1, description: "Why no check applies to this work. Only on explicit human instruction, with the human's reason" }),
       ),
     }),
     { minItems: 1, maxItems: 20, description: "Child issues to create" },
@@ -416,16 +609,23 @@ export const ApproveParams = Type.Object({
   }),
   acceptanceCriteria: Type.Optional(
     Type.String({
-      description: "Acceptance criteria recorded on the issue",
+      description:
+        "Acceptance criteria recorded on the issue, one criterion per line (each line is numbered, and the reviewer must answer every one with evidence)",
     }),
   ),
   riskTier: Type.Optional(
     StringEnum(["low", "medium", "high"], {
       description:
-        "Judgment-gate risk tier (default medium: blocking gate + author independence)",
+        "Judgment-gate risk tier (default medium: every gate enforced + author independence)",
     }),
   ),
   workflowClass: Type.Optional(WorkflowClass),
+  check: Type.Optional(
+    Type.String({ minLength: 1, description: "Shell command the core runs against the result before review, e.g. npm test; it must exit 0. Comes from the human" }),
+  ),
+  checkWaiver: Type.Optional(
+    Type.String({ minLength: 1, description: "Why no check applies to this work. Only on explicit human instruction, with the human's reason" }),
+  ),
 });
 export type ApproveParamsT = Static<typeof ApproveParams>;
 
@@ -450,10 +650,49 @@ export const AnswerDecisionParams = Type.Object({
 });
 export type AnswerDecisionParamsT = Static<typeof AnswerDecisionParams>;
 
+export const RecordOutcomeParams = Type.Object({
+  id: Type.String({ description: "Closed, accepted issue the outcome is about" }),
+  outcome: StringEnum(["clean", "needed_fixes", "abandoned"], {
+    description:
+      "clean: the accepted work needed nothing more; needed_fixes: it needed follow-up fixes; abandoned: it was dropped or reverted",
+  }),
+  fixRounds: Type.Optional(
+    Type.Integer({
+      minimum: 0,
+      description: "How many rounds of fixes the work needed after it closed (with needed_fixes)",
+    }),
+  ),
+  summary: Type.String({
+    minLength: 1,
+    description: "One line on what happened after the close",
+  }),
+});
+export type RecordOutcomeParamsT = Static<typeof RecordOutcomeParams>;
+
+export const ScorecardParams = Type.Object({
+  windowDays: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      description: "Count issues closed within this many days (default 7)",
+    }),
+  ),
+});
+export type ScorecardParamsT = Static<typeof ScorecardParams>;
+
 export const StatusParams = Type.Object({
   id: Type.String({ description: "Issue id to inspect" }),
 });
 export type StatusParamsT = Static<typeof StatusParams>;
+
+export const GatesParams = Type.Object({
+  id: Type.Optional(
+    Type.String({
+      description:
+        "Narrow the report to one issue. Omit to report every issue in the graph.",
+    }),
+  ),
+});
+export type GatesParamsT = Static<typeof GatesParams>;
 
 export const InitParams = Type.Object({
   prefix: Type.Optional(
@@ -475,7 +714,10 @@ export const CreateParams = Type.Object({
     Type.String({ description: "task (default), bug, feature, chore, ..." }),
   ),
   acceptanceCriteria: Type.Optional(
-    Type.String({ description: "What the judgment gate checks the result against" }),
+    Type.String({
+      description:
+        "What the judgment gate checks the result against, one criterion per line (each line is numbered, and the reviewer must answer every one with evidence)",
+    }),
   ),
   riskTier: Type.Optional(
     StringEnum(["low", "medium", "high"], {
@@ -498,6 +740,12 @@ export const CreateParams = Type.Object({
     Type.Array(Type.String(), {
       description: "Issue ids this one is blocked by",
     }),
+  ),
+  check: Type.Optional(
+    Type.String({ minLength: 1, description: "Shell command the core runs against the result before review, e.g. npm test; it must exit 0. Comes from the human" }),
+  ),
+  checkWaiver: Type.Optional(
+    Type.String({ minLength: 1, description: "Why no check applies to this work. Only on explicit human instruction, with the human's reason" }),
   ),
 });
 export type CreateParamsT = Static<typeof CreateParams>;

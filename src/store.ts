@@ -54,6 +54,8 @@ import {
 export const STORE_DIR = ".workgraph";
 /** Database file name inside {@link STORE_DIR}. */
 export const STORE_FILE = "workgraph.db";
+/** Directory (beside the database) that holds check logs; it ignores itself. */
+export const PROOF_DIR = "proof";
 /** Current on-disk schema version (bumped with every migration). */
 export const SCHEMA_VERSION = 1;
 
@@ -89,9 +91,11 @@ export type StoreOp =
   | "overwriteAssignee"
   | "addComment"
   | "listComments"
+  | "listCommentsByPrefix"
   | "createIssue"
   | "addDependency"
-  | "listIssues";
+  | "listIssues"
+  | "listClosedByMetadata";
 
 export interface OpLogEntry {
   op: StoreOp;
@@ -122,7 +126,8 @@ function recordOp(op: StoreOp, issueId?: string): void {
 // session_start via configureStore):
 //
 //   repo     — `<root>/.workgraph/workgraph.db`, found by walking up from the
-//              cwd like git finds `.git`. The directory ships a .gitignore.
+//              cwd like git finds `.git`. The directory ships a .gitignore
+//              naming the database files and `proof/` (check logs).
 //   central  — `<centralDir>/<key>/workgraph.db`, one per repository, where
 //              <key> = basename + short hash of the MAIN checkout's absolute
 //              path. Nothing is written inside the repository at all.
@@ -301,7 +306,8 @@ export interface InitWorkspaceResult {
 /**
  * Create the workspace for `dir` (idempotent: an existing workspace is left
  * untouched and described). In repo mode the database lands at
- * `<dir>/.workgraph/workgraph.db` with a `.gitignore` beside it; in central
+ * `<dir>/.workgraph/workgraph.db` with a `.gitignore` beside it (database
+ * files and the `proof/` log directory); in central
  * mode it lands under the central directory, keyed by the repository, with
  * a `repo` file naming the checkout for humans — nothing inside the repo.
  */
@@ -318,7 +324,10 @@ export function initWorkspaceSync(dir: string, opts: InitWorkspaceOptions = {}):
   if (policy.mode === "central") {
     writeFileSync(join(dirname(databasePath), "repo"), `${root}\n`);
   } else {
-    writeFileSync(join(dirname(databasePath), ".gitignore"), `${STORE_FILE}\n${STORE_FILE}-*\n`);
+    writeFileSync(
+      join(dirname(databasePath), ".gitignore"),
+      `${STORE_FILE}\n${STORE_FILE}-*\n${PROOF_DIR}/\n`,
+    );
   }
   const db = openAt(root);
   const prefix = (opts.prefix ?? defaultPrefix(root)).toLowerCase();
@@ -331,6 +340,44 @@ export function initWorkspaceSync(dir: string, opts: InitWorkspaceOptions = {}):
 /** Async form of {@link initWorkspaceSync}. */
 export async function initWorkspace(dir: string, opts: InitWorkspaceOptions = {}): Promise<InitWorkspaceResult> {
   return initWorkspaceSync(dir, opts);
+}
+
+/** One path component, whatever the input was (an issue id may hold anything). */
+function pathComponent(raw: string): string {
+  const part = raw
+    .replace(/[^A-Za-z0-9._-]/g, "-")
+    .replace(/\.{2,}/g, "-")
+    .replace(/^\.+/, "");
+  return part === "" ? "x" : part;
+}
+
+/**
+ * Where one check log for an issue goes: `<store dir>/proof/<issue>/<name>.log`,
+ * next to the database, wherever the store policy put it. Creates the
+ * directories. `cwd` must be the session's checkout (or anything inside the
+ * workspace), never an executor's worktree: a worktree has no store.
+ *
+ * `proof/` IGNORES ITSELF. In repo mode the store directory sits inside the
+ * checkout and its own `.gitignore` names only what existed when the
+ * workspace was created, so a log written here would be an untracked file
+ * in the very tree it describes, and every check would change the tree it
+ * just checked. A `.gitignore` holding `*` inside `proof/` covers the logs
+ * and itself, for workspaces of any age.
+ */
+export function proofLogPath(cwd: string, issueId: string, name: string): string {
+  const root = findWorkspaceRoot(cwd);
+  if (root === undefined) {
+    throw new StoreError(
+      `No workgraph workspace found in ${cwd} — run the workgraph_init tool (or \`/workgraph init\`) first`,
+      "proofLogPath",
+    );
+  }
+  const proofDir = join(dirname(databasePathFor(root)), PROOF_DIR);
+  const issueDir = join(proofDir, pathComponent(issueId));
+  mkdirSync(issueDir, { recursive: true });
+  const ignore = join(proofDir, ".gitignore");
+  if (!existsSync(ignore)) writeFileSync(ignore, "*\n");
+  return join(issueDir, `${pathComponent(name)}.log`);
 }
 
 /** Close every open handle (tests; also safe at shutdown). */
@@ -792,25 +839,47 @@ function addCommentSync(cwd: string, id: string, text: string, actor?: string): 
   );
 }
 
-function listCommentsSync(cwd: string, id: string): WorkComment[] {
-  recordOp("listComments", id);
-  const db = openDb(cwd, "listComments");
-  const rows = db
-    .prepare("SELECT id, issue_id, author, text, created_at FROM comments WHERE issue_id = ? ORDER BY id ASC")
-    .all(id) as unknown as {
-    id: number;
-    issue_id: string;
-    author: string | null;
-    text: string;
-    created_at: string;
-  }[];
-  return rows.map((r) => ({
+interface CommentRow {
+  id: number;
+  issue_id: string;
+  author: string | null;
+  text: string;
+  created_at: string;
+}
+
+function rowToComment(r: CommentRow): WorkComment {
+  return {
     id: String(r.id),
     issue_id: r.issue_id,
     ...(r.author ? { author: r.author } : {}),
     text: r.text,
     created_at: r.created_at,
-  }));
+  };
+}
+
+function listCommentsSync(cwd: string, id: string): WorkComment[] {
+  recordOp("listComments", id);
+  const db = openDb(cwd, "listComments");
+  const rows = db
+    .prepare("SELECT id, issue_id, author, text, created_at FROM comments WHERE issue_id = ? ORDER BY id ASC")
+    .all(id) as unknown as CommentRow[];
+  return rows.map(rowToComment);
+}
+
+function listCommentsByPrefixSync(cwd: string, prefix: string): WorkComment[] {
+  recordOp("listCommentsByPrefix");
+  const db = openDb(cwd, "listCommentsByPrefix");
+  // LIKE only narrows the scan: it ignores ASCII case, and `%`/`_` in the
+  // prefix are wildcards unless escaped. The exact, case-sensitive match is
+  // the `startsWith` below. No index serves a text prefix (the one comments
+  // index is on issue_id), so this reads the whole table once.
+  const pattern = `${prefix.replace(/[\\%_]/g, "\\$&")}%`;
+  const rows = db
+    .prepare(
+      "SELECT id, issue_id, author, text, created_at FROM comments WHERE text LIKE ? ESCAPE '\\' ORDER BY id ASC",
+    )
+    .all(pattern) as unknown as CommentRow[];
+  return rows.filter((r) => r.text.startsWith(prefix)).map(rowToComment);
 }
 
 /** Input for {@link createIssue}. */
@@ -949,6 +1018,27 @@ function listIssuesSync(cwd: string, opts: ListIssuesOptions = {}): WorkIssue[] 
   return rows.map((r) => rowToIssue(db, r));
 }
 
+/**
+ * Closed issues whose metadata holds `value` under `key`, oldest first. The
+ * comparison is on the stored scalar as text, so a number or boolean is
+ * matched by its JSON spelling (`true`, `2`). One statement over the
+ * existing `status` and `metadata` columns: no index serves it, so it reads
+ * every closed row once.
+ */
+function listClosedByMetadataSync(cwd: string, key: string, value: string): WorkIssue[] {
+  recordOp("listClosedByMetadata");
+  const db = openDb(cwd, "listClosedByMetadata");
+  const path = `$."${key.replace(/["\\]/g, "")}"`;
+  const rows = db
+    .prepare(
+      `SELECT * FROM issues
+        WHERE status = 'closed' AND CAST(json_extract(metadata, ?) AS TEXT) = ?
+        ORDER BY rowid ASC`,
+    )
+    .all(path, value) as unknown as IssueRow[];
+  return rows.map((r) => rowToIssue(db, r));
+}
+
 /** Synchronous surface for synchronous callers (fixtures, hooks, tooling). */
 export const sync: {
   ready: typeof readySync;
@@ -964,9 +1054,11 @@ export const sync: {
   overwriteAssigneeForReclaim: typeof overwriteAssigneeForReclaimSync;
   addComment: typeof addCommentSync;
   listComments: typeof listCommentsSync;
+  listCommentsByPrefix: typeof listCommentsByPrefixSync;
   createIssue: typeof createIssueSync;
   addDependency: typeof addDependencySync;
   listIssues: typeof listIssuesSync;
+  listClosedByMetadata: typeof listClosedByMetadataSync;
   initWorkspace: typeof initWorkspaceSync;
   getSetting: (cwd: string, key: string) => string | undefined;
   setSetting: (cwd: string, key: string, value: string | null) => void;
@@ -984,9 +1076,11 @@ export const sync: {
   overwriteAssigneeForReclaim: overwriteAssigneeForReclaimSync,
   addComment: addCommentSync,
   listComments: listCommentsSync,
+  listCommentsByPrefix: listCommentsByPrefixSync,
   createIssue: createIssueSync,
   addDependency: addDependencySync,
   listIssues: listIssuesSync,
+  listClosedByMetadata: listClosedByMetadataSync,
   initWorkspace: initWorkspaceSync,
   // Assigned below their definitions (settings live at the end of the file).
   getSetting: undefined as never,
@@ -1097,6 +1191,15 @@ export async function listComments(cwd: string, id: string): Promise<WorkComment
   return listCommentsSync(cwd, id);
 }
 
+/**
+ * Read every comment, on any issue, whose text starts with `prefix`, oldest
+ * first: one query for a report over a whole trail (e.g. every
+ * `workgraph-proof gate` record). The match is exact and case-sensitive.
+ */
+export async function listCommentsByPrefix(cwd: string, prefix: string): Promise<WorkComment[]> {
+  return listCommentsByPrefixSync(cwd, prefix);
+}
+
 /** Create a new issue and return it. */
 export async function createIssue(cwd: string, input: CreateIssueInput, actor?: string): Promise<WorkIssue> {
   return createIssueSync(cwd, input, actor);
@@ -1110,6 +1213,15 @@ export async function addDependency(cwd: string, id: string, dependsOnId: string
 /** List issues, oldest first, optionally filtered by status. */
 export async function listIssues(cwd: string, opts: ListIssuesOptions = {}): Promise<WorkIssue[]> {
   return listIssuesSync(cwd, opts);
+}
+
+/**
+ * List closed issues by one metadata key and value, oldest first: the
+ * pending-outcome sweep (`workgraph_outcome_status` = `pending`) and the
+ * scorecard (`workgraph_phase` = `accepted`) both read through it.
+ */
+export async function listClosedByMetadata(cwd: string, key: string, value: string): Promise<WorkIssue[]> {
+  return listClosedByMetadataSync(cwd, key, value);
 }
 
 // ---------------------------------------------------------------------------

@@ -17,6 +17,20 @@
  *  - a request with no upstream extension context gets an error response
  *    WITHOUT a `started` (slash-bridge.ts:80-93) — the `"no-context"` mode.
  *
+ * BACKGROUND LAUNCH, as read in pi-subagents 0.41.0 and 0.89.1 (the shapes
+ * are recorded beside `UPSTREAM_EVENTS`):
+ *  - a request that resolves to async answers `started` and then a launch
+ *    RECEIPT on the response channel (`details.asyncId`, `details.runId`,
+ *    no results). It never takes the foreground lock, so
+ *    `singleForeground` does not apply to it. Each launch gets an id of its
+ *    own: the first is `background-id`, later ones `background-id-2`, …;
+ *  - the run ends when the test calls `completeBackground()`, which emits
+ *    `subagent:async-complete` with `{ id, runId, success, state, results }`;
+ *  - `{ action: "interrupt", id }` for a live background run is recorded in
+ *    `interrupts` and, like upstream, is not itself the run's end.
+ * A script entry is still consumed for a request that turns out to be
+ * async, as it always was.
+ *
  * The fake never imports pi-subagents either — the whole point of the
  * event-names-only bridge is that neither side needs the package installed.
  */
@@ -69,6 +83,19 @@ export interface FakeSubagentsHandle {
   cancels: string[];
   /** RequestIds parked by cancels for unknown runs (never acked). */
   pendingCancels: Set<string>;
+  /** Async ids of background runs launched and not yet completed, oldest first. */
+  backgroundRuns: string[];
+  /** Ids named by `action: "interrupt"` requests, in order. */
+  interrupts: string[];
+  /**
+   * End a background run: emit `subagent:async-complete` for `asyncId`
+   * (default: the oldest live one). `success` defaults to true and `state`
+   * to `complete` (or `failed`).
+   */
+  completeBackground(
+    asyncId?: string,
+    result?: { success?: boolean; state?: string },
+  ): void;
   /** Complete a stalled run (default: the most recent stalled request). */
   respond(overrides?: FakeSubagentsBehavior & { requestId?: string }): void;
   /** Emit a raw response payload verbatim (shape-drift tests). */
@@ -123,6 +150,9 @@ export function installFakeSubagents(
   const cancels: string[] = [];
   const pendingCancels = new Set<string>();
   const inFlight = new Map<string, FakeSubagentsBehavior>();
+  const backgroundRuns: string[] = [];
+  const interrupts: string[] = [];
+  let backgroundCounter = 0;
   let cursor = 0;
   const unsubs: (() => void)[] = [];
 
@@ -163,12 +193,23 @@ export function installFakeSubagents(
         params: payload.params as Record<string, unknown>,
       });
 
+      if (params.action === "interrupt" && typeof params.id === "string") {
+        interrupts.push(params.id);
+      }
       const behavior = nextBehavior();
       const async =
         opts.forceTopLevelAsync && params.foregroundOnly !== true
           ? true
           : (params.async ?? opts.asyncByDefault ?? true);
       if (async) {
+        // A launch gets its own id; a management request (an interrupt)
+        // launches nothing and keeps the constant receipt it always had.
+        let asyncId = "background-id";
+        if (params.action === undefined) {
+          backgroundCounter += 1;
+          if (backgroundCounter > 1) asyncId = `background-id-${backgroundCounter}`;
+          backgroundRuns.push(asyncId);
+        }
         events.emit(UPSTREAM_EVENTS.started, { requestId });
         events.emit(UPSTREAM_EVENTS.response, {
           requestId,
@@ -177,9 +218,10 @@ export function installFakeSubagents(
             content: [{ type: "text", text: "Background subagent started" }],
             details: {
               mode: "single",
+              runId: asyncId,
               results: [],
-              asyncId: "background-id",
-              asyncDir: "/tmp/background-id",
+              asyncId,
+              asyncDir: `/tmp/${asyncId}`,
             },
           },
         });
@@ -268,6 +310,26 @@ export function installFakeSubagents(
     requests,
     cancels,
     pendingCancels,
+    backgroundRuns,
+    interrupts,
+    completeBackground(asyncId, result = {}) {
+      const id = asyncId ?? backgroundRuns[0];
+      const index = id === undefined ? -1 : backgroundRuns.indexOf(id);
+      if (id === undefined || index === -1) {
+        throw new Error("fake subagents: no background run to complete");
+      }
+      backgroundRuns.splice(index, 1);
+      const success = result.success ?? true;
+      const state = result.state ?? (success ? "complete" : "failed");
+      events.emit(UPSTREAM_EVENTS.asyncComplete, {
+        id,
+        runId: id,
+        mode: "single",
+        success,
+        state,
+        results: [{ agent: "fake-agent", success, status: state }],
+      });
+    },
     respond(overrides = {}) {
       const requestId =
         overrides.requestId ?? [...inFlight.keys()][inFlight.size - 1];

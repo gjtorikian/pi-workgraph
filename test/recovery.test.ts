@@ -34,12 +34,14 @@ import {
   rfc3339,
 } from "../src/lease.ts";
 import { activeExecutionIdOf, phaseOf } from "../src/lifecycle.ts";
+import { PolicyConfigError } from "../src/policy.ts";
 import { CH, newEnvelope, type RunCompletedT } from "../src/protocol.ts";
 import { reclaimAndLeaveReady } from "../src/sweep.ts";
 import {
   WORKGRAPH_ATTEMPT_KEY,
   WORKGRAPH_FAILURE_FINGERPRINT_KEY,
 } from "../src/types.ts";
+import { preProofConfig } from "./helpers/config.ts";
 import { installFakeExecutor } from "./helpers/fake-executor.ts";
 import {
   asExtensionAPI,
@@ -52,18 +54,14 @@ import { makeScratchGraph, type ScratchGraph } from "./helpers/scratch.ts";
 const WORKER = "recovery-test-worker";
 const TTL = 300_000;
 
-/** Huge scheduling timers (event-driven only), tiny REAL protocol timeouts. */
-const CONFIG: WorkgraphConfig = {
+/** The shared timers — huge scheduling timers (event-driven only), tiny REAL
+ *  protocol timeouts — with the lease TTL named, because tests do arithmetic
+ *  on it. */
+const CONFIG = preProofConfig({
   leaseTtlMs: TTL,
-  heartbeatMs: 600_000,
-  pollMs: 600_000,
-  sweepIntervalMs: 600_000,
-  discoveryTimeoutMs: 40,
-  acceptTimeoutMs: 150,
-  compatInSessionExecutor: false,
   compatLegacyIssues: true,
   workerIdOverride: WORKER,
-};
+});
 
 const IMPL_PROV = { harness: "fake", model: "impl-model", provider: "prov-impl" };
 const REV_PROV = { harness: "fake", model: "rev-model", provider: "prov-rev" };
@@ -79,7 +77,7 @@ function makeHarness(
   now?: () => number,
 ): Harness {
   const mock = makeMockPi();
-  const config: WorkgraphConfig = { ...CONFIG, ...overrides };
+  const config = preProofConfig({ ...CONFIG, ...overrides });
   setWorkerIdOverride(WORKER);
   const coordinator = registerCoordinator(asExtensionAPI(mock), {
     getConfig: () => config,
@@ -603,6 +601,83 @@ describe("startup reconciliation", () => {
     }
   }, 60_000);
 
+  it("a reconciliation an invalid policy stopped runs on the first tick after it is fixed: the judging run is re-adopted and reviewed", async () => {
+    resetLeasesForTest();
+    const graph = makeScratchGraph({ prefix: "rcvowed", seed: 1 });
+    const id = graph.seededIds[0]!;
+
+    // ---- life before the crash: parked in judging, as above.
+    const first = makeHarness();
+    const fakeA = installFakeExecutor(first.mock.events, {
+      roleScripts: {
+        implementer: { provenance: IMPL_PROV, artifacts: ["src/thing.ts"] },
+      },
+    });
+    const ectx1 = makeEventContext(graph.dir);
+    await settle(first.mock, ectx1.ctx);
+    await first.mock.flushEvents();
+    expect(metadataOf(graph, id).workgraph_phase).toBe("judging");
+    fakeA.uninstall();
+    resetLeasesForTest();
+
+    // ---- the restart, under a policy that does not validate.
+    const mock = makeMockPi();
+    const config = preProofConfig({ ...CONFIG });
+    let broken = true;
+    setWorkerIdOverride(WORKER);
+    const coordinator = registerCoordinator(asExtensionAPI(mock), {
+      getConfig: () => {
+        if (broken) throw new PolicyConfigError("policy.urgent is not a risk tier");
+        return config;
+      },
+    });
+    const fakeB = installFakeExecutor(mock.events, {
+      executorId: "reviewer-exec",
+      roles: ["reviewer"],
+      roleScripts: {
+        reviewer: { provenance: REV_PROV, verdict: { findings: [] } },
+      },
+    });
+    const ectx2 = makeEventContext(graph.dir);
+    try {
+      // Nothing is adopted under a config that does not validate.
+      const report = await coordinator.reconcile(ectx2.ctx);
+      expect(report.readopted).toEqual([]);
+      expect(coordinator.current()).toBeNull();
+
+      // A tick while it is still broken adopts nothing either.
+      await settle(mock, ectx2.ctx);
+      await mock.flushEvents();
+      expect(coordinator.current()).toBeNull();
+      expect(fakeB.requests).toEqual([]);
+      expect(await auditCount(graph.dir, id, "re-adopted")).toBe(0);
+
+      // Fixed: the next tick runs the reconciliation it owed. The run is
+      // re-adopted once, reviewed, and closed, with no second restart. The
+      // tick starts the pass and does not wait for it: poll its in-memory
+      // effects (the review request, then the lease let go at the close).
+      broken = false;
+      await settle(mock, ectx2.ctx);
+      await until(() => fakeB.requests.length === 1);
+      await until(() => heldLeases(graph.dir).length === 0);
+      await mock.flushEvents();
+      expect(fakeB.requests.map((r) => r.role)).toEqual(["reviewer"]);
+      expect(graph.showIssue(id).status).toBe("closed");
+      expect(await auditCount(graph.dir, id, "re-adopted")).toBe(1);
+      expect(heldLeases(graph.dir)).toHaveLength(0);
+
+      // Owed once: later ticks do not reconcile again.
+      await settle(mock, ectx2.ctx);
+      await mock.flushEvents();
+      expect(await auditCount(graph.dir, id, "re-adopted")).toBe(1);
+    } finally {
+      fakeB.uninstall();
+      await coordinator.teardown(ectx2.ctx);
+      await first.coordinator.teardown(ectx1.ctx);
+      graph.cleanup();
+    }
+  }, 60_000);
+
   it("a judging run with NO reconstructable author parks with the heartbeat instead of judging blind", async () => {
     resetLeasesForTest();
     const graph = makeScratchGraph({ prefix: "rcvpark", seed: 1 });
@@ -951,7 +1026,7 @@ describe("graceful shutdown", () => {
     const id = graph.seededIds[0]!;
     const mock = makeMockPi();
     setWorkerIdOverride(WORKER);
-    const config: WorkgraphConfig = { ...CONFIG, compatInSessionExecutor: true };
+    const config = preProofConfig({ ...CONFIG, compatInSessionExecutor: true });
     // Registration order mirrors index.ts: adapter first.
     registerInSessionExecutor(asExtensionAPI(mock), { getConfig: () => config });
     const coordinator = registerCoordinator(asExtensionAPI(mock), {
@@ -1099,6 +1174,10 @@ describe("graceful shutdown", () => {
                 note: "does not hold",
               },
             ],
+          },
+          // Kept on the recheck, so the revision below is requested.
+          recheck: {
+            answers: [{ n: 1, decision: "keep", reason: "still does not hold" }],
           },
         },
         // The revision is accepted, then stalls: an ISOLATED revision

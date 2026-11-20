@@ -53,6 +53,7 @@ import {
   WORKGRAPH_WORKFLOW_CLASS_KEY,
   type VerdictT,
 } from "../src/types.ts";
+import { preProofConfig } from "./helpers/config.ts";
 import { installFakeExecutor } from "./helpers/fake-executor.ts";
 import { registerWorkgraphTools } from "../src/tools.ts";
 import { registerPiSubagentsExecutor } from "../src/adapters/pi-subagents.ts";
@@ -64,22 +65,18 @@ import {
   makeToolContext,
   type MockPi,
 } from "./helpers/mock-pi.ts";
-import { makeScratchGraph, type ScratchGraph } from "./helpers/scratch.ts";
+import {
+  makeScratchGraph,
+  makeScratchRepo,
+  type ScratchGraph,
+} from "./helpers/scratch.ts";
 
 const WORKER = "judgment-test-worker";
 
-/** Huge scheduling timers (event-driven ticks only), tiny REAL protocol
- *  timeouts (bounded discovery/accept waits resolve fast). */
-const CONFIG: WorkgraphConfig = {
-  leaseTtlMs: 300_000,
-  heartbeatMs: 600_000,
-  pollMs: 600_000,
-  sweepIntervalMs: 600_000,
-  discoveryTimeoutMs: 40,
-  acceptTimeoutMs: 150,
-  compatInSessionExecutor: false,
-  workerIdOverride: WORKER,
-};
+/** The shared timers — huge scheduling timers (event-driven ticks only),
+ *  tiny REAL protocol timeouts (bounded discovery/accept waits resolve
+ *  fast). */
+const CONFIG = preProofConfig({ workerIdOverride: WORKER });
 
 /** Distinct author/reviewer provenance — independent under every policy. */
 const IMPL_PROV = {
@@ -97,6 +94,16 @@ function blockingVerdict(criterion: string): VerdictT {
   };
 }
 
+/**
+ * The reviewer's answer to the recheck every blocking verdict gets: it keeps
+ * its one blocker. (These suites run with tree binding off, so no citation
+ * is checked; the recheck is asked for either way.) A recheck is a reviewer
+ * request, so it takes the next entry of a reviewer array.
+ */
+const KEEP_BLOCKER = {
+  answers: [{ n: 1, decision: "keep", reason: "it still does not hold" }],
+};
+
 function advisoryVerdict(criterion: string): VerdictT {
   return {
     findings: [{ criterion, severity: "advisory", note: "could be tighter" }],
@@ -111,7 +118,9 @@ interface Harness {
 
 function makeHarness(overrides: Partial<WorkgraphConfig> = {}): Harness {
   const mock = makeMockPi();
-  const config: WorkgraphConfig = { ...CONFIG, ...overrides };
+  // A `policy` override merges over the pre-proof pin per tier and per gate:
+  // `{ high: { maxRevisions: 1 } }` changes one knob and keeps the pin.
+  const config = preProofConfig({ ...CONFIG, ...overrides });
   setWorkerIdOverride(WORKER);
   const coordinator = registerCoordinator(asExtensionAPI(mock), {
     getConfig: () => config,
@@ -331,18 +340,18 @@ describe("lifecycle transitions", () => {
 describe("policy and independence", () => {
   it("resolvePolicy: tier defaults, per-knob merge, conservative fallback", () => {
     expect(resolvePolicy("low")).toEqual(DEFAULT_POLICY.low);
-    expect(resolvePolicy("low").gateMode).toBe("advisory");
-    expect(resolvePolicy("medium").gateMode).toBe("blocking");
+    expect(resolvePolicy("low").gates.review).toBe("observe");
+    expect(resolvePolicy("medium").gates.review).toBe("enforce");
     expect(resolvePolicy("high").requireAuthorIndependence).toEqual({
       model: true,
     });
-    // Unknown/missing tier falls back to medium (blocking — conservative).
-    expect(resolvePolicy(undefined).gateMode).toBe("blocking");
-    expect(resolvePolicy("bogus").gateMode).toBe("blocking");
+    // Unknown/missing tier falls back to medium (enforce — conservative).
+    expect(resolvePolicy(undefined).gates.review).toBe("enforce");
+    expect(resolvePolicy("bogus").gates.review).toBe("enforce");
     // A partial override changes ONE knob and drops none.
     const merged = resolvePolicy("high", { high: { maxRevisions: 1 } });
     expect(merged.maxRevisions).toBe(1);
-    expect(merged.gateMode).toBe("blocking");
+    expect(merged.gates.review).toBe("enforce");
     expect(merged.requireAuthorIndependence).toEqual({
       model: true,
     });
@@ -555,10 +564,12 @@ describe("judgment gate flows", () => {
       roleScripts: {
         implementer: { provenance: IMPL_PROV },
         revision: { provenance: IMPL_PROV }, // artifacts stay [] — same digest
-        // A single script repeats: byte-identical blocking verdict each round.
+        // A single script repeats: byte-identical blocking verdict each
+        // round, kept on each recheck.
         reviewer: {
           provenance: REV_PROV,
           verdict: blockingVerdict("criterion-x"),
+          recheck: KEEP_BLOCKER,
         },
       },
     });
@@ -598,8 +609,10 @@ describe("judgment gate flows", () => {
       roleScripts: {
         implementer: { provenance: IMPL_PROV },
         revision: { provenance: IMPL_PROV, artifacts: ["src/fixed.ts"] },
+        // The review, the recheck of its blocker, the second review.
         reviewer: [
           { provenance: REV_PROV, verdict: blockingVerdict("criterion-x") },
+          { provenance: REV_PROV, recheck: KEEP_BLOCKER },
           { provenance: REV_PROV, verdict: CLEAN_VERDICT },
         ],
       },
@@ -650,7 +663,9 @@ describe("judgment gate flows", () => {
         // revision BOUND (not the fingerprint) is what escalates.
         reviewer: [
           { provenance: REV_PROV, verdict: blockingVerdict("criterion-a") },
+          { provenance: REV_PROV, recheck: KEEP_BLOCKER },
           { provenance: REV_PROV, verdict: blockingVerdict("criterion-b") },
+          { provenance: REV_PROV, recheck: KEEP_BLOCKER },
         ],
       },
     });
@@ -867,7 +882,8 @@ describe("executor failure diagnostics", () => {
       getConfig: () => config,
       probeVersion: () => "0.34.8",
     });
-    const graph = makeScratchGraph({ prefix: "serial", seed: 2 });
+    // A git repository: the bridge cuts a worktree for every implementer.
+    const graph = makeScratchRepo({ prefix: "serial", seed: 2 });
     for (const id of graph.seededIds) approve(graph, id);
     const fake = installFakeSubagents(mock.events, {
       singleForeground: true,
@@ -1026,6 +1042,7 @@ describe("executor failure diagnostics", () => {
         reviewer: {
           provenance: REV_PROV,
           verdict: blockingVerdict("compatibility"),
+          recheck: KEEP_BLOCKER,
         },
         revision: {
           outcome: "blocked",
@@ -1037,8 +1054,10 @@ describe("executor failure diagnostics", () => {
     try {
       await settle(mock, ectx.ctx);
       await mock.flushEvents();
+      // The review, the recheck of its blocker, then the revision.
       expect(fake.requests.map((r) => r.role)).toEqual([
         "implementer",
+        "reviewer",
         "reviewer",
         "revision",
       ]);
@@ -1087,7 +1106,8 @@ describe("executor failure diagnostics", () => {
       expect(metadataOf(graph, id).workgraph_decision_answer).toBe("Yes, bump the major.");
       expect(await auditCount(graph.dir, id, "decision-answered")).toBe(1);
 
-      await runTool("workgraph_approve", { id }, graph.dir);
+      // Tools read the shipped policy, where medium-risk work needs a check.
+      await runTool("workgraph_approve", { id, check: "npm test" }, graph.dir);
       expect(phaseOf(graph.showIssue(id))).toBe("ready");
       await settle(mock, ectx.ctx);
       await mock.flushEvents();
