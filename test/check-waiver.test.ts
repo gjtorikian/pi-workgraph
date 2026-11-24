@@ -626,6 +626,42 @@ describe("the workgraph.check setting", () => {
     }
   });
 
+  it("WORKGRAPH_CHECK replaces the settings block whole, and is validated the same way", () => {
+    const graph = makeScratchGraph({ prefix: "cwenv" });
+    const mock = makeTools();
+    captureErrors();
+    const before = process.env.WORKGRAPH_CHECK;
+    try {
+      const api = asExtensionAPI(mock);
+      writeProjectSettings(graph.dir, {
+        check: { command: "npm test", testGlobs: ["spec/**"] },
+      });
+
+      process.env.WORKGRAPH_CHECK = JSON.stringify({ command: " bun run test ", setup: "bun install" });
+      // Whole, not key by key: the settings' testGlobs do not carry over.
+      expect(resolveConfig(api).check).toEqual({ command: "bun run test", setup: "bun install" });
+
+      // Blank is unset, so the settings block applies again.
+      process.env.WORKGRAPH_CHECK = "  ";
+      expect(resolveConfig(api).check).toEqual({ command: "npm test", testGlobs: ["spec/**"] });
+
+      for (const [value, message] of [
+        ["bun test", /check is not valid JSON/],
+        ['{"comand":"bun test"}', /check\.comand is not a check setting/],
+      ] as const) {
+        process.env.WORKGRAPH_CHECK = value;
+        expect(() => resolveConfig(api)).toThrow(CheckConfigError);
+        expect(() => resolveConfig(api)).toThrow(message);
+        expect(() => resolveConfig(api)).toThrow(/set by WORKGRAPH_CHECK/);
+        expect(() => resolveConfigWithoutPolicy(api)).not.toThrow();
+      }
+    } finally {
+      if (before === undefined) delete process.env.WORKGRAPH_CHECK;
+      else process.env.WORKGRAPH_CHECK = before;
+      graph.cleanup();
+    }
+  });
+
   it("an invalid block stops dispatch, and dispatch resumes once it is fixed", async () => {
     const repo = makeScratchRepo({ prefix: "cwstop", seed: 1 });
     const id = repo.seededIds[0]!;

@@ -143,8 +143,9 @@ export interface WorkgraphConfig {
    */
   policy?: PolicyOverrides;
   /**
-   * The repository's check settings, from the `workgraph.check` key of Pi
-   * settings (there is no flag): `command` is the check run for every issue
+   * The repository's check settings, from the `WORKGRAPH_CHECK` environment
+   * variable or else the `workgraph.check` key of Pi settings (there is no
+   * flag): `command` is the check run for every issue
    * that names none of its own, `timeoutMs` bounds any check (default 10
    * minutes), `setup` prepares a throwaway worktree of a base tree before a
    * check runs there, and `testGlobs` replaces the default globs that say
@@ -385,16 +386,24 @@ function policyValue(
   }
 }
 
+/** The environment variable that holds the check block as JSON. */
+export const CHECK_ENV_VAR = "WORKGRAPH_CHECK";
+
 /**
- * The `workgraph.check` settings block. THROWS {@link CheckConfigError} on
- * anything that is not a valid block, as {@link policyValue} does for the
- * policy and for the same reason: a dropped repository default would leave
- * work unchecked without a word.
+ * The check block: the `WORKGRAPH_CHECK` environment variable, else the
+ * `workgraph.check` settings key. The variable is for a launcher that
+ * starts pi in a repository and knows what proves work there; its block
+ * replaces the settings block whole, as a policy from the environment does.
+ * THROWS {@link CheckConfigError} on anything that is not a valid block, as
+ * {@link policyValue} does for the policy and for the same reason: a dropped
+ * repository default would leave work unchecked without a word.
  */
 function checkValue(): CheckSettings | undefined {
-  const raw = settingsCheck();
+  const fromEnv = process.env[CHECK_ENV_VAR]?.trim() || undefined;
+  const raw = fromEnv ?? settingsCheck();
   if (raw === undefined) return undefined;
-  const source = 'the "workgraph.check" setting';
+  const source =
+    fromEnv !== undefined ? CHECK_ENV_VAR : 'the "workgraph.check" setting';
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
