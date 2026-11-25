@@ -502,6 +502,7 @@ Resolution order per value: CLI flag > environment variable > default.
 | `--workgraph-compaction-reasoning-level` | `WORKGRAPH_COMPACTION_REASONING_LEVEL` | the session's thinking level    | Opt-in: reasoning level for the compaction summary (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`)                          |
 | `--workgraph-subagents-executor`         | `WORKGRAPH_SUBAGENTS_EXECUTOR`         | settings `subagentsExecutor`    | Opt-in: the experimental pi-subagents bridge (`true` or its JSON block)                                                                 |
 | `--workgraph-finalization`               | `WORKGRAPH_FINALIZATION`               | —                               | Optional post-verification task (JSON with `instructions`, `timeoutMs`)                                                                 |
+| —                                        | `WORKGRAPH_CHECK`                      | settings `check`                | The repository's check block as JSON (`command`, `setup`, `timeoutMs`, `testGlobs`; see [The check](#the-check)); replaces the settings block |
 | `--workgraph-outcome`                    | `WORKGRAPH_OUTCOME`                    | —                               | Optional step launched in the background after a close (JSON with `instructions`, `timeoutMs`; see [Outcomes](#outcomes))               |
 | `--workgraph-worker-id`                  | `WORKGRAPH_WORKER_ID`                  | `{user}@{host}/{short-session}` | Worker identity used for claims, audit records, and fencing checks                                                                      |
 | `--workgraph-dispatch`                   | —                                      | `true`                          | Kill switch: `false` keeps tools + context injection, no autonomy (the flag name predates the coordinator; it disables the coordinator) |
@@ -740,7 +741,10 @@ executes model work; a shell command with an exit code is not model work.
 - Per repository: `"workgraph": { "check": { "command": "npm test" } }` in
   `.pi/settings.json` (or `~/.pi/agent/settings.json`). It applies to every
   issue with no check of its own. `timeoutMs` in the same block bounds any
-  check (default 600000, ten minutes). There is no flag for it. `setup`
+  check (default 600000, ten minutes). There is no flag for it. A launcher
+  that starts pi for a repository can pass the same block as JSON in the
+  `WORKGRAPH_CHECK` environment variable; it replaces the settings block
+  whole. `setup`
   and `testGlobs` in the same block belong to the
   [diff guards](#diff-guards). An unknown key or a bad value in the block
   is an error that stops dispatch, as an invalid policy does.
